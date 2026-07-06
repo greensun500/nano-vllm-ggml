@@ -1,6 +1,11 @@
 from collections import deque
-import xxhash
+import hashlib
 import numpy as np
+
+try:
+    import xxhash
+except ImportError:
+    xxhash = None
 
 from nanovllm.engine.sequence import Sequence
 
@@ -34,6 +39,12 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+        if xxhash is None:
+            h = hashlib.blake2b(digest_size=8)
+            if prefix != -1:
+                h.update(prefix.to_bytes(8, "little"))
+            h.update(np.array(token_ids).tobytes())
+            return int.from_bytes(h.digest(), "little")
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
@@ -91,7 +102,8 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
-    def deallocate(self, seq: Sequence):
+    def deallocate(self, seq: Sequence) -> list[int]:
+        released_block_ids = list(seq.block_table)
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -99,6 +111,7 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        return released_block_ids
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)

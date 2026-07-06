@@ -10,6 +10,8 @@
 
 A lightweight vLLM implementation built from scratch.
 
+中文源码学习路线与执行流程见 [`LEARNING_GUIDE.zh.md`](LEARNING_GUIDE.zh.md)。
+
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
@@ -42,6 +44,57 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+## llama.cpp CPU/Vulkan backend
+
+The experimental llama.cpp backend keeps nano-vLLM's scheduler and paged KV block manager, while llama.cpp executes the model on CPU or Vulkan.
+
+```bash
+LLAMA_CPP_DIR=/home/cix/nano-vlm/llama.cpp ./scripts/build_llamacpp_cpu.sh
+export NANOVLLM_LLAMA_BACKEND_LIB=/home/cix/nano-vlm/llama.cpp/build_nanovllm_cpu/bin/libnanollama_backend.so
+export NANOVLLM_GGUF_MODEL=/home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf
+PYTHONPATH=. python examples/llamacpp_backend.py
+```
+
+Use `NANOVLLM_BACKEND=llamacpp_vulkan` with `scripts/build_llamacpp_vulkan.sh` for Vulkan.
+
+Interactive chat test:
+
+```bash
+PYTHONPATH=. python -m nanovllm.cli.chat \
+  --backend llamacpp_cpu \
+  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
+  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_cpu/bin/libnanollama_backend.so
+```
+
+For Vulkan:
+
+```bash
+PYTHONPATH=. python -m nanovllm.cli.chat \
+  --backend llamacpp_vulkan \
+  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
+  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
+  --ubatch-size 512
+```
+
+Inside the chat CLI, use `/reset` to clear history, `/system <prompt>` to change the system prompt, and `/exit` to quit.
+
+Benchmark CPU/Vulkan performance:
+
+```bash
+PYTHONPATH=. python -m nanovllm.cli.bench \
+  --backend llamacpp_vulkan \
+  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
+  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
+  --batch-size 1 \
+  --prompt-len 128 \
+  --gen-len 32 \
+  --warmup 1 \
+  --repeat 3 \
+  --ubatch-size 512
+```
+
+The benchmark reports prefill input throughput, decode-step throughput, and end-to-end generated-token throughput. By default it perturbs synthetic prompts between runs to avoid measuring prefix-cache hits; add `--use-prefix-cache` when you want to benchmark cache reuse. Use `--json` for machine-readable output.
 
 ## Benchmark
 

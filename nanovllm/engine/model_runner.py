@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.backends.base import BackendExecutionPlan, build_execution_plan
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -14,7 +15,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event]):#对于普通进程，event是Event对象；对于主进程，event是list[Event]对象。
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,25 +24,25 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)#建立nccl通信组
+        torch.cuda.set_device(rank)#绑定当前进程gpu
+        default_dtype = torch.get_default_dtype()#保存默认的dtype
         torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        torch.set_default_device("cuda")#设置当前默认的device为cuda
+        self.model = Qwen3ForCausalLM(hf_config)#初始化模型结构
+        load_model(self.model, config.model)#加载模型权重
+        self.sampler = Sampler()#初始化采样器
+        self.warmup_model()#预热模型，用于获取模型运行时的内存占用情况
+        self.allocate_kv_cache()#分配kv缓存
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self.capture_cudagraph()#捕获模型运行时的cuda graph，用于后续的模型推理，减少kernel launch
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+        if self.world_size > 1:# 是否采用多卡推理
+            if rank == 0:# 主进程
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)# 由主进程创建共享内存，1mb大小，约定好名字
+                dist.barrier()#保证主进程先创建好共享内存，子进程才能正常读取
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
@@ -59,33 +60,40 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """
+        子进程的主循环，用于接收主进程发送的任务，并执行。
+        当收到"exit"任务时，退出循环，结束子进程。
+        """
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args)
+            self.call(method_name, *args)#执行任务
             if method_name == "exit":
                 break
 
     def read_shm(self):
+        """
+        从共享内存中读取任务，并返回任务名称和参数。
+        """
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
+        self.event.wait()#子进程等待到任务了，开始执行
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        self.event.clear()#清除任务信号
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = pickle.dumps([method_name, *args])#把命令任务（名称-参数）序列化成字节流，方便在进程间传递
         n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        self.shm.buf[0:4] = n.to_bytes(4, "little")#写入共享内存，4个字节存储任务长度
+        self.shm.buf[4:n+4] = data#写入共享内存，存储任务内容
         for event in self.event:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
-        method = getattr(self, method_name, None)
+        if self.world_size > 1 and self.rank == 0:# 主进程
+            self.write_shm(method_name, *args)# 主进程把任务写入共享内存
+        method = getattr(self, method_name, None)#如果是主进程，就把任务写进队列然后开始执行，初始的时候会执行run任务
         return method(*args)
 
     def warmup_model(self):
@@ -97,7 +105,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(build_execution_plan(seqs, True, self.block_size))
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -120,83 +128,52 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+    def prepare_block_tables(self, plan: BackendExecutionPlan):
+        max_len = max(len(block_table) for block_table in plan.block_tables)
+        block_tables = [block_table + [-1] * (max_len - len(block_table)) for block_table in plan.block_tables]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
+    def prepare_prefill(self, plan: BackendExecutionPlan):
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
         block_tables = None
-        for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
+        for start, seqlen_q in zip(plan.num_cached_tokens, plan.scheduled_token_counts):
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            block_tables = self.prepare_block_tables(plan)
+        input_ids = torch.tensor(plan.input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(plan.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(plan.slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+    def prepare_decode(self, plan: BackendExecutionPlan):
+        input_ids = torch.tensor(plan.input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(plan.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(plan.slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(plan.context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(plan)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+    def prepare_sample(self, plan: BackendExecutionPlan):
+        return torch.tensor(plan.temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:#只能走eager的形式
+            return self.model.compute_logits(self.model(input_ids, positions))#执行模型推理
+        else:#走cuda graph的方式
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -211,13 +188,19 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+    def run(self, plan: BackendExecutionPlan) -> list[int]:#模型核心推理代码，
+        input_ids, positions = self.prepare_prefill(plan) if plan.is_prefill else self.prepare_decode(plan)#根据是prefill还是decode，准备输入数据
+        temperatures = self.prepare_sample(plan) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, plan.is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def release_blocks(self, block_ids: list[int], seq_ids: list[int] | None = None):
+        return None
+
+    def shutdown(self):
+        self.exit()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
