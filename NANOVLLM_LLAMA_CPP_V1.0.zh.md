@@ -1,6 +1,11 @@
 # nano-vLLM + llama.cpp CPU/Vulkan v1.0 说明
 
 本文档记录当前 v1.0 版本所需源码、构建要求、部署方式、运行命令和验证方法。
+# v1.0性能：
+metric              tokens        time(s)      tok/s
+prefill                  384      23.995      16.00
+decode steps              93       5.984      15.54
+generated total           96      29.979       3.20
 
 ## 1. 版本目标
 
