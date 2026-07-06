@@ -342,7 +342,68 @@ prefill_tok_s       prompt/prefill 输入 token 吞吐
 decode_tok_s        decode step token 吞吐
 generated_tok_s     端到端生成 token 吞吐
 load_s              模型加载时间
+load_rss_mib        模型加载后进程 RSS 快照
 ```
+
+## 12. PD zero-copy 后端
+
+当前版本新增实验性后端：
+
+```text
+backend="llamacpp_pd"
+```
+
+执行策略：
+
+```text
+nano-vLLM Scheduler / BlockManager / BackendExecutionPlan 统一调度
+  -> prefill 使用 llama.cpp Vulkan context
+  -> decode 使用 llama.cpp CPU context
+  -> 两个 context 的 K/V tensor 指向同一份 Vulkan host-visible KV pool
+```
+
+这个后端是严格 zero-copy 版本：如果底层 Vulkan 后端不能创建 `Vulkan_Host` KV buffer，则初始化直接失败，不会退回 device-local KV + CPU copy。
+
+Chat 测试：
+
+```bash
+cd /home/cix/nano-vlm/nano-vllm
+PYTHONPATH=. python -m nanovllm.cli.chat \
+  --backend llamacpp_pd \
+  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
+  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
+  --threads 8 \
+  --threads-batch 8 \
+  --ubatch-size 512
+```
+
+Benchmark 测试：
+
+```bash
+cd /home/cix/nano-vlm/nano-vllm
+PYTHONPATH=. python -m nanovllm.cli.bench \
+  --backend llamacpp_pd \
+  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
+  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
+  --batch-size 1 \
+  --prompt-len 512 \
+  --gen-len 32 \
+  --warmup 1 \
+  --repeat 3 \
+  --threads 8 \
+  --threads-batch 8 \
+  --ubatch-size 512
+```
+
+初始化时 C++ backend 会打印每个 shared KV buffer 的名称、base pointer 和大小；`nanovllm.cli.bench` 会额外汇总 `shared_kv_mib`，并通过 `load_rss_mib` 记录模型初始化后的进程 RSS。
+
+第一版限制：
+
+- 只支持 GGUF 和 single process。
+- 只支持 dense non-SWA attention 模型。
+- prefill context 加载 Vulkan 权重，decode context 加载 CPU 权重，因此模型权重会加载两份。
+- 不做 CUDA 改动，不改变 `llamacpp_cpu` / `llamacpp_vulkan` 的行为。
+- 不做 KV copy fallback；不满足 zero-copy 条件时失败。
 
 默认 benchmark 会扰动 synthetic prompt，避免 prefix cache 影响 prefill 结果。
 

@@ -19,6 +19,7 @@ class BenchResult:
     use_prefix_cache: bool
     repeat: int
     load_s: float
+    load_rss_mib: float
     total_s: float
     prefill_s: float
     decode_s: float
@@ -28,11 +29,12 @@ class BenchResult:
     prefill_tok_s: float
     decode_tok_s: float
     generated_tok_s: float
+    shared_kv_mib: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="nano-vLLM benchmark CLI for CUDA and llama.cpp CPU/Vulkan backends.",
+        description="nano-vLLM benchmark CLI for CUDA and llama.cpp CPU/Vulkan/PD backends.",
     )
     parser.add_argument(
         "model",
@@ -43,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd"),
         help="Execution backend.",
     )
     parser.add_argument("--gguf-model", default=os.environ.get("NANOVLLM_GGUF_MODEL"))
@@ -59,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--ubatch-size",
         type=int,
         default=int(os.environ.get("NANOVLLM_UBATCH_SIZE", "0")),
-        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
+        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan/PD defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
     parser.add_argument("--threads-batch", type=int, default=int(os.environ.get("NANOVLLM_THREADS_BATCH", "8")))
@@ -120,6 +122,16 @@ def build_llm(args: argparse.Namespace) -> LLM:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
     )
+
+
+def current_rss_mib() -> float:
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as f:
+            fields = f.read().split()
+        resident_pages = int(fields[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1024.0 / 1024.0
+    except (OSError, IndexError, ValueError):
+        return 0.0
 
 
 def encode_prompt(llm: LLM, text: str) -> list[int]:
@@ -213,6 +225,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     load_start = perf_counter()
     llm = build_llm(args)
     load_s = perf_counter() - load_start
+    load_rss_mib = current_rss_mib()
 
     prompt_ids = make_prompt_token_ids(llm, args.prompt, args.prompt_len)
     vocab_size = get_vocab_size(llm)
@@ -220,6 +233,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=args.gen_len)
         for _ in range(args.batch_size)
     ]
+
+    shared_kv_mib = float(getattr(llm.model_runner, "shared_kv_bytes", 0)) / 1024.0 / 1024.0
 
     try:
         run_index = 0
@@ -257,6 +272,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         use_prefix_cache=args.use_prefix_cache,
         repeat=args.repeat,
         load_s=load_s,
+        load_rss_mib=load_rss_mib,
         total_s=totals["total_s"],
         prefill_s=totals["prefill_s"],
         decode_s=totals["decode_s"],
@@ -266,6 +282,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         prefill_tok_s=prefill_tok_s,
         decode_tok_s=decode_tok_s,
         generated_tok_s=generated_tok_s,
+        shared_kv_mib=shared_kv_mib,
     )
 
 
@@ -279,6 +296,10 @@ def print_result(result: BenchResult) -> None:
     print(f"prefix cache:       {result.use_prefix_cache}")
     print(f"repeat:             {result.repeat}")
     print(f"load time:          {result.load_s:.3f} s")
+    if result.load_rss_mib > 0:
+        print(f"load RSS:           {result.load_rss_mib:.2f} MiB")
+    if result.shared_kv_mib > 0:
+        print(f"shared KV pool:     {result.shared_kv_mib:.2f} MiB")
     print()
     print("metric              tokens        time(s)      tok/s")
     print(f"prefill             {result.prefill_tokens:>8}  {result.prefill_s:>10.3f}  {result.prefill_tok_s:>9.2f}")

@@ -38,7 +38,7 @@ def clean_response(text: str, template: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive nano-vLLM chat CLI for CUDA or llama.cpp CPU/Vulkan backends.",
+        description="Interactive nano-vLLM chat CLI for CUDA or llama.cpp CPU/Vulkan/PD backends.",
     )
     parser.add_argument(
         "model",
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd"),
         help="Execution backend.",
     )
     parser.add_argument(
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         "--ubatch-size",
         type=int,
         default=int(os.environ.get("NANOVLLM_UBATCH_SIZE", "0")),
-        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
+        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan/PD defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
     parser.add_argument(
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--gpu-layers",
         type=int,
         default=int(os.environ.get("NANOVLLM_GPU_LAYERS", "-1")),
-        help="Number of layers to offload for llama.cpp Vulkan. -1 means all supported layers.",
+        help="Number of layers to offload for llama.cpp Vulkan/PD prefill. -1 means all supported layers.",
     )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.6")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))

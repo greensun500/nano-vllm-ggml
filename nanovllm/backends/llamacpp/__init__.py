@@ -1,4 +1,4 @@
-from nanovllm.backends.llamacpp.runner import LlamaCppRunner
+from nanovllm.backends.llamacpp.runner import LlamaCppPDRunner, LlamaCppRunner
 
 
-__all__ = ["LlamaCppRunner"]
+__all__ = ["LlamaCppRunner", "LlamaCppPDRunner"]

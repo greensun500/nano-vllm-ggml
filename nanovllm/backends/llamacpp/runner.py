@@ -45,6 +45,12 @@ class _NanoLlamaKVPlan(ctypes.Structure):
 
 
 class LlamaCppRunner:
+    create_symbol = "nano_llama_backend_create"
+    destroy_symbol = "nano_llama_backend_destroy"
+    run_symbol = "nano_llama_backend_run"
+    release_blocks_symbol = "nano_llama_backend_release_blocks"
+    shared_kv_bytes_symbol: str | None = None
+
     def __init__(self, config: Config):
         self.config = config
         self.block_size = config.kvcache_block_size
@@ -52,7 +58,7 @@ class LlamaCppRunner:
         self._bind_functions()
 
         device_config = config.device_config or {}
-        backend_id = 1 if config.backend == "llamacpp_vulkan" else 0
+        backend_id = 1 if config.backend in ("llamacpp_vulkan", "llamacpp_pd") else 0
         default_ubatch = min(config.max_num_batched_tokens, 512) if backend_id == 1 else config.max_num_batched_tokens
         n_ubatch = device_config.get("n_ubatch") or default_ubatch
         params = _NanoLlamaBackendParams(
@@ -67,10 +73,11 @@ class LlamaCppRunner:
             offload_kqv=bool(device_config.get("offload_kqv", backend_id == 1)),
             flash_attn=bool(device_config.get("flash_attn", False)),
         )
-        self.ctx = self.lib.nano_llama_backend_create(ctypes.byref(params))
+        self.ctx = self._create(ctypes.byref(params))
         if not self.ctx:
             raise RuntimeError("failed to create nano llama.cpp backend context")
         self.vocab_size = int(self.lib.nano_llama_backend_vocab_size(self.ctx))
+        self.shared_kv_bytes = int(self._shared_kv_bytes(self.ctx)) if self._shared_kv_bytes else 0
 
     @staticmethod
     def _load_library(config: Config):
@@ -88,10 +95,21 @@ class LlamaCppRunner:
         return ctypes.CDLL(lib_path)
 
     def _bind_functions(self):
-        self.lib.nano_llama_backend_create.argtypes = [ctypes.POINTER(_NanoLlamaBackendParams)]
-        self.lib.nano_llama_backend_create.restype = ctypes.c_void_p
-        self.lib.nano_llama_backend_destroy.argtypes = [ctypes.c_void_p]
-        self.lib.nano_llama_backend_destroy.restype = None
+        def bind_symbol(name: str):
+            try:
+                return getattr(self.lib, name)
+            except AttributeError as exc:
+                raise RuntimeError(
+                    f"llama.cpp backend library does not export {name}. "
+                    "Rebuild libnanollama_backend.so with the matching nano-vLLM llama.cpp sources."
+                ) from exc
+
+        self._create = bind_symbol(self.create_symbol)
+        self._create.argtypes = [ctypes.POINTER(_NanoLlamaBackendParams)]
+        self._create.restype = ctypes.c_void_p
+        self._destroy = bind_symbol(self.destroy_symbol)
+        self._destroy.argtypes = [ctypes.c_void_p]
+        self._destroy.restype = None
         self.lib.nano_llama_backend_vocab_size.argtypes = [ctypes.c_void_p]
         self.lib.nano_llama_backend_vocab_size.restype = ctypes.c_int32
         self.lib.nano_llama_backend_eos_token.argtypes = [ctypes.c_void_p]
@@ -115,15 +133,17 @@ class LlamaCppRunner:
             ctypes.c_bool,
         ]
         self.lib.nano_llama_backend_detokenize.restype = ctypes.c_int32
-        self.lib.nano_llama_backend_run.argtypes = [
+        self._run = bind_symbol(self.run_symbol)
+        self._run.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(_NanoLlamaKVPlan),
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_int32,
             ctypes.c_int32,
         ]
-        self.lib.nano_llama_backend_run.restype = ctypes.c_int32
-        self.lib.nano_llama_backend_release_blocks.argtypes = [
+        self._run.restype = ctypes.c_int32
+        self._release_blocks = bind_symbol(self.release_blocks_symbol)
+        self._release_blocks.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_int32,
@@ -131,7 +151,12 @@ class LlamaCppRunner:
             ctypes.c_int32,
             ctypes.c_int32,
         ]
-        self.lib.nano_llama_backend_release_blocks.restype = None
+        self._release_blocks.restype = None
+        self._shared_kv_bytes = None
+        if self.shared_kv_bytes_symbol is not None:
+            self._shared_kv_bytes = bind_symbol(self.shared_kv_bytes_symbol)
+            self._shared_kv_bytes.argtypes = [ctypes.c_void_p]
+            self._shared_kv_bytes.restype = ctypes.c_size_t
 
     def call(self, method_name, *args):
         method = getattr(self, method_name)
@@ -170,7 +195,7 @@ class LlamaCppRunner:
     def run(self, plan: BackendExecutionPlan) -> list[int]:
         c_plan, buffers = self._make_c_plan(plan)
         logits = np.empty((len(plan.seq_ids), self.vocab_size), dtype=np.float32)
-        ret = self.lib.nano_llama_backend_run(
+        ret = self._run(
             self.ctx,
             ctypes.byref(c_plan),
             logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -232,7 +257,7 @@ class LlamaCppRunner:
         c_blocks = (ctypes.c_int32 * len(block_ids))(*block_ids)
         seq_ids = seq_ids or []
         c_seq_ids = (ctypes.c_int32 * max(1, len(seq_ids)))(*seq_ids or [-1])
-        self.lib.nano_llama_backend_release_blocks(
+        self._release_blocks(
             self.ctx,
             c_blocks,
             len(block_ids),
@@ -243,8 +268,16 @@ class LlamaCppRunner:
 
     def shutdown(self):
         if getattr(self, "ctx", None):
-            self.lib.nano_llama_backend_destroy(self.ctx)
+            self._destroy(self.ctx)
             self.ctx = None
 
     def exit(self):
         self.shutdown()
+
+
+class LlamaCppPDRunner(LlamaCppRunner):
+    create_symbol = "nano_llama_pd_backend_create"
+    destroy_symbol = "nano_llama_pd_backend_destroy"
+    run_symbol = "nano_llama_pd_backend_run"
+    release_blocks_symbol = "nano_llama_pd_backend_release_blocks"
+    shared_kv_bytes_symbol = "nano_llama_pd_backend_shared_kv_bytes"

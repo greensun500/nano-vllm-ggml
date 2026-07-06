@@ -24,7 +24,7 @@ class Config:
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
-        assert self.backend in ("cuda", "llamacpp_cpu", "llamacpp_vulkan")
+        assert self.backend in ("cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd")
         assert self.model_format in ("hf", "gguf")
         assert self.tokenizer_backend in ("hf", "llamacpp")
         assert self.kvcache_block_size % 256 == 0
