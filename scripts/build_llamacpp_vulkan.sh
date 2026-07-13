@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/home/cix/nano-vlm/llama.cpp}"
+LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/home/cix/nano-vllm/llama.cpp-qwen35}"
 BUILD_DIR="${BUILD_DIR:-${LLAMA_CPP_DIR}/build_nanovllm_vulkan}"
 VULKAN_INCLUDE_DIR="${VULKAN_INCLUDE_DIR:-/usr/include}"
 VULKAN_LIBRARY="${VULKAN_LIBRARY:-/usr/lib/aarch64-linux-gnu/libvulkan.so}"

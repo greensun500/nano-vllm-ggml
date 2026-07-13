@@ -10,8 +10,4 @@ def create_backend(config: Config, rank: int = 0, event=None):
         from nanovllm.backends.llamacpp.runner import LlamaCppRunner
 
         return LlamaCppRunner(config)
-    if config.backend == "llamacpp_pd":
-        from nanovllm.backends.llamacpp.runner import LlamaCppPDRunner
-
-        return LlamaCppPDRunner(config)
     raise ValueError(f"unsupported backend: {config.backend}")

@@ -49,16 +49,17 @@ class LlamaCppRunner:
     destroy_symbol = "nano_llama_backend_destroy"
     run_symbol = "nano_llama_backend_run"
     release_blocks_symbol = "nano_llama_backend_release_blocks"
-    shared_kv_bytes_symbol: str | None = None
 
     def __init__(self, config: Config):
         self.config = config
         self.block_size = config.kvcache_block_size
+        self._seq_slots: dict[int, int] = {}
+        self._free_seq_slots = list(reversed(range(config.max_num_seqs)))
         self.lib = self._load_library(config)
         self._bind_functions()
 
         device_config = config.device_config or {}
-        backend_id = 1 if config.backend in ("llamacpp_vulkan", "llamacpp_pd") else 0
+        backend_id = 1 if config.backend == "llamacpp_vulkan" else 0
         default_ubatch = min(config.max_num_batched_tokens, 512) if backend_id == 1 else config.max_num_batched_tokens
         n_ubatch = device_config.get("n_ubatch") or default_ubatch
         params = _NanoLlamaBackendParams(
@@ -77,7 +78,6 @@ class LlamaCppRunner:
         if not self.ctx:
             raise RuntimeError("failed to create nano llama.cpp backend context")
         self.vocab_size = int(self.lib.nano_llama_backend_vocab_size(self.ctx))
-        self.shared_kv_bytes = int(self._shared_kv_bytes(self.ctx)) if self._shared_kv_bytes else 0
 
     @staticmethod
     def _load_library(config: Config):
@@ -112,8 +112,14 @@ class LlamaCppRunner:
         self._destroy.restype = None
         self.lib.nano_llama_backend_vocab_size.argtypes = [ctypes.c_void_p]
         self.lib.nano_llama_backend_vocab_size.restype = ctypes.c_int32
-        self.lib.nano_llama_backend_eos_token.argtypes = [ctypes.c_void_p]
-        self.lib.nano_llama_backend_eos_token.restype = ctypes.c_int32
+        self.lib.nano_llama_backend_eog_token_count.argtypes = [ctypes.c_void_p]
+        self.lib.nano_llama_backend_eog_token_count.restype = ctypes.c_int32
+        self.lib.nano_llama_backend_eog_tokens.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_int32,
+        ]
+        self.lib.nano_llama_backend_eog_tokens.restype = ctypes.c_int32
         self.lib.nano_llama_backend_tokenize.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
@@ -151,19 +157,21 @@ class LlamaCppRunner:
             ctypes.c_int32,
             ctypes.c_int32,
         ]
-        self._release_blocks.restype = None
-        self._shared_kv_bytes = None
-        if self.shared_kv_bytes_symbol is not None:
-            self._shared_kv_bytes = bind_symbol(self.shared_kv_bytes_symbol)
-            self._shared_kv_bytes.argtypes = [ctypes.c_void_p]
-            self._shared_kv_bytes.restype = ctypes.c_size_t
+        self._release_blocks.restype = ctypes.c_int32
 
     def call(self, method_name, *args):
         method = getattr(self, method_name)
         return method(*args)
 
-    def eos_token_id(self) -> int:
-        return int(self.lib.nano_llama_backend_eos_token(self.ctx))
+    def eog_token_ids(self) -> tuple[int, ...]:
+        count = int(self.lib.nano_llama_backend_eog_token_count(self.ctx))
+        if count <= 0:
+            raise RuntimeError(f"llama.cpp backend returned invalid EOG token count: {count}")
+        tokens = (ctypes.c_int32 * count)()
+        result = int(self.lib.nano_llama_backend_eog_tokens(self.ctx, tokens, count))
+        if result != count:
+            raise RuntimeError(f"llama.cpp backend failed to return EOG tokens: {result}")
+        return tuple(tokens)
 
     def tokenize(self, text: str) -> list[int]:
         data = text.encode("utf-8")
@@ -214,10 +222,11 @@ class LlamaCppRunner:
         for block_table in plan.block_tables:
             flat_block_tables.extend(block_table + [-1] * (max_block_table_len - len(block_table)))
 
+        native_seq_ids = [self._native_seq_id(seq_id) for seq_id in plan.seq_ids]
         buffers = {
             "tokens": (ctypes.c_int32 * n_tokens)(*plan.input_ids),
             "positions": (ctypes.c_int32 * n_tokens)(*plan.positions),
-            "seq_ids": (ctypes.c_int32 * n_seqs)(*plan.seq_ids),
+            "seq_ids": (ctypes.c_int32 * n_seqs)(*native_seq_ids),
             "scheduled_token_counts": (ctypes.c_int32 * n_seqs)(*plan.scheduled_token_counts),
             "slot_mapping": (ctypes.c_int32 * max(1, len(plan.slot_mapping)))(*plan.slot_mapping or [-1]),
             "block_tables": (ctypes.c_int32 * max(1, len(flat_block_tables)))(*flat_block_tables or [-1]),
@@ -244,20 +253,31 @@ class LlamaCppRunner:
 
     @staticmethod
     def _sample(logits: np.ndarray, temperatures: np.ndarray) -> np.ndarray:
-        scaled = logits.astype(np.float32, copy=False) / temperatures[:, None]
-        scaled -= scaled.max(axis=1, keepdims=True)
-        probs = np.exp(scaled)
-        probs /= probs.sum(axis=1, keepdims=True)
-        noise = np.random.exponential(size=probs.shape).astype(np.float32)
-        return np.argmax(probs / np.maximum(noise, 1e-10), axis=1).astype(np.int32)
+        if np.any(temperatures != 0):
+            raise ValueError("the llama.cpp Qwen3.5 stage-1 backend only supports greedy decoding")
+        return np.argmax(logits, axis=1).astype(np.int32)
+
+    def _native_seq_id(self, seq_id: int) -> int:
+        native_seq_id = self._seq_slots.get(seq_id)
+        if native_seq_id is not None:
+            return native_seq_id
+        if not self._free_seq_slots:
+            raise RuntimeError("llama.cpp native sequence slots are exhausted")
+        native_seq_id = self._free_seq_slots.pop()
+        self._seq_slots[seq_id] = native_seq_id
+        return native_seq_id
 
     def release_blocks(self, block_ids: list[int], seq_ids: list[int] | None = None):
-        if not block_ids:
-            return
-        c_blocks = (ctypes.c_int32 * len(block_ids))(*block_ids)
         seq_ids = seq_ids or []
-        c_seq_ids = (ctypes.c_int32 * max(1, len(seq_ids)))(*seq_ids or [-1])
-        self._release_blocks(
+        if not seq_ids:
+            raise ValueError("llama.cpp native KV release requires sequence IDs")
+        missing = [seq_id for seq_id in seq_ids if seq_id not in self._seq_slots]
+        if missing:
+            raise RuntimeError(f"llama.cpp sequence slots are not allocated: {missing}")
+        native_seq_ids = [self._seq_slots[seq_id] for seq_id in seq_ids]
+        c_blocks = (ctypes.c_int32 * max(1, len(block_ids)))(*block_ids or [-1])
+        c_seq_ids = (ctypes.c_int32 * len(native_seq_ids))(*native_seq_ids)
+        result = self._release_blocks(
             self.ctx,
             c_blocks,
             len(block_ids),
@@ -265,6 +285,11 @@ class LlamaCppRunner:
             len(seq_ids),
             self.block_size,
         )
+        if result != 0:
+            raise RuntimeError(f"llama.cpp sequence release failed with code {result}")
+        for seq_id, native_seq_id in zip(seq_ids, native_seq_ids):
+            del self._seq_slots[seq_id]
+            self._free_seq_slots.append(native_seq_id)
 
     def shutdown(self):
         if getattr(self, "ctx", None):
@@ -273,11 +298,3 @@ class LlamaCppRunner:
 
     def exit(self):
         self.shutdown()
-
-
-class LlamaCppPDRunner(LlamaCppRunner):
-    create_symbol = "nano_llama_pd_backend_create"
-    destroy_symbol = "nano_llama_pd_backend_destroy"
-    run_symbol = "nano_llama_pd_backend_run"
-    release_blocks_symbol = "nano_llama_pd_backend_release_blocks"
-    shared_kv_bytes_symbol = "nano_llama_pd_backend_shared_kv_bytes"

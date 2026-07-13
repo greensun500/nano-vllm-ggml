@@ -25,11 +25,13 @@ def format_chat_prompt(messages: list[dict[str, str]], system_prompt: str, templ
     for message in messages:
         prompt += f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
     prompt += "<|im_start|>assistant\n"
+    if template == "qwen35":
+        prompt += "<think>\n\n</think>\n\n"
     return prompt
 
 
 def clean_response(text: str, template: str) -> str:
-    if template == "qwen":
+    if template in ("qwen", "qwen35"):
         for stop in QWEN_STOPS:
             if stop in text:
                 text = text.split(stop, 1)[0]
@@ -38,7 +40,7 @@ def clean_response(text: str, template: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive nano-vLLM chat CLI for CUDA or llama.cpp CPU/Vulkan/PD backends.",
+        description="Interactive nano-vLLM chat CLI for CUDA or llama.cpp CPU/Vulkan backends.",
     )
     parser.add_argument(
         "model",
@@ -49,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
         help="Execution backend.",
     )
     parser.add_argument(
@@ -63,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to libnanollama_backend.so.",
     )
     parser.add_argument("--max-model-len", type=int, default=int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "2048")))
-    parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "8")))
+    parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "1")))
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -73,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--ubatch-size",
         type=int,
         default=int(os.environ.get("NANOVLLM_UBATCH_SIZE", "0")),
-        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan/PD defaults to min(batch, 512).",
+        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
     parser.add_argument(
@@ -85,9 +87,9 @@ def parse_args() -> argparse.Namespace:
         "--gpu-layers",
         type=int,
         default=int(os.environ.get("NANOVLLM_GPU_LAYERS", "-1")),
-        help="Number of layers to offload for llama.cpp Vulkan/PD prefill. -1 means all supported layers.",
+        help="Number of layers to offload with Vulkan. -1 means all supported layers.",
     )
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.6")))
+    parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
     parser.add_argument(
         "--system",
@@ -96,8 +98,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--template",
-        default=os.environ.get("NANOVLLM_CHAT_TEMPLATE", "qwen"),
-        choices=("qwen", "plain"),
+        default=os.environ.get("NANOVLLM_CHAT_TEMPLATE", "qwen35"),
+        choices=("qwen35", "qwen", "plain"),
         help="Prompt template used to convert chat history into one generation prompt.",
     )
     parser.add_argument(

@@ -45,85 +45,41 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
-## llama.cpp CPU/Vulkan/PD backend
+## Qwen3.5 llama.cpp CPU/Vulkan backend
 
-The experimental llama.cpp backend keeps nano-vLLM's scheduler and paged KV block manager, while llama.cpp executes the model on CPU, Vulkan, or PD-separated Vulkan-prefill/CPU-decode.
+Stage 1 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. It uses llama.cpp native hybrid memory, nano-vLLM scheduling, the Qwen3.5 non-thinking chat template, all model EOG tokens, and greedy decoding. Paged KV and built-in MTP are intentionally deferred to stages 2 and 3.
+
+The integration is based on official llama.cpp commit `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`. Build the dedicated llama.cpp checkout:
 
 ```bash
-LLAMA_CPP_DIR=/home/cix/nano-vlm/llama.cpp ./scripts/build_llamacpp_cpu.sh
-export NANOVLLM_LLAMA_BACKEND_LIB=/home/cix/nano-vlm/llama.cpp/build_nanovllm_cpu/bin/libnanollama_backend.so
-export NANOVLLM_GGUF_MODEL=/home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf
-PYTHONPATH=. python examples/llamacpp_backend.py
+./scripts/build_llamacpp_cpu.sh
+./scripts/build_llamacpp_vulkan.sh
 ```
 
-Use `NANOVLLM_BACKEND=llamacpp_vulkan` with `scripts/build_llamacpp_vulkan.sh` for Vulkan.
-
-Use `NANOVLLM_BACKEND=llamacpp_pd` with the Vulkan build for strict zero-copy PD separation. In this mode prefill runs on Vulkan, decode runs on CPU, and both contexts share one Vulkan host-visible KV pool. If llama.cpp cannot create a `Vulkan_Host` KV buffer, initialization fails instead of silently falling back to KV copy.
-
-Interactive chat test:
+Run CPU chat:
 
 ```bash
 PYTHONPATH=. python -m nanovllm.cli.chat \
   --backend llamacpp_cpu \
-  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
-  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_cpu/bin/libnanollama_backend.so
+  --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
+  --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_cpu/bin/libnanollama_backend.so \
+  --temperature 0
 ```
 
-For Vulkan:
+Run Vulkan chat:
 
 ```bash
 PYTHONPATH=. python -m nanovllm.cli.chat \
   --backend llamacpp_vulkan \
-  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
-  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
-  --ubatch-size 512
+  --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
+  --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_vulkan/bin/libnanollama_backend.so \
+  --gpu-layers -1 \
+  --temperature 0
 ```
 
-For PD zero-copy:
+The stage-1 llama.cpp backend disables nano-vLLM prefix caching because llama.cpp owns the KV state. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
 
-```bash
-PYTHONPATH=. python -m nanovllm.cli.chat \
-  --backend llamacpp_pd \
-  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
-  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
-  --ubatch-size 512
-```
-
-Inside the chat CLI, use `/reset` to clear history, `/system <prompt>` to change the system prompt, and `/exit` to quit.
-
-Benchmark CPU/Vulkan/PD performance:
-
-```bash
-PYTHONPATH=. python -m nanovllm.cli.bench \
-  --backend llamacpp_vulkan \
-  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
-  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
-  --batch-size 1 \
-  --prompt-len 128 \
-  --gen-len 32 \
-  --warmup 1 \
-  --repeat 3 \
-  --ubatch-size 512
-```
-
-PD benchmark:
-
-```bash
-PYTHONPATH=. python -m nanovllm.cli.bench \
-  --backend llamacpp_pd \
-  --gguf-model /home/cix/Qwen2.5-3B-Instruct-Q4_0.gguf \
-  --library-path /home/cix/nano-vlm/llama.cpp/build_nanovllm_vulkan/bin/libnanollama_backend.so \
-  --batch-size 1 \
-  --prompt-len 512 \
-  --gen-len 32 \
-  --warmup 1 \
-  --repeat 3 \
-  --ubatch-size 512
-```
-
-The benchmark reports prefill input throughput, decode-step throughput, end-to-end generated-token throughput, load-time RSS, and load time. For PD it also reports the shared KV pool size. By default it perturbs synthetic prompts between runs to avoid measuring prefix-cache hits; add `--use-prefix-cache` when you want to benchmark cache reuse. Use `--json` for machine-readable output.
-
-See `NANOVLLM_LLAMA_CPP_V2.0_PD_ZERO_COPY.zh.md` for the v2.0 PD zero-copy architecture, source-reading guide, benchmark interpretation, and optimization directions.
+See `QWEN35_STAGED_IMPLEMENTATION.zh.md` for stage boundaries, validation evidence, and reflection notes.
 
 ## Benchmark
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/home/cix/nano-vlm/llama.cpp}"
+LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/home/cix/nano-vllm/llama.cpp-qwen35}"
 BUILD_DIR="${BUILD_DIR:-${LLAMA_CPP_DIR}/build_nanovllm_cpu}"
 
 cmake -S "${LLAMA_CPP_DIR}" -B "${BUILD_DIR}" \

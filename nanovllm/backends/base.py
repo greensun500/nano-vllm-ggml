@@ -6,7 +6,7 @@ from typing import Literal
 from nanovllm.engine.sequence import Sequence
 
 
-BackendName = Literal["cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd"]
+BackendName = Literal["cuda", "llamacpp_cpu", "llamacpp_vulkan"]
 PlanMode = Literal["prefill", "decode"]
 
 

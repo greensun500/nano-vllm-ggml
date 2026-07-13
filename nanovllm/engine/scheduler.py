@@ -10,10 +10,14 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs  # 最大同时调度的序列（请求）数
         self.max_num_batched_tokens = config.max_num_batched_tokens  # 一个batch中最多的总token数（调度最大token数）
-        self.eos = config.eos  # 终止token的ID（end-of-sequence）
+        self.eos_token_ids = frozenset(config.eos_token_ids)
         self.block_size = config.kvcache_block_size  # KV Cache的block大小（每个块包含的token数）
         # BlockManager用于管理KV cache的分配与回收，第一个参数为可分配的block数，第二个为每个block的大小
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            enable_prefix_cache=config.enable_prefix_cache,
+        )
         self.waiting: deque[Sequence] = deque()  # 等待调度的序列队列
         self.running: deque[Sequence] = deque()  # 正在运行的序列队列
         self.block_releases: list[tuple[list[int], int]] = []
@@ -94,7 +98,7 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if (not seq.ignore_eos and token_id in self.eos_token_ids) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 block_ids = self.block_manager.deallocate(seq)
                 self.block_releases.append((block_ids, seq.seq_id))

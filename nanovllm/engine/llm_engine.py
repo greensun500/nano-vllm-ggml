@@ -37,13 +37,14 @@ class LLMEngine:
         self.closed = False
         if config.tokenizer_backend == "llamacpp":
             self.tokenizer = None
-            config.eos = self.model_runner.call("eos_token_id")
+            config.eos_token_ids = self.model_runner.call("eog_token_ids")
         else:
             from transformers import AutoTokenizer
 
             tokenizer_path = config.tokenizer or config.model
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
-            config.eos = self.tokenizer.eos_token_id
+            eos_token_id = self.tokenizer.eos_token_id
+            config.eos_token_ids = (eos_token_id,) if isinstance(eos_token_id, int) else tuple(eos_token_id or ())
         self.scheduler = Scheduler(config)#调度器
         atexit.register(self.exit)#整个程序退出时候字段调用
 

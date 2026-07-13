@@ -29,12 +29,11 @@ class BenchResult:
     prefill_tok_s: float
     decode_tok_s: float
     generated_tok_s: float
-    shared_kv_mib: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="nano-vLLM benchmark CLI for CUDA and llama.cpp CPU/Vulkan/PD backends.",
+        description="nano-vLLM benchmark CLI for CUDA and llama.cpp CPU/Vulkan backends.",
     )
     parser.add_argument(
         "model",
@@ -45,13 +44,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "llamacpp_pd"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
         help="Execution backend.",
     )
     parser.add_argument("--gguf-model", default=os.environ.get("NANOVLLM_GGUF_MODEL"))
     parser.add_argument("--library-path", default=os.environ.get("NANOVLLM_LLAMA_BACKEND_LIB"))
     parser.add_argument("--max-model-len", type=int, default=int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "2048")))
-    parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "8")))
+    parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "1")))
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -61,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--ubatch-size",
         type=int,
         default=int(os.environ.get("NANOVLLM_UBATCH_SIZE", "0")),
-        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan/PD defaults to min(batch, 512).",
+        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
     parser.add_argument("--threads-batch", type=int, default=int(os.environ.get("NANOVLLM_THREADS_BATCH", "8")))
@@ -71,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gen-len", type=int, default=int(os.environ.get("NANOVLLM_BENCH_GEN_LEN", "32")))
     parser.add_argument("--repeat", type=int, default=int(os.environ.get("NANOVLLM_BENCH_REPEAT", "3")))
     parser.add_argument("--warmup", type=int, default=int(os.environ.get("NANOVLLM_BENCH_WARMUP", "1")))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.6")))
+    parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
@@ -234,8 +233,6 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         for _ in range(args.batch_size)
     ]
 
-    shared_kv_mib = float(getattr(llm.model_runner, "shared_kv_bytes", 0)) / 1024.0 / 1024.0
-
     try:
         run_index = 0
         for _ in range(args.warmup):
@@ -282,7 +279,6 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         prefill_tok_s=prefill_tok_s,
         decode_tok_s=decode_tok_s,
         generated_tok_s=generated_tok_s,
-        shared_kv_mib=shared_kv_mib,
     )
 
 
@@ -298,8 +294,6 @@ def print_result(result: BenchResult) -> None:
     print(f"load time:          {result.load_s:.3f} s")
     if result.load_rss_mib > 0:
         print(f"load RSS:           {result.load_rss_mib:.2f} MiB")
-    if result.shared_kv_mib > 0:
-        print(f"shared KV pool:     {result.shared_kv_mib:.2f} MiB")
     print()
     print("metric              tokens        time(s)      tok/s")
     print(f"prefill             {result.prefill_tokens:>8}  {result.prefill_s:>10.3f}  {result.prefill_tok_s:>9.2f}")
