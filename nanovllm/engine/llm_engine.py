@@ -75,9 +75,10 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()#调度返回这一轮要计算的seq列表（包括prompt+采样参数），以及是否是prefill
         self.flush_backend_releases()
         plan = build_execution_plan(seqs, is_prefill, self.config.kvcache_block_size)
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)#计算这轮处理了多少token数据
-        token_ids = self.model_runner.call("run", plan)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        result = self.model_runner.call("run", plan)
+        num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill
+                      else -sum(len(token_ids) for token_ids in result.token_ids))#计算这轮处理了多少token数据
+        self.scheduler.postprocess(seqs, result, is_prefill)
         self.flush_backend_releases()
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens

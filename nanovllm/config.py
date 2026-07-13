@@ -22,6 +22,8 @@ class Config:
     eos_token_ids: tuple[int, ...] = ()
     enable_prefix_cache: bool | None = None
     enable_preemption: bool | None = None
+    enable_mtp: bool = False
+    mtp_max_draft_tokens: int = 3
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
@@ -36,6 +38,7 @@ class Config:
         if self.enable_preemption is None:
             self.enable_preemption = self.backend == "cuda"
         if self.backend == "cuda":
+            assert not self.enable_mtp, "built-in MTP is only supported by the llama.cpp backend"
             from transformers import AutoConfig
 
             assert os.path.isdir(self.model)
@@ -51,6 +54,11 @@ class Config:
             assert self.gguf_model is not None, "llama.cpp backend requires gguf_model=/path/to/model.gguf"
             assert os.path.isfile(self.gguf_model)
             assert self.tensor_parallel_size == 1, "llama.cpp backend v1 is single-process"
+            if self.enable_mtp:
+                assert self.mtp_max_draft_tokens > 0
+                assert self.max_num_batched_tokens >= self.max_num_seqs * (self.mtp_max_draft_tokens + 1), (
+                    "max_num_batched_tokens must fit one MTP verification batch"
+                )
             if self.num_kvcache_blocks <= 0:
                 self.num_kvcache_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
             self.max_model_len = self.num_kvcache_blocks * self.kvcache_block_size

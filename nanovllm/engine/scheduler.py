@@ -1,6 +1,7 @@
 from collections import deque
 
 from nanovllm.config import Config
+from nanovllm.backends.base import BackendExecutionResult
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
@@ -12,6 +13,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens  # 一个batch中最多的总token数（调度最大token数）
         self.eos_token_ids = frozenset(config.eos_token_ids)
         self.enable_preemption = config.enable_preemption
+        self.speculative_tokens = config.mtp_max_draft_tokens if config.enable_mtp else 0
         self.block_size = config.kvcache_block_size  # KV Cache的block大小（每个块包含的token数）
         # BlockManager用于管理KV cache的分配与回收，第一个参数为可分配的block数，第二个为每个block的大小
         self.block_manager = BlockManager(
@@ -71,9 +73,9 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            if not self.enable_preemption and not self.block_manager.can_append(seq):
+            if not self.enable_preemption and not self.block_manager.can_append(seq, self.speculative_tokens):
                 raise RuntimeError("paged KV cache is full and preemption is disabled")
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, self.speculative_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -82,7 +84,7 @@ class Scheduler:
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, self.speculative_tokens)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -95,19 +97,26 @@ class Scheduler:
         self.block_releases.append((block_ids, seq.seq_id))
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
+    def postprocess(self, seqs: list[Sequence], result: BackendExecutionResult, is_prefill: bool):
+        assert len(seqs) == len(result.token_ids)
+        for seq, token_ids in zip(seqs, result.token_ids):
+            assert token_ids
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
+            if not is_prefill:
+                seq.num_cached_tokens += len(token_ids) - 1
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id in self.eos_token_ids) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                block_ids = self.block_manager.deallocate(seq)
-                self.block_releases.append((block_ids, seq.seq_id))
-                self.running.remove(seq)
+            for token_id in token_ids:
+                seq.append_token(token_id)
+                if ((not seq.ignore_eos and token_id in self.eos_token_ids) or
+                        seq.num_completion_tokens == seq.max_tokens):
+                    seq.status = SequenceStatus.FINISHED
+                    block_ids = self.block_manager.deallocate(seq)
+                    self.block_releases.append((block_ids, seq.seq_id))
+                    self.running.remove(seq)
+                    break
 
     def pop_block_releases(self) -> list[tuple[list[int], int]]:
         block_releases = self.block_releases

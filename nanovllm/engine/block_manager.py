@@ -116,11 +116,15 @@ class BlockManager:
         seq.block_table.clear()
         return released_block_ids
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def _append_block_count(self, seq: Sequence, speculative_tokens: int) -> int:
+        required_blocks = (len(seq) + speculative_tokens + self.block_size - 1) // self.block_size
+        return max(0, required_blocks - len(seq.block_table))
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    def can_append(self, seq: Sequence, speculative_tokens: int = 0) -> bool:
+        return len(self.free_block_ids) >= self._append_block_count(seq, speculative_tokens)
+
+    def may_append(self, seq: Sequence, speculative_tokens: int = 0):
+        for _ in range(self._append_block_count(seq, speculative_tokens)):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

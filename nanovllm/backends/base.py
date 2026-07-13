@@ -28,6 +28,12 @@ class BackendExecutionPlan:
         return self.mode == "prefill"
 
 
+@dataclass(slots=True)
+class BackendExecutionResult:
+    token_ids: list[list[int]]
+    draft_token_counts: list[int] | None = None
+
+
 def build_execution_plan(seqs: list[Sequence], is_prefill: bool, block_size: int) -> BackendExecutionPlan:
     input_ids: list[int] = []
     positions: list[int] = []
@@ -75,7 +81,8 @@ def build_execution_plan(seqs: list[Sequence], is_prefill: bool, block_size: int
             context_lens.append(len(seq))
             num_cached_tokens.append(seq.num_cached_tokens)
             temperatures.append(seq.temperature)
-            slot_mapping.append(seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1)
+            position = len(seq) - 1
+            slot_mapping.append(seq.block_table[position // block_size] * block_size + position % block_size)
 
     return BackendExecutionPlan(
         mode="prefill" if is_prefill else "decode",
@@ -95,7 +102,7 @@ class BackendRunner:
     def allocate_kv_cache(self, num_blocks: int, block_size: int):
         raise NotImplementedError
 
-    def run(self, plan: BackendExecutionPlan) -> list[int]:
+    def run(self, plan: BackendExecutionPlan) -> BackendExecutionResult:
         raise NotImplementedError
 
     def release_blocks(self, block_ids: list[int], seq_ids: list[int] | None = None):

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nanovllm.backends.base import BackendExecutionPlan
+from nanovllm.backends.base import BackendExecutionPlan, BackendExecutionResult
 from nanovllm.config import Config
 
 
@@ -22,6 +22,8 @@ class _NanoLlamaBackendParams(ctypes.Structure):
         ("n_gpu_layers", ctypes.c_int32),
         ("offload_kqv", ctypes.c_bool),
         ("flash_attn", ctypes.c_bool),
+        ("enable_mtp", ctypes.c_bool),
+        ("mtp_max_draft_tokens", ctypes.c_int32),
     ]
 
 
@@ -48,6 +50,7 @@ class LlamaCppRunner:
     create_symbol = "nano_llama_backend_create"
     destroy_symbol = "nano_llama_backend_destroy"
     run_symbol = "nano_llama_backend_run"
+    run_mtp_symbol = "nano_llama_backend_run_mtp"
     release_blocks_symbol = "nano_llama_backend_release_blocks"
 
     def __init__(self, config: Config):
@@ -55,6 +58,9 @@ class LlamaCppRunner:
         self.block_size = config.kvcache_block_size
         self._seq_slots: dict[int, int] = {}
         self._free_seq_slots = list(reversed(range(config.max_num_seqs)))
+        self.mtp_drafted_tokens = 0
+        self.mtp_accepted_tokens = 0
+        self.mtp_verification_steps = 0
         self.lib = self._load_library(config)
         self._bind_functions()
 
@@ -73,6 +79,8 @@ class LlamaCppRunner:
             n_gpu_layers=int(device_config.get("n_gpu_layers", -1 if backend_id == 1 else 0)),
             offload_kqv=bool(device_config.get("offload_kqv", backend_id == 1)),
             flash_attn=bool(device_config.get("flash_attn", False)),
+            enable_mtp=config.enable_mtp,
+            mtp_max_draft_tokens=config.mtp_max_draft_tokens,
         )
         self.ctx = self._create(ctypes.byref(params))
         if not self.ctx:
@@ -148,6 +156,16 @@ class LlamaCppRunner:
             ctypes.c_int32,
         ]
         self._run.restype = ctypes.c_int32
+        self._run_mtp = bind_symbol(self.run_mtp_symbol)
+        self._run_mtp.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_NanoLlamaKVPlan),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_int32,
+        ]
+        self._run_mtp.restype = ctypes.c_int32
         self._release_blocks = bind_symbol(self.release_blocks_symbol)
         self._release_blocks.argtypes = [
             ctypes.c_void_p,
@@ -200,8 +218,33 @@ class LlamaCppRunner:
     def allocate_kv_cache(self, num_blocks: int, block_size: int):
         return None
 
-    def run(self, plan: BackendExecutionPlan) -> list[int]:
+    def run(self, plan: BackendExecutionPlan) -> BackendExecutionResult:
         c_plan, buffers = self._make_c_plan(plan)
+        temperatures = np.asarray(plan.temperatures, dtype=np.float32)
+        if self.config.enable_mtp and not plan.is_prefill:
+            if np.any(temperatures != 0):
+                raise ValueError("the llama.cpp Qwen3.5 backend only supports greedy decoding")
+            capacity = self.config.mtp_max_draft_tokens + 1
+            token_ids = np.empty((len(plan.seq_ids), capacity), dtype=np.int32)
+            output_counts = np.empty(len(plan.seq_ids), dtype=np.int32)
+            draft_counts = np.empty(len(plan.seq_ids), dtype=np.int32)
+            ret = self._run_mtp(
+                self.ctx,
+                ctypes.byref(c_plan),
+                token_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                output_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                draft_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                capacity,
+            )
+            if ret != 0:
+                raise RuntimeError(f"llama.cpp MTP execution failed with code {ret}")
+            outputs = [token_ids[row, :count].tolist() for row, count in enumerate(output_counts)]
+            drafts = draft_counts.tolist()
+            self.mtp_drafted_tokens += sum(drafts)
+            self.mtp_accepted_tokens += sum(len(output) - 1 for output in outputs)
+            self.mtp_verification_steps += len(outputs)
+            return BackendExecutionResult(outputs, drafts)
+
         logits = np.empty((len(plan.seq_ids), self.vocab_size), dtype=np.float32)
         ret = self._run(
             self.ctx,
@@ -212,7 +255,15 @@ class LlamaCppRunner:
         )
         if ret != 0:
             raise RuntimeError(f"llama.cpp backend execution failed with code {ret}")
-        return self._sample(logits, np.asarray(plan.temperatures, dtype=np.float32)).tolist()
+        sampled = self._sample(logits, temperatures).tolist()
+        return BackendExecutionResult([[token_id] for token_id in sampled])
+
+    def mtp_stats(self) -> dict[str, int]:
+        return {
+            "drafted_tokens": self.mtp_drafted_tokens,
+            "accepted_tokens": self.mtp_accepted_tokens,
+            "verification_steps": self.mtp_verification_steps,
+        }
 
     def _make_c_plan(self, plan: BackendExecutionPlan):
         n_tokens = len(plan.input_ids)

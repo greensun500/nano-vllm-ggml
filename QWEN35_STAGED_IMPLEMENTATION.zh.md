@@ -79,3 +79,37 @@ Qwen3.5 的 paged KV 不能等价成“把整个 hybrid memory 分页”。Full-
 当前释放粒度仍是完整序列，而不是单独 page。这与“无 prefix cache、无 preemption”的阶段边界一致；序列生命周期内 page 独占，结束时完整清理即可。当前 attention 计算仍可能扫描到最高已用 cell 的 padding 范围，性能不是本阶段验收项。
 
 阶段 3 的关键新增约束是拒绝 draft token 后的回滚：attention page metadata、target KV 内容和 recurrent state 必须回到最后接受位置。不能只回收 attention page 而忽略 recurrent state；应优先复用官方 MTP 上下文与 `n_rs_seq` 回滚快照语义。
+
+## 阶段 3：内置 MTP greedy speculative decoding
+
+状态：完成。
+
+实现边界：
+
+- 直接复用 GGUF 内的 next-token prediction layer 和官方 `draft-mtp` 实现，不加载第二份 draft model。
+- target context 的 full-attention KV 继续使用阶段 2 的 paged slot；MTP context 使用 llama.cpp 原生 memory，二者不会共享外部 page plan。
+- decode 结果由单 token 扩展为每序列一组已验证 token；调度器一次提交 `1 + 已接受 draft 数` 个 cache 位置，并按最大 draft 数预留可能跨越的 page。
+- target 与 MTP context 都配置 `n_rs_seq=mtp_max_draft_tokens`。验证后从第一个拒绝位置同时回滚 target attention metadata、target recurrent snapshot 和 MTP state。
+- sequence slot 完整释放时同步重置 MTP 的 `pending_h`、sampler 和验证行，并清理对应 recurrent device cell；请求 ID 仍可安全映射到有限 native slot。
+- `enable_mtp` 默认关闭，显式开启后默认最多 draft 3 个 token；第一版仍拒绝非零 temperature。
+- runner 累积 `drafted_tokens`、`accepted_tokens` 和 `verification_steps`，使验收能证明 MTP 确实参与生成，而不只是成功初始化。
+
+验证结果：
+
+- 官方 `llama-speculative` 使用同一 GGUF 在本机 CPU 跑通 `draft-mtp`，6/6 draft token 被接受。
+- nano-vLLM 本机 CPU：普通 greedy 与 MTP 的 16-token 输出逐 token 一致；MTP draft 15、接受 13。
+- 本机双序列 batch 连续执行两轮，native slot 释放/复用后输出完全一致；累计 draft 48、接受 32。
+- 本机 257-token chunked prefill 使用 block table `[3, 1]`，MTP 与连续 page 输出一致，draft 9/9 接受。
+- CIX CPU 与 Vulkan：普通 greedy 与 MTP 的 16-token 输出完全一致；连续页与 `[3, 1]` 非连续页的 12-token 输出完全一致；两端均 draft 33、接受 31。
+- CIX Vulkan 日志确认使用 `Mali-G720-Immortalis`；完整释放后连续三次更换 page 的非 MTP/MTP 回归均通过。
+- 本机和 CIX 的 7 项阶段测试全部通过，CPU/Vulkan 后端均重新构建成功。
+
+### 阶段 3 反思
+
+投机解码的 cache 不变量与普通单步 decode 不同：target 会验证“当前未入 cache 的 token + draft”，最终保留当前 token 和已接受 draft，而返回的最后一个 target token仍未入 cache。若只把多 token 当成批量输出而不同时推进 `num_cached_tokens`，下一轮 position 会立即错位。阶段 3 因此把多 token 结果建模为后端执行结果，而不是在 runner 内偷偷循环单 token。
+
+`n_rs_seq` 是 Qwen3.5 hybrid 模型正确回滚的核心。仅删除被拒绝 draft 的 attention cell 会留下已经前进的 linear-attention state；整段保存/恢复虽然可行，但没有必要。给 target 和 MTP context 保留与最大 draft 数相同的 per-token snapshot 后，拒绝数量天然不超过可回滚深度，能直接回到最后接受位置。
+
+更严格的 Vulkan 复用测试还暴露了阶段 2 验收未覆盖的生命周期问题：recurrent `seq_rm` 原先只清 cell metadata，设备行依赖后续图内 zero 操作。请求长度和物理 page 组合变化时，Vulkan 图复用可能读到旧行。完整释放时显式清零该 cell 及其 rollback snapshot 后，CPU/Vulkan 和 MTP/非 MTP 的换页复用都稳定一致。这说明 sequence 生命周期验收必须同时检查 metadata 与设备数据，而不能只看 allocator 已归还 page。
+
+本阶段不以吞吐、接受率或额外内存为门槛。当前实现会为 recurrent rollback 增加 snapshot memory，并链接 llama.cpp common speculative library；这些是后续性能阶段的优化对象，不影响本阶段的正确性结论。

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from nanovllm.backends.llamacpp.runner import LlamaCppRunner
-from nanovllm.backends.base import build_execution_plan
+from nanovllm.backends.base import BackendExecutionResult, build_execution_plan
 from nanovllm.cli.chat import format_chat_prompt
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler import Scheduler
@@ -46,12 +46,14 @@ class Qwen35Tests(unittest.TestCase):
             num_kvcache_blocks=1,
             enable_prefix_cache=False,
             enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1], SamplingParams(max_tokens=4))
         scheduler.add(sequence)
         scheduled, is_prefill = scheduler.schedule()
-        scheduler.postprocess(scheduled, [9], is_prefill)
+        scheduler.postprocess(scheduled, BackendExecutionResult([[9]]), is_prefill)
         self.assertTrue(sequence.is_finished)
         self.assertEqual(scheduler.pop_block_releases(), [([0], sequence.seq_id)])
 
@@ -95,14 +97,46 @@ class Qwen35Tests(unittest.TestCase):
             num_kvcache_blocks=1,
             enable_prefix_cache=False,
             enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1] * 256, SamplingParams(max_tokens=2))
         scheduler.add(sequence)
         scheduled, is_prefill = scheduler.schedule()
-        scheduler.postprocess(scheduled, [2], is_prefill)
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
         with self.assertRaisesRegex(RuntimeError, "preemption is disabled"):
             scheduler.schedule()
+
+    def test_mtp_reserves_pages_and_commits_multiple_tokens(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=2,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=True,
+            mtp_max_draft_tokens=3,
+        )
+        scheduler = Scheduler(config)
+        sequence = Sequence([1] * 253, SamplingParams(max_tokens=8))
+        scheduler.add(sequence)
+
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertFalse(is_prefill)
+        self.assertEqual(len(sequence.block_table), 2)
+
+        scheduler.postprocess(
+            scheduled,
+            BackendExecutionResult([[3, 4, 5, 6]], [3]),
+            is_prefill,
+        )
+        self.assertEqual(sequence.completion_token_ids, [2, 3, 4, 5, 6])
+        self.assertEqual(sequence.num_cached_tokens, 257)
 
 
 if __name__ == "__main__":

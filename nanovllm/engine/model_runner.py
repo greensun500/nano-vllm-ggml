@@ -5,7 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.backends.base import BackendExecutionPlan, build_execution_plan
+from nanovllm.backends.base import BackendExecutionPlan, BackendExecutionResult, build_execution_plan
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -188,13 +188,13 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, plan: BackendExecutionPlan) -> list[int]:#模型核心推理代码，
+    def run(self, plan: BackendExecutionPlan) -> BackendExecutionResult:#模型核心推理代码，
         input_ids, positions = self.prepare_prefill(plan) if plan.is_prefill else self.prepare_decode(plan)#根据是prefill还是decode，准备输入数据
         temperatures = self.prepare_sample(plan) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, plan.is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else []
         reset_context()
-        return token_ids
+        return BackendExecutionResult([[token_id] for token_id in token_ids])
 
     def release_blocks(self, block_ids: list[int], seq_ids: list[int] | None = None):
         return None

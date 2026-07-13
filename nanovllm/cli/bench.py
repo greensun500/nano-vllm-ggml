@@ -192,8 +192,8 @@ def run_generation_once(
         plan = build_execution_plan(seqs, is_prefill, llm.config.kvcache_block_size)
         scheduled_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else len(seqs)
         completion_counts = [seq.num_completion_tokens for seq in seqs]
-        token_ids = llm.model_runner.call("run", plan)
-        llm.scheduler.postprocess(seqs, token_ids, is_prefill)
+        result = llm.model_runner.call("run", plan)
+        llm.scheduler.postprocess(seqs, result, is_prefill)
         llm.flush_backend_releases()
         elapsed = perf_counter() - t0
 
@@ -203,7 +203,7 @@ def run_generation_once(
             prefill_tokens += scheduled_tokens
         else:
             decode_s += elapsed
-            decode_tokens += scheduled_tokens
+            decode_tokens += sum(len(token_ids) for token_ids in result.token_ids)
 
     return {
         "total_s": perf_counter() - total_start,

@@ -47,7 +47,9 @@ outputs[0]["text"]
 
 ## Qwen3.5 llama.cpp CPU/Vulkan backend
 
-Stage 2 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. Full-attention layers use nano-vLLM paged KV slots, recurrent layers keep one native state per sequence, and both are applied through llama.cpp hybrid memory. The backend also supports the Qwen3.5 non-thinking chat template, all model EOG tokens, and greedy decoding. Built-in MTP is deferred to stage 3.
+Stage 3 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. Full-attention layers use nano-vLLM paged KV slots, recurrent layers keep one native state per sequence, and the GGUF's built-in MTP layer can perform greedy speculative decoding without a separate draft model. The backend also supports the Qwen3.5 non-thinking chat template and all model EOG tokens.
+
+MTP is opt-in. `mtp_max_draft_tokens` defaults to 3, matching the current llama.cpp default. An MTP verification batch requires `max_num_batched_tokens >= max_num_seqs * (mtp_max_draft_tokens + 1)`.
 
 The integration is based on official llama.cpp commit `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`. Build the dedicated llama.cpp checkout:
 
@@ -63,6 +65,8 @@ PYTHONPATH=. python -m nanovllm.cli.chat \
   --backend llamacpp_cpu \
   --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
   --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_cpu/bin/libnanollama_backend.so \
+  --enable-mtp \
+  --mtp-max-draft-tokens 3 \
   --temperature 0
 ```
 
@@ -74,10 +78,12 @@ PYTHONPATH=. python -m nanovllm.cli.chat \
   --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
   --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_vulkan/bin/libnanollama_backend.so \
   --gpu-layers -1 \
+  --enable-mtp \
+  --mtp-max-draft-tokens 3 \
   --temperature 0
 ```
 
-The stage-2 backend intentionally disables prefix caching and preemption. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
+The staged backend intentionally disables prefix caching and preemption, and MTP v1 only accepts greedy sampling. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
 
 See `QWEN35_STAGED_IMPLEMENTATION.zh.md` for stage boundaries, validation evidence, and reflection notes.
 

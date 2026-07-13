@@ -89,6 +89,17 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("NANOVLLM_GPU_LAYERS", "-1")),
         help="Number of layers to offload with Vulkan. -1 means all supported layers.",
     )
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_ENABLE_MTP", "0") == "1",
+        help="Enable built-in Qwen3.5 MTP greedy speculative decoding.",
+    )
+    parser.add_argument(
+        "--mtp-max-draft-tokens",
+        type=int,
+        default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "3")),
+    )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
     parser.add_argument(
@@ -130,6 +141,8 @@ def build_llm(args: argparse.Namespace) -> LLM:
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            enable_mtp=args.enable_mtp,
+            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             device_config={
                 "library_path": args.library_path,
                 "n_ubatch": args.ubatch_size or None,
