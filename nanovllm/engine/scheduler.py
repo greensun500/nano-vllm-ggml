@@ -11,6 +11,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs  # 最大同时调度的序列（请求）数
         self.max_num_batched_tokens = config.max_num_batched_tokens  # 一个batch中最多的总token数（调度最大token数）
         self.eos_token_ids = frozenset(config.eos_token_ids)
+        self.enable_preemption = config.enable_preemption
         self.block_size = config.kvcache_block_size  # KV Cache的block大小（每个块包含的token数）
         # BlockManager用于管理KV cache的分配与回收，第一个参数为可分配的block数，第二个为每个block的大小
         self.block_manager = BlockManager(
@@ -46,6 +47,8 @@ class Scheduler:
             if not seq.block_table:#空表，kvcache为空，是全新请求
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
+                    if not self.enable_preemption and not self.running and not scheduled_seqs:
+                        raise RuntimeError("request exceeds the available paged KV blocks")
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
@@ -68,6 +71,8 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            if not self.enable_preemption and not self.block_manager.can_append(seq):
+                raise RuntimeError("paged KV cache is full and preemption is disabled")
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())

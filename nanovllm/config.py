@@ -21,6 +21,7 @@ class Config:
     hf_config: Any | None = None
     eos_token_ids: tuple[int, ...] = ()
     enable_prefix_cache: bool | None = None
+    enable_preemption: bool | None = None
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
@@ -32,6 +33,8 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         if self.enable_prefix_cache is None:
             self.enable_prefix_cache = self.backend == "cuda"
+        if self.enable_preemption is None:
+            self.enable_preemption = self.backend == "cuda"
         if self.backend == "cuda":
             from transformers import AutoConfig
 
@@ -40,7 +43,8 @@ class Config:
             self.hf_config = AutoConfig.from_pretrained(self.model)
             self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         else:
-            assert not self.enable_prefix_cache, "llama.cpp native KV does not support nano-vLLM prefix caching"
+            assert not self.enable_prefix_cache, "llama.cpp staged backend does not support prefix caching yet"
+            assert not self.enable_preemption, "llama.cpp paged KV does not support preemption yet"
             if self.gguf_model is None and self.model.endswith(".gguf"):
                 self.gguf_model = self.model
                 self.model_format = "gguf"

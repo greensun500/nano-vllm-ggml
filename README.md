@@ -47,7 +47,7 @@ outputs[0]["text"]
 
 ## Qwen3.5 llama.cpp CPU/Vulkan backend
 
-Stage 1 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. It uses llama.cpp native hybrid memory, nano-vLLM scheduling, the Qwen3.5 non-thinking chat template, all model EOG tokens, and greedy decoding. Paged KV and built-in MTP are intentionally deferred to stages 2 and 3.
+Stage 2 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. Full-attention layers use nano-vLLM paged KV slots, recurrent layers keep one native state per sequence, and both are applied through llama.cpp hybrid memory. The backend also supports the Qwen3.5 non-thinking chat template, all model EOG tokens, and greedy decoding. Built-in MTP is deferred to stage 3.
 
 The integration is based on official llama.cpp commit `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`. Build the dedicated llama.cpp checkout:
 
@@ -77,7 +77,7 @@ PYTHONPATH=. python -m nanovllm.cli.chat \
   --temperature 0
 ```
 
-The stage-1 llama.cpp backend disables nano-vLLM prefix caching because llama.cpp owns the KV state. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
+The stage-2 backend intentionally disables prefix caching and preemption. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
 
 See `QWEN35_STAGED_IMPLEMENTATION.zh.md` for stage boundaries, validation evidence, and reflection notes.
 

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from nanovllm.backends.llamacpp.runner import LlamaCppRunner
+from nanovllm.backends.base import build_execution_plan
 from nanovllm.cli.chat import format_chat_prompt
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler import Scheduler
@@ -11,7 +12,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
 
 
-class Qwen35Stage1Tests(unittest.TestCase):
+class Qwen35Tests(unittest.TestCase):
 
     def setUp(self):
         Sequence.block_size = 256
@@ -23,7 +24,7 @@ class Qwen35Stage1Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LlamaCppRunner._sample(logits, np.array([0.0, 0.1], dtype=np.float32))
 
-    def test_native_kv_mode_does_not_reuse_prefix_blocks(self):
+    def test_llamacpp_mode_does_not_reuse_prefix_blocks(self):
         manager = BlockManager(2, 256, enable_prefix_cache=False)
         first = Sequence([7] * 256, SamplingParams(max_tokens=1))
         self.assertEqual(manager.can_allocate(first), 0)
@@ -44,6 +45,7 @@ class Qwen35Stage1Tests(unittest.TestCase):
             kvcache_block_size=256,
             num_kvcache_blocks=1,
             enable_prefix_cache=False,
+            enable_preemption=False,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1], SamplingParams(max_tokens=4))
@@ -65,6 +67,42 @@ class Qwen35Stage1Tests(unittest.TestCase):
             "<|im_start|>user\nHello<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
         )
+
+    def test_paged_kv_plan_supports_wrapped_blocks(self):
+        manager = BlockManager(4, 256, enable_prefix_cache=False)
+
+        first = Sequence([1] * 257, SamplingParams(max_tokens=1))
+        manager.allocate(first, manager.can_allocate(first))
+        self.assertEqual(manager.deallocate(first), [0, 1])
+
+        second = Sequence([2], SamplingParams(max_tokens=1))
+        manager.allocate(second, manager.can_allocate(second))
+        self.assertEqual(manager.deallocate(second), [2])
+
+        wrapped = Sequence([3] * 257, SamplingParams(max_tokens=1))
+        manager.allocate(wrapped, manager.can_allocate(wrapped))
+        self.assertEqual(wrapped.block_table, [3, 1])
+        wrapped.num_scheduled_tokens = 257
+        plan = build_execution_plan([wrapped], True, 256)
+        self.assertEqual(plan.slot_mapping[:257], list(range(768, 1024)) + [256])
+
+    def test_preemption_is_rejected_for_llamacpp_paged_kv(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=1,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+        )
+        scheduler = Scheduler(config)
+        sequence = Sequence([1] * 256, SamplingParams(max_tokens=2))
+        scheduler.add(sequence)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, [2], is_prefill)
+        with self.assertRaisesRegex(RuntimeError, "preemption is disabled"):
+            scheduler.schedule()
 
 
 if __name__ == "__main__":

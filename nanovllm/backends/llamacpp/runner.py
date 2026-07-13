@@ -254,7 +254,7 @@ class LlamaCppRunner:
     @staticmethod
     def _sample(logits: np.ndarray, temperatures: np.ndarray) -> np.ndarray:
         if np.any(temperatures != 0):
-            raise ValueError("the llama.cpp Qwen3.5 stage-1 backend only supports greedy decoding")
+            raise ValueError("the llama.cpp Qwen3.5 backend only supports greedy decoding")
         return np.argmax(logits, axis=1).astype(np.int32)
 
     def _native_seq_id(self, seq_id: int) -> int:
