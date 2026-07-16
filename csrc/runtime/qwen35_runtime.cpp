@@ -1,6 +1,7 @@
 #include "runtime/qwen35_runtime.h"
 
 #include "models/qwen35/graph.h"
+#include "models/qwen35/ops.h"
 #include "models/qwen35/weights.h"
 #include "runtime/backend.h"
 #include "runtime/gguf_loader.h"
@@ -384,16 +385,16 @@ struct Qwen35Runtime::Impl {
         return persistent;
     }
 
-    void place_vulkan_compute_nodes(qwen35::TokenGraph & token_graph) {
+    void place_vulkan_compute_nodes(ggml_cgraph * graph) {
         if (primary_backend->kind() != BackendKind::Vulkan) {
             return;
         }
-        executor->set_all_compute_nodes_backend(token_graph.graph, BackendKind::Vulkan);
+        executor->set_all_compute_nodes_backend(graph, BackendKind::Vulkan);
     }
 
-    void assert_compute_placement(qwen35::TokenGraph & token_graph) const {
+    void assert_compute_placement(ggml_cgraph * graph) const {
         executor->assert_all_compute_nodes_on_backend(
-            token_graph.graph, primary_backend->kind());
+            graph, primary_backend->kind());
     }
 
     void upload_common_inputs(
@@ -428,33 +429,34 @@ struct Qwen35Runtime::Impl {
         const std::vector<std::int32_t> & read_slots,
         std::size_t input_plane,
         std::size_t output_plane,
-        bool emit_greedy) {
+        bool emit_greedy,
+        bool read_hidden) {
         paged_kv->validate_read_indices(read_slots);
         paged_kv->validate_write_indices({write_slot});
         if (read_slots.empty() || read_slots.back() != write_slot) {
             fail("target attention context must end at the current write slot");
         }
-        executor->reset();
         GraphContext graph_context;
         ExecutorResetGuard reset_guard(*executor);
         qwen35::TargetPersistentView persistent = make_target_persistent(
             graph_context.get(), sequence_slot, input_plane, output_plane);
         qwen35::TokenGraph token_graph = qwen35::build_target_token_graph(
             graph_context.get(), *model, persistent, read_slots.size(), emit_greedy);
-        place_vulkan_compute_nodes(token_graph);
+        place_vulkan_compute_nodes(token_graph.graph);
         executor->allocate(token_graph.graph);
-        assert_compute_placement(token_graph);
+        assert_compute_placement(token_graph.graph);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
         executor->compute(token_graph.graph);
-        executor->synchronize();
 
         TokenResult result;
-        result.hidden.resize(model->config().embedding_length);
-        ggml_backend_tensor_get(
-            token_graph.hidden,
-            result.hidden.data(),
-            0,
-            result.hidden.size() * sizeof(float));
+        if (read_hidden) {
+            result.hidden.resize(model->config().embedding_length);
+            ggml_backend_tensor_get(
+                token_graph.hidden,
+                result.hidden.data(),
+                0,
+                result.hidden.size() * sizeof(float));
+        }
         if (emit_greedy) {
             ggml_backend_tensor_get(
                 token_graph.greedy_token, &result.token, 0, sizeof(result.token));
@@ -468,7 +470,8 @@ struct Qwen35Runtime::Impl {
         std::int32_t write_slot,
         const std::vector<std::int32_t> & read_slots,
         const std::vector<float> & hidden_input,
-        bool emit_greedy) {
+        bool emit_greedy,
+        bool read_hidden) {
         if (!options.enable_mtp || !paged_kv->has_mtp_layer()) {
             fail("MTP execution was requested on an MTP-disabled runtime");
         }
@@ -480,16 +483,15 @@ struct Qwen35Runtime::Impl {
         if (read_slots.empty() || read_slots.back() != write_slot) {
             fail("MTP attention context must end at the current write slot");
         }
-        executor->reset();
         GraphContext graph_context;
         ExecutorResetGuard reset_guard(*executor);
         const PagedKvLayer & layer = paged_kv->mtp_layer();
         qwen35::AttentionCacheView cache{layer.key, layer.value};
         qwen35::TokenGraph token_graph = qwen35::build_mtp_token_graph(
             graph_context.get(), *model, cache, read_slots.size(), emit_greedy);
-        place_vulkan_compute_nodes(token_graph);
+        place_vulkan_compute_nodes(token_graph.graph);
         executor->allocate(token_graph.graph);
-        assert_compute_placement(token_graph);
+        assert_compute_placement(token_graph.graph);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
         ggml_backend_tensor_set(
             token_graph.hidden_input,
@@ -497,20 +499,83 @@ struct Qwen35Runtime::Impl {
             0,
             hidden_input.size() * sizeof(float));
         executor->compute(token_graph.graph);
-        executor->synchronize();
 
         TokenResult result;
-        result.hidden.resize(model->config().embedding_length);
-        ggml_backend_tensor_get(
-            token_graph.hidden,
-            result.hidden.data(),
-            0,
-            result.hidden.size() * sizeof(float));
+        if (read_hidden) {
+            result.hidden.resize(model->config().embedding_length);
+            ggml_backend_tensor_get(
+                token_graph.hidden,
+                result.hidden.data(),
+                0,
+                result.hidden.size() * sizeof(float));
+        }
         if (emit_greedy) {
             ggml_backend_tensor_get(
                 token_graph.greedy_token, &result.token, 0, sizeof(result.token));
         }
         return result;
+    }
+
+    void execute_mtp_kv_update(
+        const std::vector<std::int32_t> & tokens,
+        const std::vector<std::size_t> & positions,
+        const std::vector<std::int32_t> & write_slots,
+        const std::vector<float> & hidden_inputs) {
+        if (!options.enable_mtp || !paged_kv->has_mtp_layer()) {
+            fail("MTP KV update was requested on an MTP-disabled runtime");
+        }
+        if (tokens.empty()) {
+            fail("MTP KV update requires at least one token");
+        }
+        if (positions.size() != tokens.size() || write_slots.size() != tokens.size()) {
+            fail("MTP KV update input row counts differ");
+        }
+        const std::size_t hidden_elements = checked_product(
+            tokens.size(), model->config().embedding_length, "MTP KV hidden input");
+        if (hidden_inputs.size() != hidden_elements) {
+            fail("MTP KV update hidden input has the wrong shape");
+        }
+        paged_kv->validate_write_indices(write_slots);
+
+        std::vector<std::int32_t> positions_i32;
+        positions_i32.reserve(positions.size());
+        for (const std::size_t position : positions) {
+            if (position > static_cast<std::size_t>(
+                    std::numeric_limits<std::int32_t>::max())) {
+                fail("position exceeds the I32 IMRoPE ABI");
+            }
+            positions_i32.push_back(static_cast<std::int32_t>(position));
+        }
+        const std::vector<std::int32_t> expanded_positions =
+            qwen35::ops::expand_text_positions(positions_i32);
+
+        GraphContext graph_context;
+        ExecutorResetGuard reset_guard(*executor);
+        const PagedKvLayer & layer = paged_kv->mtp_layer();
+        qwen35::AttentionCacheView cache{layer.key, layer.value};
+        qwen35::MtpKvUpdateGraph graph = qwen35::build_mtp_kv_update_graph(
+            graph_context.get(), *model, cache, tokens.size());
+        place_vulkan_compute_nodes(graph.graph);
+        executor->allocate(graph.graph);
+        assert_compute_placement(graph.graph);
+        ggml_backend_tensor_set(
+            graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
+        ggml_backend_tensor_set(
+            graph.positions,
+            expanded_positions.data(),
+            0,
+            expanded_positions.size() * sizeof(expanded_positions.front()));
+        ggml_backend_tensor_set(
+            graph.write_slots,
+            write_slots.data(),
+            0,
+            write_slots.size() * sizeof(write_slots.front()));
+        ggml_backend_tensor_set(
+            graph.hidden_input,
+            hidden_inputs.data(),
+            0,
+            hidden_inputs.size() * sizeof(hidden_inputs.front()));
+        executor->compute(graph.graph);
     }
 
     std::vector<std::int32_t> run(const Qwen35ExecutionPlan & plan) {
@@ -521,6 +586,19 @@ struct Qwen35Runtime::Impl {
         for (const PreparedSequence & item : prepared) {
             SequenceState & sequence = sequences[item.sequence_slot];
             std::int32_t greedy = -1;
+            std::vector<std::int32_t> mtp_tokens;
+            std::vector<std::size_t> mtp_positions;
+            std::vector<std::int32_t> mtp_write_slots;
+            std::vector<float> mtp_hidden_inputs;
+            if (options.enable_mtp) {
+                mtp_tokens.reserve(item.token_count);
+                mtp_positions.reserve(item.token_count);
+                mtp_write_slots.reserve(item.token_count);
+                mtp_hidden_inputs.reserve(checked_product(
+                    item.token_count,
+                    model->config().embedding_length,
+                    "MTP prefill hidden input"));
+            }
             for (std::size_t index = 0; index < item.token_count; ++index) {
                 const std::size_t position = item.start_position + index;
                 const std::int32_t write_slot = plan.slot_mapping[item.token_offset + index];
@@ -530,7 +608,15 @@ struct Qwen35Runtime::Impl {
                 const std::size_t input_plane = recurrent->active_snapshot_plane(
                     item.sequence_slot);
                 const std::size_t output_plane = 0;
-                const std::vector<float> previous_hidden = sequence.pending_hidden;
+                if (options.enable_mtp) {
+                    mtp_tokens.push_back(plan.tokens[item.token_offset + index]);
+                    mtp_positions.push_back(position);
+                    mtp_write_slots.push_back(write_slot);
+                    mtp_hidden_inputs.insert(
+                        mtp_hidden_inputs.end(),
+                        sequence.pending_hidden.begin(),
+                        sequence.pending_hidden.end());
+                }
                 TokenResult target = execute_target(
                     item.sequence_slot,
                     plan.tokens[item.token_offset + index],
@@ -539,22 +625,20 @@ struct Qwen35Runtime::Impl {
                     context,
                     input_plane,
                     output_plane,
-                    last);
+                    last,
+                    options.enable_mtp);
                 recurrent->select_latest(item.sequence_slot);
                 if (last) {
                     greedy = target.token;
                 }
                 if (options.enable_mtp) {
-                    (void) execute_mtp(
-                        plan.tokens[item.token_offset + index],
-                        position,
-                        write_slot,
-                        context,
-                        previous_hidden,
-                        false);
                     sequence.pending_hidden = std::move(target.hidden);
                 }
                 sequence.next_position = position + 1;
+            }
+            if (options.enable_mtp) {
+                execute_mtp_kv_update(
+                    mtp_tokens, mtp_positions, mtp_write_slots, mtp_hidden_inputs);
             }
             if (greedy < 0) {
                 fail("target graph did not produce a greedy token");
@@ -606,7 +690,8 @@ struct Qwen35Runtime::Impl {
                     slot,
                     context,
                     draft_hidden,
-                    true);
+                    true,
+                    index + 1 < draft_count);
                 if (drafted.token < 0) {
                     fail("MTP graph did not produce a greedy draft token");
                 }
@@ -625,6 +710,7 @@ struct Qwen35Runtime::Impl {
             target_predictions.reserve(draft_count + 1);
             target_hidden.reserve(draft_count + 1);
 
+            std::size_t accepted = 0;
             std::size_t input_plane =
                 recurrent->active_snapshot_plane(item.sequence_slot);
             for (std::size_t index = 0; index <= draft_count; ++index) {
@@ -642,6 +728,7 @@ struct Qwen35Runtime::Impl {
                     context,
                     input_plane,
                     output_plane,
+                    true,
                     true);
                 if (target.token < 0) {
                     fail("target verification graph did not produce a greedy token");
@@ -649,34 +736,47 @@ struct Qwen35Runtime::Impl {
                 target_predictions.push_back(target.token);
                 target_hidden.push_back(std::move(target.hidden));
                 input_plane = output_plane;
-            }
-
-            std::size_t accepted = 0;
-            while (accepted < draft_count &&
-                   target_predictions[accepted] == drafts[accepted]) {
+                if (index == draft_count) {
+                    break;
+                }
+                if (target_predictions.back() != drafts[index]) {
+                    break;
+                }
                 ++accepted;
             }
             recurrent->select_mtp_rollback(
                 item.sequence_slot, draft_count, accepted);
 
-            // Replace the temporary draft-conditioned MTP KV with the
-            // target-conditioned accepted path. h_{p-1} pairs with x_p, then
-            // each following token pairs with the preceding target hidden row.
-            for (std::size_t index = 0; index <= accepted; ++index) {
-                const std::size_t catchup_position = position + index;
-                const std::int32_t slot = paged_kv->physical_indices(
-                    item.block_table, catchup_position, 1).front();
-                const std::vector<std::int32_t> context =
-                    paged_kv->context_indices(item.block_table, catchup_position + 1);
-                const std::vector<float> & hidden =
-                    index == 0 ? old_pending_hidden : target_hidden[index - 1];
-                (void) execute_mtp(
-                    verification_inputs[index],
-                    catchup_position,
-                    slot,
-                    context,
-                    hidden,
-                    false);
+            // The first draft graph already wrote x_p paired with h_{p-1}.
+            // Replace only later accepted draft-conditioned rows, batching the
+            // target-conditioned K/V projections without running dead MTP
+            // attention, FFN, output norm, or hidden readback work.
+            if (accepted > 0) {
+                std::vector<std::int32_t> catchup_tokens(
+                    verification_inputs.begin() + 1,
+                    verification_inputs.begin() + accepted + 1);
+                std::vector<std::size_t> catchup_positions;
+                catchup_positions.reserve(accepted);
+                std::vector<float> catchup_hidden;
+                catchup_hidden.reserve(checked_product(
+                    accepted,
+                    model->config().embedding_length,
+                    "MTP catch-up hidden input"));
+                for (std::size_t index = 0; index < accepted; ++index) {
+                    catchup_positions.push_back(position + index + 1);
+                    catchup_hidden.insert(
+                        catchup_hidden.end(),
+                        target_hidden[index].begin(),
+                        target_hidden[index].end());
+                }
+                const std::vector<std::int32_t> catchup_slots =
+                    paged_kv->physical_indices(
+                        item.block_table, position + 1, accepted);
+                execute_mtp_kv_update(
+                    catchup_tokens,
+                    catchup_positions,
+                    catchup_slots,
+                    catchup_hidden);
             }
             sequence.pending_hidden = target_hidden[accepted];
             sequence.next_position = position + accepted + 1;

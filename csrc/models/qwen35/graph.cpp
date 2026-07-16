@@ -52,6 +52,11 @@ void add_critical(TokenGraph & result, ggml_tensor * tensor) {
     result.critical_compute_nodes.push_back(tensor);
 }
 
+void add_critical(MtpKvUpdateGraph & result, ggml_tensor * tensor) {
+    require(tensor != nullptr, "critical compute node is null");
+    result.critical_compute_nodes.push_back(tensor);
+}
+
 struct GraphInputs {
     ggml_tensor * token = nullptr;
     ggml_tensor * positions = nullptr;
@@ -79,6 +84,78 @@ GraphInputs make_inputs(ggml_context * ctx, std::size_t n_kv) {
     return inputs;
 }
 
+struct StoredKeyValue {
+    ggml_tensor * key = nullptr;
+    ggml_tensor * value = nullptr;
+};
+
+StoredKeyValue store_attention_key_value(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    const LayerWeights & layer,
+    const AttentionCacheView & cache,
+    ggml_tensor * positions,
+    ggml_tensor * write_slots,
+    const Config & config,
+    std::int64_t n_tokens,
+    const std::string & prefix) {
+    require(ctx != nullptr, prefix + " GGML context is null");
+    require(layer.is_full_attention(), prefix + " is not a full-attention layer");
+    require(n_tokens > 0, prefix + " token count must be positive");
+    require(input != nullptr, prefix + " input tensor is null");
+    require(
+        input->ne[0] == static_cast<std::int64_t>(config.embedding_length) &&
+            input->ne[1] == n_tokens,
+        prefix + " input shape is invalid");
+    require_shape(
+        positions,
+        {n_tokens * 4},
+        (prefix + ".positions").c_str());
+    require(positions->type == GGML_TYPE_I32, prefix + " positions must be I32");
+    require_shape(
+        write_slots,
+        {n_tokens},
+        (prefix + ".write_slots").c_str());
+    require(write_slots->type == GGML_TYPE_I32, prefix + " write slots must be I32");
+
+    const std::int64_t key_width = static_cast<std::int64_t>(
+        config.attention_key_length * config.attention_head_count_kv);
+    const std::int64_t value_width = static_cast<std::int64_t>(
+        config.attention_value_length * config.attention_head_count_kv);
+    require_shape(
+        cache.key,
+        {key_width, cache.key != nullptr ? cache.key->ne[1] : 0},
+        (prefix + ".key_cache").c_str());
+    require_shape(
+        cache.value,
+        {value_width, cache.value != nullptr ? cache.value->ne[1] : 0},
+        (prefix + ".value_cache").c_str());
+    require(cache.key->type == GGML_TYPE_F32, prefix + " key cache must be F32");
+    require(cache.value->type == GGML_TYPE_F32, prefix + " value cache must be F32");
+    require(cache.key->ne[1] == cache.value->ne[1], prefix + " cache sizes differ");
+
+    ggml_tensor * key = ops::project_key_or_value(
+        ctx, input, layer.attn_k, config, n_tokens, (prefix + ".key").c_str());
+    ggml_tensor * value = ops::project_key_or_value(
+        ctx, input, layer.attn_v, config, n_tokens, (prefix + ".value").c_str());
+    key = ops::normalize_attention_heads(
+        ctx, key, layer.attn_k_norm, config, (prefix + ".key_norm").c_str());
+    key = ops::apply_imrope(
+        ctx, key, positions, config, (prefix + ".key_rope").c_str());
+
+    key = ggml_cont_2d(ctx, key, key_width, n_tokens);
+    value = ggml_cont_2d(ctx, value, value_width, n_tokens);
+    set_name(key, prefix + ".key_contiguous");
+    set_name(value, prefix + ".value_contiguous");
+
+    StoredKeyValue stored;
+    stored.key = ggml_set_rows(ctx, cache.key, key, write_slots);
+    stored.value = ggml_set_rows(ctx, cache.value, value, write_slots);
+    set_name(stored.key, prefix + ".key_store");
+    set_name(stored.value, prefix + ".value_store");
+    return stored;
+}
+
 ggml_tensor * build_attention(
     ggml_context * ctx,
     ggml_cgraph * graph,
@@ -91,60 +168,32 @@ ggml_tensor * build_attention(
     std::size_t n_kv,
     const std::string & prefix) {
     require(layer.is_full_attention(), prefix + " is not a full-attention layer");
-    require_shape(
-        cache.key,
-        {static_cast<std::int64_t>(
-             config.attention_key_length * config.attention_head_count_kv),
-         cache.key != nullptr ? cache.key->ne[1] : 0},
-        (prefix + ".key_cache").c_str());
-    require_shape(
-        cache.value,
-        {static_cast<std::int64_t>(
-             config.attention_value_length * config.attention_head_count_kv),
-         cache.value != nullptr ? cache.value->ne[1] : 0},
-        (prefix + ".value_cache").c_str());
-    require(cache.key->type == GGML_TYPE_F32, prefix + " key cache must be F32");
-    require(cache.value->type == GGML_TYPE_F32, prefix + " value cache must be F32");
-    require(cache.key->ne[1] == cache.value->ne[1], prefix + " cache sizes differ");
-
     ops::QueryGate query_gate =
         ops::project_query_and_gate(ctx, input, layer.attn_q, config, 1);
     query_gate.query = ops::normalize_attention_heads(
         ctx, query_gate.query, layer.attn_q_norm, config,
         (prefix + ".query_norm").c_str());
-    ggml_tensor * key = ops::project_key_or_value(
-        ctx, input, layer.attn_k, config, 1, (prefix + ".key").c_str());
-    ggml_tensor * value = ops::project_key_or_value(
-        ctx, input, layer.attn_v, config, 1, (prefix + ".value").c_str());
-    key = ops::normalize_attention_heads(
-        ctx, key, layer.attn_k_norm, config, (prefix + ".key_norm").c_str());
-
     query_gate.query = ops::apply_imrope(
         ctx, query_gate.query, inputs.positions, config,
         (prefix + ".query_rope").c_str());
-    key = ops::apply_imrope(
-        ctx, key, inputs.positions, config, (prefix + ".key_rope").c_str());
 
-    const std::int64_t kv_width = static_cast<std::int64_t>(
-        config.attention_key_length * config.attention_head_count_kv);
-    key = ggml_cont_2d(ctx, key, kv_width, 1);
-    value = ggml_cont_2d(ctx, value, kv_width, 1);
-    set_name(key, prefix + ".key_contiguous");
-    set_name(value, prefix + ".value_contiguous");
+    const StoredKeyValue stored = store_attention_key_value(
+        ctx,
+        input,
+        layer,
+        cache,
+        inputs.positions,
+        inputs.write_slot,
+        config,
+        1,
+        prefix);
 
     // SET_ROWS returns a view of the persistent destination and establishes an
     // explicit dependency for the subsequent GET_ROWS. The current token is
     // therefore visible to its own causal attention without relying on graph
     // insertion order as an implicit memory barrier.
-    ggml_tensor * updated_key =
-        ggml_set_rows(ctx, cache.key, key, inputs.write_slot);
-    ggml_tensor * updated_value =
-        ggml_set_rows(ctx, cache.value, value, inputs.write_slot);
-    set_name(updated_key, prefix + ".key_store");
-    set_name(updated_value, prefix + ".value_store");
-
-    ggml_tensor * gathered_key = ggml_get_rows(ctx, updated_key, inputs.read_slots);
-    ggml_tensor * gathered_value = ggml_get_rows(ctx, updated_value, inputs.read_slots);
+    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
     gathered_key = ggml_reshape_3d(
         ctx,
         gathered_key,
@@ -192,8 +241,8 @@ ggml_tensor * build_attention(
     // Build the store branches before downstream residual work. They also
     // remain dependencies of gathered_key/value, but explicitly expanding
     // them makes persistent side effects auditable in graph dumps.
-    ggml_build_forward_expand(graph, updated_key);
-    ggml_build_forward_expand(graph, updated_value);
+    ggml_build_forward_expand(graph, stored.key);
+    ggml_build_forward_expand(graph, stored.value);
     return output;
 }
 
@@ -557,6 +606,71 @@ TokenGraph build_mtp_token_graph(
         layer.mtp_output_head,
         emit_greedy,
         "qwen35.mtp");
+    return result;
+}
+
+MtpKvUpdateGraph build_mtp_kv_update_graph(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    const AttentionCacheView & cache,
+    std::size_t n_tokens) {
+    require(ctx != nullptr, "MTP KV-update graph context is null");
+    require(n_tokens > 0, "MTP KV-update graph requires at least one token");
+    const Config & config = weights.config();
+    require(config.nextn_predict_layers == 1, "MTP graph requires one bundled MTP layer");
+    const LayerWeights & layer = weights.layer(config.main_layers);
+    require(layer.is_mtp(), "last Qwen3.5 layer is not the bundled MTP block");
+
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    MtpKvUpdateGraph result;
+    result.graph = ggml_new_graph_custom(ctx, 512, false);
+    result.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
+    result.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count * 4);
+    result.write_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
+    result.hidden_input = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, config.embedding_length, token_count);
+    ggml_set_input(result.tokens);
+    ggml_set_input(result.positions);
+    ggml_set_input(result.write_slots);
+    ggml_set_input(result.hidden_input);
+    set_name(result.tokens, "qwen35.mtp.kv_update.tokens");
+    set_name(result.positions, "qwen35.mtp.kv_update.positions");
+    set_name(result.write_slots, "qwen35.mtp.kv_update.write_slots");
+    set_name(result.hidden_input, "qwen35.mtp.kv_update.hidden_input");
+
+    ggml_tensor * token_embedding = ggml_get_rows(
+        ctx, layer.mtp_token_embd, result.tokens);
+    ggml_tensor * current = ops::mtp_merge_embedding_and_hidden(
+        ctx,
+        token_embedding,
+        result.hidden_input,
+        layer.nextn_enorm,
+        layer.nextn_hnorm,
+        layer.nextn_eh_proj,
+        config);
+    current = ops::rms_norm(
+        ctx,
+        current,
+        layer.attn_norm,
+        config.attention_layer_norm_rms_epsilon,
+        "qwen35.mtp.kv_update.attention_norm");
+
+    const StoredKeyValue stored = store_attention_key_value(
+        ctx,
+        current,
+        layer,
+        cache,
+        result.positions,
+        result.write_slots,
+        config,
+        token_count,
+        "qwen35.mtp.kv_update");
+    result.key_store = stored.key;
+    result.value_store = stored.value;
+    add_critical(result, result.key_store);
+    add_critical(result, result.value_store);
+    ggml_build_forward_expand(result.graph, result.key_store);
+    ggml_build_forward_expand(result.graph, result.value_store);
     return result;
 }
 

@@ -102,11 +102,11 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat \
 ```
 
 The earlier `llamacpp_cpu`/`llamacpp_vulkan` external-library path remains only
-as a migration oracle. It is not used by either native backend. The 3.0 code
-flow is documented in
-[`NANOVLLM_V3.0_NATIVE_RUNTIME_FLOW.zh.md`](NANOVLLM_V3.0_NATIVE_RUNTIME_FLOW.zh.md);
-phase reflections and CPU/Vulkan validation evidence are in
-[`NATIVE_RUNTIME_IMPLEMENTATION.zh.md`](NATIVE_RUNTIME_IMPLEMENTATION.zh.md).
+as a migration oracle. It is not used by either native backend. The current
+runtime flow is documented in
+[`CURRENT_RUNTIME_FLOW.zh.md`](CURRENT_RUNTIME_FLOW.zh.md); current-version
+changes, correctness evidence and remote benchmarks are recorded in
+[`CURRENT_VERSION_CHANGES.zh.md`](CURRENT_VERSION_CHANGES.zh.md).
 
 ## Benchmark
 

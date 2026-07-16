@@ -58,6 +58,26 @@ struct TokenGraph {
     std::vector<ggml_tensor *> critical_compute_nodes;
 };
 
+// Batched state-maintenance graph for the bundled MTP attention layer.  MTP
+// prefill and post-verification catch-up only need target-conditioned K/V rows;
+// constructing the query, attending over the cache, running the FFN and
+// materializing a hidden output would be dead work in those paths.
+struct MtpKvUpdateGraph {
+    ggml_cgraph * graph = nullptr;
+
+    ggml_tensor * tokens = nullptr;        // I32 [n_tokens]
+    ggml_tensor * positions = nullptr;     // I32 [4 * n_tokens], IMRoPE channels
+    ggml_tensor * write_slots = nullptr;   // I32 [n_tokens]
+    ggml_tensor * hidden_input = nullptr;  // F32 [2048, n_tokens]
+
+    // Persistent-cache update nodes.  They are graph roots so executing this
+    // graph commits every supplied row without producing a host-visible output.
+    ggml_tensor * key_store = nullptr;
+    ggml_tensor * value_store = nullptr;
+
+    std::vector<ggml_tensor *> critical_compute_nodes;
+};
+
 TokenGraph build_target_token_graph(
     ggml_context * ctx,
     const Qwen35Weights & weights,
@@ -71,5 +91,11 @@ TokenGraph build_mtp_token_graph(
     const AttentionCacheView & cache,
     std::size_t n_kv,
     bool emit_greedy);
+
+MtpKvUpdateGraph build_mtp_kv_update_graph(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    const AttentionCacheView & cache,
+    std::size_t n_tokens);
 
 }  // namespace nanovllm::native::qwen35

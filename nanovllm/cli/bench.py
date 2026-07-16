@@ -37,9 +37,11 @@ class BenchResult:
     decode_s: float
     prefill_tokens: int
     decode_tokens: int
+    processed_tokens: int
     generated_tokens: int
     prefill_tok_s: float
     decode_tok_s: float
+    processed_tok_s: float
     generated_tok_s: float
 
 
@@ -377,6 +379,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
 
     prefill_tok_s = totals["prefill_tokens"] / totals["prefill_s"] if totals["prefill_s"] > 0 else 0.0
     decode_tok_s = totals["decode_tokens"] / totals["decode_s"] if totals["decode_s"] > 0 else 0.0
+    processed_tokens = totals["prefill_tokens"] + totals["decode_tokens"]
+    processed_tok_s = processed_tokens / totals["total_s"] if totals["total_s"] > 0 else 0.0
     generated_tok_s = totals["generated_tokens"] / totals["total_s"] if totals["total_s"] > 0 else 0.0
     drafted_tokens = int(mtp_stats["drafted_tokens"] - mtp_baseline["drafted_tokens"])
     accepted_tokens = int(mtp_stats["accepted_tokens"] - mtp_baseline["accepted_tokens"])
@@ -410,9 +414,11 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         decode_s=totals["decode_s"],
         prefill_tokens=totals["prefill_tokens"],
         decode_tokens=totals["decode_tokens"],
+        processed_tokens=processed_tokens,
         generated_tokens=totals["generated_tokens"],
         prefill_tok_s=prefill_tok_s,
         decode_tok_s=decode_tok_s,
+        processed_tok_s=processed_tok_s,
         generated_tok_s=generated_tok_s,
     )
 
@@ -441,6 +447,7 @@ def print_result(result: BenchResult) -> None:
     print("metric              tokens        time(s)      tok/s")
     print(f"prefill             {result.prefill_tokens:>8}  {result.prefill_s:>10.3f}  {result.prefill_tok_s:>9.2f}")
     print(f"decode steps        {result.decode_tokens:>8}  {result.decode_s:>10.3f}  {result.decode_tok_s:>9.2f}")
+    print(f"processed total     {result.processed_tokens:>8}  {result.total_s:>10.3f}  {result.processed_tok_s:>9.2f}")
     print(f"generated total     {result.generated_tokens:>8}  {result.total_s:>10.3f}  {result.generated_tok_s:>9.2f}")
     if result.enable_mtp:
         print(
