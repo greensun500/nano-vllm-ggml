@@ -52,6 +52,11 @@ void add_critical(TokenGraph & result, ggml_tensor * tensor) {
     result.critical_compute_nodes.push_back(tensor);
 }
 
+void add_critical(TargetChunkGraph & result, ggml_tensor * tensor) {
+    require(tensor != nullptr, "critical compute node is null");
+    result.critical_compute_nodes.push_back(tensor);
+}
+
 void add_critical(MtpKvUpdateGraph & result, ggml_tensor * tensor) {
     require(tensor != nullptr, "critical compute node is null");
     result.critical_compute_nodes.push_back(tensor);
@@ -81,6 +86,49 @@ GraphInputs make_inputs(ggml_context * ctx, std::size_t n_kv) {
     set_name(inputs.positions, "qwen35.input.positions");
     set_name(inputs.write_slot, "qwen35.input.write_slot");
     set_name(inputs.read_slots, "qwen35.input.read_slots");
+    return inputs;
+}
+
+struct ChunkGraphInputs {
+    ggml_tensor * tokens = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * write_slots = nullptr;
+    ggml_tensor * read_slots = nullptr;
+    ggml_tensor * causal_mask = nullptr;
+};
+
+ChunkGraphInputs make_chunk_inputs(
+    ggml_context * ctx,
+    std::size_t n_tokens,
+    std::size_t n_kv) {
+    require(ctx != nullptr, "chunk GGML context is null");
+    require(n_tokens > 0, "chunk token count must be positive");
+    require(n_kv >= n_tokens, "chunk attention context is shorter than its token count");
+
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    const std::int64_t kv_count = static_cast<std::int64_t>(n_kv);
+    ChunkGraphInputs inputs;
+    inputs.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
+    inputs.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count * 4);
+    inputs.write_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
+    inputs.read_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_count);
+    if (n_tokens > 1) {
+        inputs.causal_mask = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, kv_count, token_count);
+    }
+
+    ggml_set_input(inputs.tokens);
+    ggml_set_input(inputs.positions);
+    ggml_set_input(inputs.write_slots);
+    ggml_set_input(inputs.read_slots);
+    if (inputs.causal_mask != nullptr) {
+        ggml_set_input(inputs.causal_mask);
+    }
+    set_name(inputs.tokens, "qwen35.target_chunk.tokens");
+    set_name(inputs.positions, "qwen35.target_chunk.positions");
+    set_name(inputs.write_slots, "qwen35.target_chunk.write_slots");
+    set_name(inputs.read_slots, "qwen35.target_chunk.read_slots");
+    set_name(inputs.causal_mask, "qwen35.target_chunk.causal_mask");
     return inputs;
 }
 
@@ -246,6 +294,121 @@ ggml_tensor * build_attention(
     return output;
 }
 
+ggml_tensor * build_chunk_attention(
+    ggml_context * ctx,
+    ggml_cgraph * graph,
+    TargetChunkGraph & result,
+    ggml_tensor * input,
+    const LayerWeights & layer,
+    const AttentionCacheView & cache,
+    const ChunkGraphInputs & inputs,
+    const Config & config,
+    std::size_t n_tokens,
+    std::size_t n_kv,
+    const std::string & prefix) {
+    require(layer.is_full_attention(), prefix + " is not a full-attention layer");
+    require(n_tokens > 0, prefix + " token count must be positive");
+    require(n_kv >= n_tokens, prefix + " attention context is too short");
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    const std::int64_t kv_count = static_cast<std::int64_t>(n_kv);
+    require_shape(
+        input,
+        {static_cast<std::int64_t>(config.embedding_length), token_count},
+        (prefix + ".input").c_str());
+    if (n_tokens == 1) {
+        require(inputs.causal_mask == nullptr, prefix + " single-token mask must be null");
+    } else {
+        require_shape(
+            inputs.causal_mask,
+            {kv_count, token_count},
+            (prefix + ".causal_mask").c_str());
+        require(
+            inputs.causal_mask->type == GGML_TYPE_F32,
+            prefix + " causal mask must be F32");
+    }
+
+    ops::QueryGate query_gate = ops::project_query_and_gate(
+        ctx, input, layer.attn_q, config, token_count);
+    query_gate.query = ops::normalize_attention_heads(
+        ctx,
+        query_gate.query,
+        layer.attn_q_norm,
+        config,
+        (prefix + ".query_norm").c_str());
+    query_gate.query = ops::apply_imrope(
+        ctx,
+        query_gate.query,
+        inputs.positions,
+        config,
+        (prefix + ".query_rope").c_str());
+
+    const StoredKeyValue stored = store_attention_key_value(
+        ctx,
+        input,
+        layer,
+        cache,
+        inputs.positions,
+        inputs.write_slots,
+        config,
+        token_count,
+        prefix);
+
+    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
+    gathered_key = ggml_reshape_3d(
+        ctx,
+        gathered_key,
+        config.attention_key_length,
+        config.attention_head_count_kv,
+        kv_count);
+    gathered_value = ggml_reshape_3d(
+        ctx,
+        gathered_value,
+        config.attention_value_length,
+        config.attention_head_count_kv,
+        kv_count);
+
+    ggml_tensor * query = ggml_permute(ctx, query_gate.query, 0, 2, 1, 3);
+    ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
+    ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    set_name(scores, prefix + ".scores");
+    add_critical(result, scores);
+    require_shape(
+        scores,
+        {kv_count,
+         token_count,
+         static_cast<std::int64_t>(config.attention_head_count)},
+        (prefix + ".scores").c_str());
+    const float scale = 1.0f /
+        std::sqrt(static_cast<float>(config.attention_key_length));
+    scores = ggml_soft_max_ext(
+        ctx, scores, inputs.causal_mask, scale, 0.0f);
+    set_name(scores, prefix + ".probabilities");
+
+    values = ggml_cont(ctx, ggml_transpose(ctx, values));
+    ggml_tensor * attended = ggml_mul_mat(ctx, values, scores);
+    set_name(attended, prefix + ".weighted_values");
+    add_critical(result, attended);
+    attended = ggml_permute(ctx, attended, 0, 2, 1, 3);
+    attended = ggml_cont_2d(
+        ctx,
+        attended,
+        static_cast<std::int64_t>(
+            config.attention_value_length * config.attention_head_count),
+        token_count);
+    attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
+    ggml_tensor * output = ops::linear(
+        ctx, layer.attn_output, attended, (prefix + ".output").c_str());
+    add_critical(result, output);
+
+    ggml_build_forward_expand(graph, stored.key);
+    ggml_build_forward_expand(graph, stored.value);
+    return output;
+}
+
 ggml_tensor * build_recurrent(
     ggml_context * ctx,
     ggml_cgraph * graph,
@@ -401,6 +564,229 @@ ggml_tensor * build_recurrent(
     return output;
 }
 
+ggml_tensor * build_chunk_recurrent(
+    ggml_context * ctx,
+    ggml_cgraph * graph,
+    TargetChunkGraph & result,
+    ggml_tensor * input,
+    const LayerWeights & layer,
+    const RecurrentChunkStateView & persistent,
+    const Config & config,
+    std::size_t n_tokens,
+    std::size_t snapshot_count,
+    const std::string & prefix) {
+    require(layer.is_recurrent(), prefix + " is not a recurrent layer");
+    require(n_tokens > 0, prefix + " token count must be positive");
+    require(
+        snapshot_count > 0 && snapshot_count <= n_tokens,
+        prefix + " snapshot count must be in [1, n_tokens]");
+
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    const std::int64_t snapshots = static_cast<std::int64_t>(snapshot_count);
+    const std::int64_t kernel = config.ssm_conv_kernel;
+    const std::int64_t state_width = config.ssm_state_size;
+    const std::int64_t key_heads = config.ssm_group_count;
+    const std::int64_t value_heads = config.ssm_time_step_rank;
+    const std::int64_t inner = config.ssm_inner_size;
+    const std::int64_t value_width = inner / value_heads;
+    const std::int64_t qkv_width =
+        state_width * key_heads * 2 + value_width * value_heads;
+
+    require(kernel == 4, "only the Qwen3.5 convolution kernel size 4 is supported");
+    require(value_width == state_width, "GDN key/value state widths differ");
+    require(key_heads == value_heads, "Qwen3.5 GDN requires equal key/value heads");
+    require_shape(
+        input,
+        {static_cast<std::int64_t>(config.embedding_length), token_count},
+        (prefix + ".input").c_str());
+    require_shape(
+        persistent.convolution,
+        {kernel - 1, qkv_width},
+        (prefix + ".convolution_state").c_str());
+    require_shape(
+        persistent.delta,
+        {state_width, state_width, value_heads, 1},
+        (prefix + ".delta_state").c_str());
+    require(
+        persistent.convolution->type == GGML_TYPE_F32,
+        prefix + " convolution state must be F32");
+    require(
+        persistent.delta->type == GGML_TYPE_F32,
+        prefix + " delta state must be F32");
+    require(
+        persistent.convolution_outputs.size() == snapshot_count,
+        prefix + " convolution snapshot destination count differs from the graph request");
+    require(
+        persistent.delta_outputs.size() == snapshot_count,
+        prefix + " delta snapshot destination count differs from the graph request");
+    for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
+        const std::string snapshot_prefix =
+            prefix + ".snapshot." + std::to_string(snapshot);
+        require_shape(
+            persistent.convolution_outputs[snapshot],
+            {kernel - 1, qkv_width},
+            (snapshot_prefix + ".convolution_destination").c_str());
+        require_shape(
+            persistent.delta_outputs[snapshot],
+            {state_width, state_width, value_heads, 1},
+            (snapshot_prefix + ".delta_destination").c_str());
+        require(
+            persistent.convolution_outputs[snapshot]->type == GGML_TYPE_F32,
+            snapshot_prefix + " convolution destination must be F32");
+        require(
+            persistent.delta_outputs[snapshot]->type == GGML_TYPE_F32,
+            snapshot_prefix + " delta destination must be F32");
+    }
+
+    ggml_tensor * qkv = ops::linear(
+        ctx, layer.attn_qkv, input, (prefix + ".qkv").c_str());
+    qkv = ggml_reshape_3d(ctx, qkv, qkv_width, token_count, 1);
+    ggml_tensor * z = ops::linear(
+        ctx, layer.attn_gate, input, (prefix + ".z").c_str());
+
+    ggml_tensor * beta = ops::linear(
+        ctx, layer.ssm_beta, input, (prefix + ".beta_linear").c_str());
+    beta = ggml_reshape_4d(ctx, beta, 1, value_heads, token_count, 1);
+    beta = ggml_sigmoid(ctx, beta);
+
+    ggml_tensor * alpha = ops::linear(
+        ctx, layer.ssm_alpha, input, (prefix + ".alpha_linear").c_str());
+    alpha = ggml_reshape_3d(ctx, alpha, value_heads, token_count, 1);
+    alpha = ggml_softplus(ctx, ggml_add(ctx, alpha, layer.ssm_dt_bias));
+    ggml_tensor * gate = ggml_mul(ctx, alpha, layer.ssm_a);
+    gate = ggml_reshape_4d(ctx, gate, 1, value_heads, token_count, 1);
+
+    ggml_tensor * old_conv = ggml_reshape_3d(
+        ctx, persistent.convolution, kernel - 1, qkv_width, 1);
+    ggml_tensor * qkv_rows = ggml_transpose(ctx, qkv);
+    ggml_tensor * conv_input = ggml_concat(ctx, old_conv, qkv_rows, 0);
+    set_name(conv_input, prefix + ".convolution_input");
+
+    for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
+        const std::int64_t window_start =
+            token_count - static_cast<std::int64_t>(snapshot);
+        ggml_tensor * new_conv = ggml_view_2d(
+            ctx,
+            conv_input,
+            kernel - 1,
+            qkv_width,
+            conv_input->nb[1],
+            ggml_row_size(conv_input->type, window_start));
+        ggml_tensor * update = ggml_cpy(
+            ctx, new_conv, persistent.convolution_outputs[snapshot]);
+        set_name(
+            update,
+            prefix + ".convolution_state_update." + std::to_string(snapshot));
+        ggml_build_forward_expand(graph, update);
+    }
+
+    ggml_tensor * mixed = ggml_silu(
+        ctx, ggml_ssm_conv(ctx, conv_input, layer.ssm_conv1d));
+    set_name(mixed, prefix + ".convolution_output");
+    add_critical(result, mixed);
+    require_shape(
+        mixed,
+        {qkv_width, token_count},
+        (prefix + ".convolution_output").c_str());
+
+    const std::size_t scalar_bytes = ggml_element_size(mixed);
+    const std::size_t head_stride = ggml_row_size(mixed->type, state_width);
+    const std::size_t token_stride = ggml_row_size(mixed->type, qkv_width);
+    const std::size_t sequence_stride =
+        token_stride * static_cast<std::size_t>(token_count);
+    ggml_tensor * query = ggml_view_4d(
+        ctx,
+        mixed,
+        state_width,
+        key_heads,
+        token_count,
+        1,
+        head_stride,
+        token_stride,
+        sequence_stride,
+        0);
+    ggml_tensor * key = ggml_view_4d(
+        ctx,
+        mixed,
+        state_width,
+        key_heads,
+        token_count,
+        1,
+        head_stride,
+        token_stride,
+        sequence_stride,
+        static_cast<std::size_t>(state_width * key_heads) * scalar_bytes);
+    ggml_tensor * value = ggml_view_4d(
+        ctx,
+        mixed,
+        value_width,
+        value_heads,
+        token_count,
+        1,
+        ggml_row_size(mixed->type, value_width),
+        token_stride,
+        sequence_stride,
+        static_cast<std::size_t>(state_width * key_heads * 2) * scalar_bytes);
+    query = ggml_l2_norm(ctx, query, config.attention_layer_norm_rms_epsilon);
+    key = ggml_l2_norm(ctx, key, config.attention_layer_norm_rms_epsilon);
+
+    ggml_tensor * gdn = ggml_gated_delta_net(
+        ctx, query, key, value, gate, beta, persistent.delta, snapshots);
+    set_name(gdn, prefix + ".gated_delta_net");
+    add_critical(result, gdn);
+    const std::int64_t output_elements_per_token = value_width * value_heads;
+    const std::int64_t attention_output_elements =
+        output_elements_per_token * token_count;
+    const std::int64_t state_elements = state_width * state_width * value_heads;
+    ggml_tensor * output = ggml_view_4d(
+        ctx,
+        gdn,
+        value_width,
+        value_heads,
+        token_count,
+        1,
+        ggml_row_size(gdn->type, value_width),
+        ggml_row_size(gdn->type, output_elements_per_token),
+        ggml_row_size(gdn->type, attention_output_elements),
+        0);
+    for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
+        const std::int64_t state_offset = attention_output_elements +
+            static_cast<std::int64_t>(snapshot) * state_elements;
+        ggml_tensor * new_delta = ggml_view_4d(
+            ctx,
+            gdn,
+            state_width,
+            state_width,
+            value_heads,
+            1,
+            ggml_row_size(gdn->type, state_width),
+            ggml_row_size(gdn->type, state_width * state_width),
+            ggml_row_size(gdn->type, state_elements),
+            static_cast<std::size_t>(state_offset) * ggml_element_size(gdn));
+        ggml_tensor * update = ggml_cpy(
+            ctx, new_delta, persistent.delta_outputs[snapshot]);
+        set_name(
+            update,
+            prefix + ".delta_state_update." + std::to_string(snapshot));
+        ggml_build_forward_expand(graph, update);
+    }
+
+    z = ggml_reshape_4d(
+        ctx, z, value_width, value_heads, token_count, 1);
+    output = ops::rms_norm(
+        ctx,
+        output,
+        layer.ssm_norm,
+        config.attention_layer_norm_rms_epsilon,
+        (prefix + ".state_norm").c_str());
+    output = ggml_mul(ctx, output, ggml_silu(ctx, z));
+    output = ggml_reshape_2d(ctx, output, inner, token_count);
+    output = ops::linear(
+        ctx, layer.ssm_out, output, (prefix + ".output").c_str());
+    add_critical(result, output);
+    return output;
+}
+
 ggml_tensor * decoder_block(
     ggml_context * ctx,
     ggml_cgraph * graph,
@@ -446,6 +832,74 @@ ggml_tensor * decoder_block(
     return output;
 }
 
+ggml_tensor * decoder_chunk_block(
+    ggml_context * ctx,
+    ggml_cgraph * graph,
+    TargetChunkGraph & result,
+    ggml_tensor * input,
+    const LayerWeights & layer,
+    const RecurrentChunkStateView * recurrent,
+    const AttentionCacheView * attention,
+    const ChunkGraphInputs & inputs,
+    const Config & config,
+    std::size_t n_tokens,
+    std::size_t n_kv,
+    std::size_t snapshot_count,
+    const std::string & prefix) {
+    ggml_tensor * normalized = ops::rms_norm(
+        ctx,
+        input,
+        layer.attn_norm,
+        config.attention_layer_norm_rms_epsilon,
+        (prefix + ".attention_norm").c_str());
+    ggml_tensor * attention_output = nullptr;
+    if (layer.is_recurrent()) {
+        require(
+            recurrent != nullptr && attention == nullptr,
+            prefix + " persistent-state kind mismatch");
+        attention_output = build_chunk_recurrent(
+            ctx,
+            graph,
+            result,
+            normalized,
+            layer,
+            *recurrent,
+            config,
+            n_tokens,
+            snapshot_count,
+            prefix);
+    } else {
+        require(
+            attention != nullptr && recurrent == nullptr,
+            prefix + " persistent-cache kind mismatch");
+        attention_output = build_chunk_attention(
+            ctx,
+            graph,
+            result,
+            normalized,
+            layer,
+            *attention,
+            inputs,
+            config,
+            n_tokens,
+            n_kv,
+            prefix);
+    }
+    ggml_tensor * residual = ggml_add(ctx, attention_output, input);
+    ggml_tensor * ffn_input = ops::rms_norm(
+        ctx,
+        residual,
+        layer.post_attention_norm,
+        config.attention_layer_norm_rms_epsilon,
+        (prefix + ".post_attention_norm").c_str());
+    ggml_tensor * ffn = ops::parallel_swiglu_ffn(
+        ctx, ffn_input, layer.ffn_gate, layer.ffn_up, layer.ffn_down, config);
+    add_critical(result, ffn);
+    ggml_tensor * output = ggml_add(ctx, ffn, residual);
+    set_name(output, prefix + ".block_output");
+    return output;
+}
+
 void finalize_outputs(
     ggml_context * ctx,
     TokenGraph & result,
@@ -467,6 +921,50 @@ void finalize_outputs(
     } else {
         ggml_build_forward_expand(result.graph, result.hidden);
     }
+}
+
+void finalize_chunk_outputs(
+    ggml_context * ctx,
+    TargetChunkGraph & result,
+    ggml_tensor * hidden,
+    ggml_tensor * head,
+    std::size_t n_tokens,
+    TargetChunkOutputMode output_mode,
+    bool retain_hidden) {
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    require(head != nullptr, "target chunk output head is null");
+    require_shape(
+        hidden,
+        {head->ne[0], token_count},
+        "target_chunk.hidden");
+    require(
+        ggml_is_contiguous(hidden),
+        "target chunk hidden tensor must be contiguous");
+    result.hidden = hidden;
+    set_name(result.hidden, "qwen35.target_chunk.hidden");
+    if (retain_hidden) {
+        ggml_set_output(result.hidden);
+    }
+
+    ggml_tensor * head_input = hidden;
+    if (output_mode == TargetChunkOutputMode::Last && n_tokens > 1) {
+        head_input = ggml_view_2d(
+            ctx,
+            hidden,
+            hidden->ne[0],
+            1,
+            hidden->nb[1],
+            static_cast<std::size_t>(token_count - 1) * hidden->nb[1]);
+        set_name(head_input, "qwen35.target_chunk.last_hidden");
+    }
+
+    ggml_tensor * logits = ops::linear(
+        ctx, head, head_input, "qwen35.target_chunk.logits");
+    add_critical(result, logits);
+    result.greedy_tokens = ggml_argmax(ctx, logits);
+    ggml_set_output(result.greedy_tokens);
+    set_name(result.greedy_tokens, "qwen35.target_chunk.greedy_tokens");
+    ggml_build_forward_expand(result.graph, result.greedy_tokens);
 }
 
 }  // namespace
@@ -545,6 +1043,109 @@ TokenGraph build_target_token_graph(
         weights.global().output_head,
         emit_greedy,
         "qwen35.target");
+    return result;
+}
+
+TargetChunkGraph build_target_chunk_graph(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    const TargetChunkPersistentView & persistent,
+    std::size_t n_tokens,
+    std::size_t n_kv,
+    std::size_t snapshot_count,
+    TargetChunkOutputMode output_mode,
+    bool retain_hidden) {
+    require(ctx != nullptr, "target chunk GGML context is null");
+    require(n_tokens > 0, "target chunk requires at least one token");
+    require(n_kv >= n_tokens, "target chunk attention context is too short");
+    require(
+        snapshot_count > 0 && snapshot_count <= n_tokens,
+        "target chunk snapshot count must be in [1, n_tokens]");
+    require(
+        output_mode == TargetChunkOutputMode::Last ||
+            output_mode == TargetChunkOutputMode::All,
+        "target chunk output mode is invalid");
+
+    const Config & config = weights.config();
+    require(config.main_layers == 24, "target chunk graph requires 24 decoder layers");
+    require(
+        persistent.recurrent.size() == kExpectedRecurrentLayers,
+        "target chunk graph requires 18 recurrent state records");
+    require(
+        persistent.attention.size() == kExpectedAttentionLayers,
+        "target chunk graph requires 6 attention-cache records");
+
+    TargetChunkGraph result;
+    result.graph = ggml_new_graph_custom(ctx, 4096, false);
+    const ChunkGraphInputs inputs = make_chunk_inputs(ctx, n_tokens, n_kv);
+    result.tokens = inputs.tokens;
+    result.positions = inputs.positions;
+    result.write_slots = inputs.write_slots;
+    result.read_slots = inputs.read_slots;
+    result.causal_mask = inputs.causal_mask;
+
+    ggml_tensor * current = ggml_get_rows(
+        ctx, weights.global().token_embd, inputs.tokens);
+    set_name(current, "qwen35.target_chunk.token_embedding");
+    std::size_t recurrent_index = 0;
+    std::size_t attention_index = 0;
+    for (std::uint32_t index = 0; index < config.main_layers; ++index) {
+        const LayerWeights & layer = weights.layer(index);
+        const std::string prefix =
+            "qwen35.target_chunk.layer." + std::to_string(index);
+        if (layer.is_recurrent()) {
+            current = decoder_chunk_block(
+                ctx,
+                result.graph,
+                result,
+                current,
+                layer,
+                &persistent.recurrent.at(recurrent_index++),
+                nullptr,
+                inputs,
+                config,
+                n_tokens,
+                n_kv,
+                snapshot_count,
+                prefix);
+        } else {
+            current = decoder_chunk_block(
+                ctx,
+                result.graph,
+                result,
+                current,
+                layer,
+                nullptr,
+                &persistent.attention.at(attention_index++),
+                inputs,
+                config,
+                n_tokens,
+                n_kv,
+                snapshot_count,
+                prefix);
+        }
+    }
+    require(
+        recurrent_index == persistent.recurrent.size(),
+        "target chunk graph has an unused recurrent state record");
+    require(
+        attention_index == persistent.attention.size(),
+        "target chunk graph has an unused attention cache record");
+
+    current = ops::rms_norm(
+        ctx,
+        current,
+        weights.global().output_norm,
+        config.attention_layer_norm_rms_epsilon,
+        "qwen35.target_chunk.output_norm");
+    finalize_chunk_outputs(
+        ctx,
+        result,
+        current,
+        weights.global().output_head,
+        n_tokens,
+        output_mode,
+        retain_hidden);
     return result;
 }
 

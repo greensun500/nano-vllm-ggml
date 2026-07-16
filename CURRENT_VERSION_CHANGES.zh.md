@@ -1,121 +1,144 @@
-# nano-vLLM 当前版本修改说明：v3.1 MTP KV-only quick path
+# nano-vLLM 当前版本修改说明：v3.2 TargetChunkGraph
 
 ## 1. 版本定位
 
-本文件只描述当前工作树版本。旧版本说明不在当前代码树中累积，历史内容由 Git 提交保存。
+本文件只描述当前代码版本。旧版本说明不在工作树中累积，历史由 Git 提交保存。
 
-- 基线提交：`a27ba58`（v3.0 in-tree native runtime）
-- 当前迭代：v3.1
-- 固定 GGML：官方 llama.cpp `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`
+- 基线提交：`fb5a028`（v3.1 MTP KV-only quick path）
+- 当前迭代：v3.2
+- GGML：官方 llama.cpp `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`
 - 模型：Qwen3.5-2B-Q4_0.gguf，内置单层 MTP
-- 后端：CPU、Vulkan；不走 CUDA，不构造 `llama_context`
+- 后端：CPU、Vulkan；不使用 CUDA、`libllama` 或 `llama_context`
 - 采样：greedy only
 
 ## 2. 本轮目标与结论
 
-本轮优先删除 MTP 热路径里已经确认的冗余工作，并改善非 MTP 路径的同步/readback。实现与远程实测均已完成，但相对 v3.0 MTP-off 基线尚未达到 30% 提升，因此本版本不是性能优化终点。
+v3.2 将单序列的多个 target token 合并到一张 GGML graph，覆盖普通 prompt prefill 和 MTP verification。目标是减少重复 graph 调度，并让同一权重的多个 token projection 共享一次矩阵计算。
 
-结论如下：
+结果分成两部分：
 
-1. MTP prefill 的额外维护成本已经从“每 token 一张完整 MTP 图”降为“每 sequence chunk 一张批量 KV-only 图”。
-2. accepted path 的 MTP catch-up 从多张完整图变为一张 KV-only 图；立即拒绝时不再 catch-up。
-3. 串行 target verification 在首次 mismatch 后停止，减少无效 target 图。
-4. CPU/Vulkan 的非 MTP 性能约提升 0.1%～1.2%，证明 readback/sync 不是主瓶颈。
-5. MTP decode 仍慢于 MTP-off：CPU tg128 -21.03%，Vulkan tg128 -28.57%。剩余主瓶颈是 K+1 次串行 target trunk/大词表 head。
+1. 结构改造与正确性验证完成。CPU/Vulkan 的 greedy token、MTP full/partial/reject、rollback 后下一轮状态均通过真实模型 oracle。
+2. 性能目标未完成。CPU prefill 提升 50.3%，组合项提升 33.8%；但 CPU/Vulkan MTP decode 分别比 v3.0 MTP-off 基线慢 24.2% 和 33.9%。
 
-下一轮必须实现单序列、多 token `TargetChunkGraph`，同时覆盖 prompt prefill 与 K+1 verification。
+本轮揭示了一个重要事实：正确的批处理结构不等于当前硬件上一定更快。远程 ARM CPU 的原构建没有启用 dotprod/i8mm，也没有把 Q4/Q6 权重放入 CPU_REPACK；Mali-G720 对 `T<=8` 选择 DMMV 小批量 kernel。固定 `T=4` 还会在首次 mismatch 后继续计算，而 v3.1 平均只执行约 3.25～3.33 个 target 行。
+
+因此 v3.2 是已验证但未达 30% 门槛的中间迭代，下一轮继续优化。
 
 ## 3. 代码修改
 
-### 3.1 Batched MTP KV-only graph
+### 3.1 单序列多 token TargetChunkGraph
 
-新增批量状态维护图，输入为：
-
-```text
-tokens        I32 [N]
-positions     I32 [4*N]
-write_slots   I32 [N]
-hidden_input  F32 [2048,N]
-```
-
-图中只执行：
+新增 `TargetChunkGraph`，输入为：
 
 ```text
-token embedding
-  -> embedding/hidden RMSNorm + eh_proj
-  -> MTP attention norm
-  -> K/V projection
-  -> K norm + IMRoPE
-  -> contiguous
-  -> SET_ROWS 到 MTP PagedKV
+tokens        I32 [T]
+positions     I32 [4*T]
+write_slots   I32 [T]
+read_slots    I32 [C]
+causal_mask   F32 [C,T]（T=1 时省略）
 ```
 
-它明确不执行 Q/gate、KV gather、attention、output projection、FFN、output norm、词表 head 和 hidden readback。
+一次 graph 中执行完整 24 层 target trunk，并把输出模式分为：
 
-完整 attention graph 与 KV-only graph 复用同一个 K/V projection、normalization、RoPE 和 store helper，避免布局或数值语义漂移。
+- `Last`：只对最后一列 hidden 执行 tied vocab head，供普通 prefill/decode 使用；
+- `All`：对全部 T 列执行 vocab head，供 MTP greedy verification 使用。
 
-### 3.2 Prefill MTP maintenance batching
+`Last` 避免在长 prompt 上物化约 `vocab_size × T` 的 logits。
 
-普通 target prompt 仍按 token 运行，但运行过程中收集右移后的 target hidden：
+### 3.2 多 token causal attention
+
+6 个 full-attention 层一次投影 T 个 token 的 Q/K/V，批量写入 PagedKV，然后按 block table 展开的物理 slot gather 完整上下文。
+
+mask 语义为：第 i 个 query 只能看到历史 KV 和当前 chunk 的 `0..i` 行。它同时满足：
+
+- prompt chunk causal prefill；
+- MTP verification 的 `[x_p,d1,...,dK]`；
+- 非连续物理 KV slot 下的逻辑时序。
+
+### 3.3 多 token Gated Delta Net
+
+18 个 recurrent 层改为在一张图内按 token 递推：
+
+- convolution 输入由旧的 3 行状态与本 chunk 的 T 行 QKV 拼接；
+- delta state 在 graph 内逐 token 更新；
+- 普通 prefill 只提交最新 canonical state；
+- verification 按 newest-first 写入 K+1 个 snapshot plane。
+
+verification 输入 index 与 snapshot plane 的关系为：
 
 ```text
-MTP hidden row 0 = 进入 chunk 前的 pending hidden
-MTP hidden row i = target hidden[i-1]
+index 0 -> plane K
+index 1 -> plane K-1
+...
+index K -> plane 0
 ```
 
-chunk 结束后一次执行 KV-only graph。对 pp512，每个请求的 MTP maintenance graph 从约 512 张完整 MTP 图降为 1 张轻量图。
+接受 a 个 draft 后选择 `plane K-a`，无需重算 target trunk。
 
-### 3.3 Catch-up 去重与批处理
+### 3.4 普通 prefill
 
-本轮第一个 MTP draft 已经用完全相同的 `x_p + h_{p-1} + position + slot` 写入第 0 行，因此 post-verification catch-up 从 index 1 开始：
-
-- `accepted == 0`：不执行 catch-up；
-- `accepted > 0`：将 `1..accepted` 的 token、position、slot、target hidden 一次送入 KV-only graph。
-
-### 3.4 Verification early-stop
-
-串行 target verification 现在边计算边比较。首次 mismatch 位于 `index=a` 时，该图已经产生 correction token、`target_hidden[a]` 和 recurrent plane `K-a`，后续 target 图无需再执行。full accept 仍执行第 K 行得到额外 correction token。
-
-### 3.5 Readback 与同步
-
-- `execute_target()`/`execute_mtp()` 只在调用方消费 hidden 时才读回；
-- 非 MTP prefill/decode 不再读取无用 hidden；
-- 最后一个 draft 不再读取无消费者的 hidden；
-- 删除同步 `graph_compute` 之后的重复 `synchronize()`；
-- 删除每图入口的重复 scheduler reset，保留 RAII 出口 reset。
-
-### 3.6 Benchmark 口径
-
-CLI 新增：
+`run()` 不再逐 token 建 target graph，而是每个 scheduler sequence chunk 执行一次 `TargetChunkGraph(Last)`：
 
 ```text
-processed_tokens = prefill_tokens + decode_tokens
-processed_tok_s  = processed_tokens / total_s
+T 个 token
+  -> 一次 24-layer target chunk
+  -> 批量写 target PagedKV
+  -> 提交最新 recurrent state
+  -> 仅最后一列 vocab head/argmax
 ```
 
-组合项使用 `processed_tok_s`，与 llama-bench 的 pp+tg 分子一致，不再误用只统计 completion 的 `generated_tok_s`。
+CPU pp512 因此从约 512 张 target graph 降为 1 张，并获得本轮最明显的收益。
 
-## 4. 正确性证据
+### 3.5 MTP prefill hidden 右移
 
-本地与远程均通过：
+开启 MTP 时，target chunk 返回全部 target hidden。MTP maintenance 输入保持严格右移：
 
-- C++ `graph_executor_placement`；
-- 35 项 Python 单元测试；
-- 4 项真实模型 CPU oracle；
-- CPU/Vulkan 完整扩展构建；
-- Vulkan MTP 实际推理烟雾测试。
+```text
+mtp_hidden[0] = 进入 chunk 前的 pending_hidden
+mtp_hidden[i] = target_hidden[i-1]
+```
 
-真实模型 oracle 覆盖：
+随后一次执行 batched MTP KV-only graph，chunk 最后一行 target hidden 成为下一轮 `pending_hidden`。
 
-- full accept：`a=3 -> plane 0`；
-- partial accept：`a=1 -> plane 2`；
-- immediate reject：`a=0 -> plane 3`；
-- 每种情况的下一轮 token，用于验证 rollback 和 target-conditioned MTP KV；
-- MTP on/off 的 nano-vLLM scheduler 路径 greedy token 一致。
+### 3.6 一图 verification
 
-## 5. 远程基准口径
+K 个 draft 仍串行产生，target verification 从最多 K+1 张 token graph 改为一张：
 
-远程：`cix@172.16.64.219`，12 核 Cortex-A720/A520，Mali-G720-Immortalis。
+```text
+verification_inputs = [x_p, d1, ..., dK]
+TargetChunkGraph(T=K+1, output=All, snapshots=K+1)
+  -> K+1 个 target predictions
+  -> K+1 个 target hidden
+  -> K+1 组 recurrent snapshots
+```
+
+host 端比较 draft 与 target prediction，得到 accepted 数 a，选择 `plane K-a`，回滚未提交的尾部，并继续使用 v3.1 的 batched MTP KV catch-up。
+
+### 3.7 兼容性
+
+旧的单 token graph API 保留，新增 chunk graph 没有改变 Python scheduler 的 plan ABI、block table 所有权或 request 生命周期。
+
+## 4. 正确性验证
+
+本地验证：
+
+- native CPU extension 构建通过；
+- C++ `graph_executor_placement` 通过；
+- 34 项 Python 测试通过，5 项按环境跳过；
+- 4 项真实 Qwen3.5 CPU oracle 全部通过。
+
+远程验证：
+
+- CPU+Vulkan extension 构建通过；
+- C++ 与 Python 测试通过；
+- 4 项 CPU 真实模型 oracle 通过；
+- Vulkan 专项 oracle 通过 fixed trace、full accept、partial accept、immediate reject、下一轮状态和 near-boundary 场景。
+
+这些测试确认 v3.2 的下降来自执行成本与 kernel 选择，而不是 token 或状态语义错误。
+
+## 5. 基准口径
+
+远程：12 核 Cortex-A720/A520、Mali-G720-Immortalis。
 
 公共参数：
 
@@ -125,6 +148,7 @@ max_num_batched_tokens=768
 max_num_seqs=1
 num_kvcache_blocks=3
 threads=8
+device_index=0
 temperature=0
 warmup=1
 repeat=3
@@ -134,45 +158,60 @@ MTP K=3
 测试映射：
 
 ```text
-pp512        = prompt_len 512, gen_len 1，读取 prefill_tok_s
-tg128        = prompt_len 1, gen_len 129，读取 decode_tok_s
-pp521+tg128  = prompt_len 521, gen_len 129，读取 processed_tok_s
+pp512       = prompt_len 512, gen_len 1，读取 prefill_tok_s
+tg128       = prompt_len 1, gen_len 129，读取 decode_tok_s
+pp521+tg128 = prompt_len 521, gen_len 129，读取 processed_tok_s
 ```
 
-`gen_len=129` 是因为第一个 completion 随 prefill 产生，随后正好保留 128 个 decode step。
+## 6. 远程实测
 
-## 6. 实测结果
+变化均相对同机 v3.0 MTP-off 基线。30% 目标分别为：
 
-表中变化均相对同一机器上的 v3.0 MTP-off 基线。
+- CPU：pp 24.270、tg 20.060、组合 22.932 tok/s；
+- Vulkan：pp 41.337、tg 27.480、组合 37.317 tok/s。
 
 ### CPU
 
-| 版本/模式 | pp512 tok/s | 变化 | tg128 tok/s | 变化 | pp521+tg128 tok/s | 变化 |
+| 版本/模式 | pp512 tok/s | 相对基线 | tg128 tok/s | 相对基线 | pp521+tg128 tok/s | 相对基线 |
 |---|---:|---:|---:|---:|---:|---:|
-| v3.0 MTP-off 基线 | 18.669 | - | 15.431 | - | 17.640 | - |
-| v3.1 MTP-off | 18.850 | +0.97% | 15.453 | +0.14% | 17.785 | +0.82% |
-| v3.1 MTP-on | 18.792 | +0.66% | 12.185 | -21.03% | 16.811 | -4.70% |
+| v3.0 MTP-off | 18.669 | - | 15.431 | - | 17.640 | - |
+| v3.2 MTP-off | 28.065 | +50.32% | 15.380 | -0.33% | 23.599 | +33.78% |
+| v3.2 MTP-on | 27.858 | +49.22% | 11.701 | -24.17% | 22.753 | +28.98% |
 
 ### Vulkan
 
-| 版本/模式 | pp512 tok/s | 变化 | tg128 tok/s | 变化 | pp521+tg128 tok/s | 变化 |
+| 版本/模式 | pp512 tok/s | 相对基线 | tg128 tok/s | 相对基线 | pp521+tg128 tok/s | 相对基线 |
 |---|---:|---:|---:|---:|---:|---:|
-| v3.0 MTP-off 基线 | 31.797 | - | 21.139 | - | 28.706 | - |
-| v3.1 MTP-off | 32.173 | +1.18% | 21.343 | +0.97% | 28.919 | +0.74% |
-| v3.1 MTP-on | 31.744 | -0.17% | 15.099 | -28.57% | 26.081 | -9.14% |
+| v3.0 MTP-off | 31.797 | - | 21.139 | - | 28.706 | - |
+| v3.2 MTP-off | 36.199 | +13.84% | 21.266 | +0.60% | 28.591 | -0.40% |
+| v3.2 MTP-on | 35.821 | +12.65% | 13.978 | -33.88% | 25.998 | -9.43% |
+
+K sweep 进一步确认批宽与 kernel 的相关性：K=1（target T=2）在 Vulkan 上优于 K=3（T=4），但仍未达到 tg128 的 30% 目标。
 
 ## 7. 本轮反思
 
-本轮达成了预期的“清掉确定性冗余”，尤其是 MTP prefill 维护几乎不再增加时间；但没有达到 30%，原因不是接受率不足，而是 verification 的计算组织仍然错误：
+### 7.1 已经成立的优化
 
-```text
-当前 K=3：3 张 draft 图 + 最多 4 张 target 图 + 1 张 KV-only catch-up 图
-```
+- 长 prompt target batching 成立，CPU prefill/组合项显著提升；
+- causal attention、multi-token GDN 与 snapshot rollback 语义成立；
+- `Last` 模式成功避免长 prompt 的全量 logits；
+- target verification 图数从 K+1 降到 1。
 
-target 的 24 层 trunk 和约 398 MiB tied head 仍按 token 重复扫描。下一轮改为：
+### 7.2 为什么 MTP decode 变慢
 
-```text
-3 张 draft 图 + 1 张 K+1 target chunk 图 + 至多 1 张 KV-only catch-up 图
-```
+1. v3.1 可在 mismatch 后 early-stop，平均只执行约 3.25～3.33 个 target 行；v3.2 固定执行 4 行，多算约 20%～23%。
+2. 原远程 ARM 构建的 `-mcpu=native` 没有启用 dotprod/i8mm；Q4_0/Q6_K 的 T=4 无法形成期望的多行高效矩阵内核。
+3. nano loader 只使用默认 CPU buffer，`GGML_CPU_REPACK=ON` 并不代表模型权重实际进入 CPU_REPACK。
+4. Vulkan 对 `T<=8` 固定选择 DMMV；Mali 无 int-dot 和 matrix-core，T=4 没有获得预期的权重复用。
+5. 18 层 GDN 为 K+1 个候选状态分别执行 snapshot CPY。
+6. K 个 MTP draft 仍是 K 张串行图，并且每张都扫描约 398 MiB tied Q6_K vocab head。
 
-同时普通 pp512 要从 512 张 target token graph 改为一张 target chunk graph。只有完成这项结构变化，才可能同时达到 pp、tg 与组合项的 30% 目标。
+### 7.3 下一轮优先级
+
+1. 修正 AArch64 构建自动探测，明确启用 dotprod+i8mm，并用运行时 feature query/反汇编验证。
+2. CPU 按 tensor 使用 CPU_REPACK；保留 embedding 原布局，单独复制 tied output head 到 repack buffer。
+3. Vulkan 实测 prompt chunk 和 verification T=2/3/4 的最优形状，不假设 CPU 最优形状适用于 Mali。
+4. 引入 backend-aware K/shape 策略；必要时保留 early-stop 小图路径。
+5. 将连续 draft 与 target verification 尽可能合并为单图，减少 graph build、同步和 host readback。
+6. 避免物化所有 snapshot 副本，改为按 accepted index 提交或缩小复制范围。
+7. 增加 graph-build、backend compute、readback、head、trunk、catch-up 分段计时，按实测继续迭代。

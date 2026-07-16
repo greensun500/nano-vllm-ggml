@@ -36,6 +36,28 @@ struct TargetPersistentView {
     std::vector<AttentionCacheView> attention;
 };
 
+enum class TargetChunkOutputMode {
+    Last,
+    All,
+};
+
+// Persistent state used by one single-sequence, multi-token target graph.
+// Snapshot destinations are ordered newest first and must contain exactly the
+// number of planes requested from build_target_chunk_graph().
+struct RecurrentChunkStateView {
+    ggml_tensor * convolution = nullptr;  // input [3, 6144], F32
+    ggml_tensor * delta = nullptr;        // input [128, 128, 16, 1], F32
+
+    std::vector<ggml_tensor *> convolution_outputs;
+    std::vector<ggml_tensor *> delta_outputs;
+};
+
+struct TargetChunkPersistentView {
+    // Ordered by target-layer occurrence, matching TargetPersistentView.
+    std::vector<RecurrentChunkStateView> recurrent;
+    std::vector<AttentionCacheView> attention;
+};
+
 // Inputs and outputs of a graph which consumes exactly one token from exactly
 // one nano-vLLM sequence. Processing requests token-by-token is intentional in
 // the first correctness runtime: it preserves nano-vLLM's batching/Paged-KV
@@ -55,6 +77,25 @@ struct TokenGraph {
     // A narrow diagnostic subset retained for compatibility. Strict Vulkan
     // execution pins and audits every real compute node in the graph, including
     // cache/state CPY and SET_ROWS operations; it does not rely on this list.
+    std::vector<ggml_tensor *> critical_compute_nodes;
+};
+
+// One target graph for T contiguous tokens from exactly one sequence. The
+// read-slot vector is the complete logical prefix through the final token, so
+// the caller-provided mask can hide the future T-token suffix per query row.
+struct TargetChunkGraph {
+    ggml_cgraph * graph = nullptr;
+
+    ggml_tensor * tokens = nullptr;       // I32 [T]
+    ggml_tensor * positions = nullptr;    // I32 [4 * T], IMRoPE channels
+    ggml_tensor * write_slots = nullptr;  // I32 [T]
+    ggml_tensor * read_slots = nullptr;   // I32 [n_kv]
+    ggml_tensor * causal_mask = nullptr;  // F32 [n_kv, T], null for T == 1
+
+    // Hidden remains readable only when retain_hidden=true was requested.
+    ggml_tensor * hidden = nullptr;        // F32 [2048, T]
+    ggml_tensor * greedy_tokens = nullptr; // I32 [1] for Last, I32 [T] for All
+
     std::vector<ggml_tensor *> critical_compute_nodes;
 };
 
@@ -84,6 +125,16 @@ TokenGraph build_target_token_graph(
     const TargetPersistentView & persistent,
     std::size_t n_kv,
     bool emit_greedy);
+
+TargetChunkGraph build_target_chunk_graph(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    const TargetChunkPersistentView & persistent,
+    std::size_t n_tokens,
+    std::size_t n_kv,
+    std::size_t snapshot_count,
+    TargetChunkOutputMode output_mode,
+    bool retain_hidden);
 
 TokenGraph build_mtp_token_graph(
     ggml_context * ctx,
