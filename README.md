@@ -24,6 +24,15 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+The base Python dependencies are sufficient for the native CPU/Vulkan path;
+the in-tree extension must still be compiled from a source checkout with the
+build script below. Install the CUDA-specific stack explicitly when using the
+original CUDA backend from a checkout:
+
+```bash
+pip install '.[cuda]'
+```
+
 ## Model Download
 
 To download the model weights manually, use the following command:
@@ -45,51 +54,85 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
-## Qwen3.5 llama.cpp CPU/Vulkan backend
+## In-tree Qwen3.5 CPU/Vulkan runtime
 
-Stage 3 supports text-only Qwen3.5 GGUF inference on CPU and Vulkan. Full-attention layers use nano-vLLM paged KV slots, recurrent layers keep one native state per sequence, and the GGUF's built-in MTP layer can perform greedy speculative decoding without a separate draft model. The backend also supports the Qwen3.5 non-thinking chat template and all model EOG tokens.
-
-MTP is opt-in. `mtp_max_draft_tokens` defaults to 3, matching the current llama.cpp default. An MTP verification batch requires `max_num_batched_tokens >= max_num_seqs * (mtp_max_draft_tokens + 1)`.
-
-The integration is based on official llama.cpp commit `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`. Build the dedicated llama.cpp checkout:
+The new runtime keeps request scheduling and cache ownership in nano-vLLM and
+statically embeds only the official GGML CPU/Vulkan implementation. It does not
+link `llama`, construct a `llama_context`, or require `--library-path`.
 
 ```bash
-./scripts/build_llamacpp_cpu.sh
-./scripts/build_llamacpp_vulkan.sh
+git submodule update --init --recursive
+./scripts/build_native_runtime.sh
+
+# Build one module containing CPU plus Vulkan:
+NANOVLLM_NATIVE_VULKAN=ON ./scripts/build_native_runtime.sh
 ```
 
-Run CPU chat:
+The native path implements the 24-layer Qwen3.5-2B target graph, six
+full-attention Paged-KV layers, 18 recurrent Gated Delta Net layers, and the
+GGUF's bundled MTP layer. MTP v1 is greedy-only and opt-in. Start with one
+sequence while validating the correctness-first F32 state implementation:
 
 ```bash
-PYTHONPATH=. python -m nanovllm.cli.chat \
-  --backend llamacpp_cpu \
-  --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
-  --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_cpu/bin/libnanollama_backend.so \
+PYTHONPATH=. python3 -m nanovllm.cli.chat \
+  /path/to/Qwen3.5-2B-Q4_0.gguf \
+  --backend native_cpu \
+  --tokenizer /path/to/Qwen3.5-2B \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 1 \
   --enable-mtp \
   --mtp-max-draft-tokens 3 \
   --temperature 0
 ```
 
-Run Vulkan chat:
+After a Vulkan-enabled build, change only the execution backend:
 
 ```bash
-PYTHONPATH=. python -m nanovllm.cli.chat \
-  --backend llamacpp_vulkan \
-  --gguf-model /home/cix/nano-vllm/models/Qwen3.5-2B-Q4_0.gguf \
-  --library-path /home/cix/nano-vllm/llama.cpp-qwen35/build_nanovllm_vulkan/bin/libnanollama_backend.so \
-  --gpu-layers -1 \
+PYTHONPATH=. python3 -m nanovllm.cli.chat \
+  /path/to/Qwen3.5-2B-Q4_0.gguf \
+  --backend native_vulkan \
+  --tokenizer /path/to/Qwen3.5-2B \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 1 \
   --enable-mtp \
   --mtp-max-draft-tokens 3 \
   --temperature 0
 ```
 
-The staged backend intentionally disables prefix caching and preemption, and MTP v1 only accepts greedy sampling. It does not expose the previous PD backend. The older PD design documents remain as historical references for their original branches.
-
-See `QWEN35_STAGED_IMPLEMENTATION.zh.md` for stage boundaries, validation evidence, and reflection notes.
+The earlier `llamacpp_cpu`/`llamacpp_vulkan` external-library path remains only
+as a migration oracle. It is not used by either native backend. The 3.0 code
+flow is documented in
+[`NANOVLLM_V3.0_NATIVE_RUNTIME_FLOW.zh.md`](NANOVLLM_V3.0_NATIVE_RUNTIME_FLOW.zh.md);
+phase reflections and CPU/Vulkan validation evidence are in
+[`NATIVE_RUNTIME_IMPLEMENTATION.zh.md`](NATIVE_RUNTIME_IMPLEMENTATION.zh.md).
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+Use the backend-aware CLI. Its JSON includes the pinned GGML commit, Vulkan
+build flag, physical KV block count, and MTP drafted/accepted/verification
+statistics:
+
+```bash
+PYTHONPATH=. python3 -m nanovllm.cli.bench \
+  /path/to/Qwen3.5-2B-Q4_0.gguf \
+  --backend native_cpu \
+  --tokenizer /path/to/Qwen3.5-2B \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 1 \
+  --num-kvcache-blocks 1 \
+  --prompt-len 32 \
+  --gen-len 16 \
+  --enable-mtp \
+  --temperature 0 \
+  --json
+```
+
+`num_kvcache_blocks` is total physical capacity and does not change the
+per-sequence `max_model_len`. Increase it explicitly when concurrent sequences
+need more pages.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)

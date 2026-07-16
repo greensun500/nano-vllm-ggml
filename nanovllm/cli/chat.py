@@ -40,32 +40,43 @@ def clean_response(text: str, template: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive nano-vLLM chat CLI for CUDA or llama.cpp CPU/Vulkan backends.",
+        description="Interactive nano-vLLM chat CLI for CUDA, staged llama.cpp, or native CPU/Vulkan backends.",
     )
     parser.add_argument(
         "model",
         nargs="?",
-        default=os.environ.get("NANOVLLM_GGUF_MODEL") or os.environ.get("NANOVLLM_MODEL"),
-        help="HF model path for CUDA, or GGUF model path for llama.cpp backends.",
+        default=None,
+        help="HF model path for CUDA, or GGUF model path for staged/native CPU/Vulkan backends.",
     )
     parser.add_argument(
         "--backend",
-        default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
+        default=os.environ.get("NANOVLLM_BACKEND", "native_cpu"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "native_cpu", "native_vulkan"),
         help="Execution backend.",
     )
     parser.add_argument(
         "--gguf-model",
         default=os.environ.get("NANOVLLM_GGUF_MODEL"),
-        help="GGUF model path. Defaults to the positional model path for llama.cpp backends.",
+        help="GGUF model path. Defaults to the positional model path for staged/native backends.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=os.environ.get("NANOVLLM_TOKENIZER"),
+        help="Local Hugging Face tokenizer directory required by native CPU/Vulkan backends.",
     )
     parser.add_argument(
         "--library-path",
         default=os.environ.get("NANOVLLM_LLAMA_BACKEND_LIB"),
-        help="Path to libnanollama_backend.so.",
+        help="Path to libnanollama_backend.so (legacy staged llama.cpp backend only).",
     )
     parser.add_argument("--max-model-len", type=int, default=int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "2048")))
     parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "1")))
+    parser.add_argument(
+        "--num-kvcache-blocks",
+        type=int,
+        default=int(os.environ.get("NANOVLLM_NUM_KVCACHE_BLOCKS", "-1")),
+        help="Total physical KV blocks. -1 derives the minimum from max-model-len.",
+    )
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -78,6 +89,7 @@ def parse_args() -> argparse.Namespace:
         help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
+    parser.add_argument("--device-index", type=int, default=int(os.environ.get("NANOVLLM_DEVICE_INDEX", "0")))
     parser.add_argument(
         "--threads-batch",
         type=int,
@@ -127,8 +139,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_llm(args: argparse.Namespace) -> LLM:
-    model = args.model
+    model = args.model or (
+        os.environ.get("NANOVLLM_MODEL")
+        if args.backend == "cuda"
+        else args.gguf_model
+    )
     gguf_model = args.gguf_model or model
+    if args.backend.startswith("native"):
+        if not gguf_model:
+            raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
+        if not args.tokenizer:
+            raise SystemExit("Native backends require --tokenizer or NANOVLLM_TOKENIZER pointing to the HF tokenizer directory.")
+        return LLM(
+            gguf_model,
+            backend=args.backend,
+            model_format="gguf",
+            gguf_model=gguf_model,
+            tokenizer=args.tokenizer,
+            tokenizer_backend="hf",
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            num_kvcache_blocks=args.num_kvcache_blocks,
+            enable_mtp=args.enable_mtp,
+            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+            device_config={
+                "n_threads": args.threads,
+                "device_index": args.device_index,
+            },
+        )
     if args.backend.startswith("llamacpp"):
         if not gguf_model:
             raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
@@ -141,6 +180,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            num_kvcache_blocks=args.num_kvcache_blocks,
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             device_config={
@@ -148,7 +188,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
                 "n_ubatch": args.ubatch_size or None,
                 "n_threads": args.threads,
                 "n_threads_batch": args.threads_batch,
-                "n_gpu_layers": args.gpu_layers,
+                "n_gpu_layers": 0 if args.backend == "llamacpp_cpu" else args.gpu_layers,
             },
         )
 
@@ -163,12 +203,22 @@ def build_llm(args: argparse.Namespace) -> LLM:
     )
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if args.max_tokens <= 0:
+        raise SystemExit("--max-tokens must be positive.")
+    if args.backend != "cuda" and args.temperature != 0:
+        raise SystemExit("CPU/Vulkan GGUF backends currently require --temperature 0.")
+    if args.backend == "cuda" and args.enable_mtp:
+        raise SystemExit("--enable-mtp is supported only by CPU/Vulkan GGUF backends.")
+
+
 def print_help() -> None:
     print("Commands: /exit, /quit, /reset, /history, /system <prompt>, /help")
 
 
 def main() -> int:
     args = parse_args()
+    validate_args(args)
     llm = build_llm(args)
     sampling_params = SamplingParams(
         temperature=args.temperature,

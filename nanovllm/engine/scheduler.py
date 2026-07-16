@@ -14,6 +14,7 @@ class Scheduler:
         self.eos_token_ids = frozenset(config.eos_token_ids)
         self.enable_preemption = config.enable_preemption
         self.speculative_tokens = config.mtp_max_draft_tokens if config.enable_mtp else 0
+        self.max_model_len = config.max_model_len
         self.block_size = config.kvcache_block_size  # KV Cache的block大小（每个块包含的token数）
         # BlockManager用于管理KV cache的分配与回收，第一个参数为可分配的block数，第二个为每个block的大小
         self.block_manager = BlockManager(
@@ -31,6 +32,15 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    def _speculative_tokens_for(self, seq: Sequence) -> int:
+        if self.speculative_tokens == 0:
+            return 0
+        # A K-token verification window consumes slots through
+        # position len(seq)-1+K. NativeRunner uses the same boundary test and
+        # falls back to one target step when the full window would cross the
+        # configured logical context.
+        return self.speculative_tokens if len(seq) + self.speculative_tokens <= self.max_model_len else 0
 
     def schedule(self) -> tuple[list[Sequence], bool]:#调度器的核心代码，
         """
@@ -73,9 +83,10 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            if not self.enable_preemption and not self.block_manager.can_append(seq, self.speculative_tokens):
+            speculative_tokens = self._speculative_tokens_for(seq)
+            if not self.enable_preemption and not self.block_manager.can_append(seq, speculative_tokens):
                 raise RuntimeError("paged KV cache is full and preemption is disabled")
-            while not self.block_manager.can_append(seq, self.speculative_tokens):
+            while not self.block_manager.can_append(seq, speculative_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -84,7 +95,7 @@ class Scheduler:
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq, self.speculative_tokens)
+                self.block_manager.may_append(seq, speculative_tokens)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))

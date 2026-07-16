@@ -11,6 +11,18 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 
 
+def _hf_eog_token_ids(tokenizer, include_qwen_eog: bool = False) -> tuple[int, ...]:
+    eos = tokenizer.eos_token_id
+    values = [eos] if isinstance(eos, int) else list(eos or ())
+    if include_qwen_eog:
+        unknown = getattr(tokenizer, "unk_token_id", None)
+        for token in ("<|endoftext|>", "<|im_end|>"):
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if isinstance(token_id, int) and token_id >= 0 and token_id != unknown:
+                values.append(token_id)
+    return tuple(dict.fromkeys(values))
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -43,8 +55,10 @@ class LLMEngine:
 
             tokenizer_path = config.tokenizer or config.model
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
-            eos_token_id = self.tokenizer.eos_token_id
-            config.eos_token_ids = (eos_token_id,) if isinstance(eos_token_id, int) else tuple(eos_token_id or ())
+            config.eos_token_ids = _hf_eog_token_ids(
+                self.tokenizer,
+                include_qwen_eog=config.backend in ("native_cpu", "native_vulkan"),
+            )
         self.scheduler = Scheduler(config)#调度器
         atexit.register(self.exit)#整个程序退出时候字段调用
 

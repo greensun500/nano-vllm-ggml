@@ -18,6 +18,18 @@ class BenchResult:
     gen_len: int
     use_prefix_cache: bool
     repeat: int
+    warmup: int
+    threads: int
+    device_index: int
+    num_kvcache_blocks: int
+    enable_mtp: bool
+    mtp_max_draft_tokens: int
+    mtp_drafted_tokens: int
+    mtp_accepted_tokens: int
+    mtp_verification_steps: int
+    mtp_acceptance_rate: float
+    ggml_commit: str
+    vulkan_compiled: bool
     load_s: float
     load_rss_mib: float
     total_s: float
@@ -33,24 +45,39 @@ class BenchResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="nano-vLLM benchmark CLI for CUDA and llama.cpp CPU/Vulkan backends.",
+        description="nano-vLLM benchmark CLI for CUDA, staged llama.cpp, and native CPU/Vulkan backends.",
     )
     parser.add_argument(
         "model",
         nargs="?",
-        default=os.environ.get("NANOVLLM_GGUF_MODEL") or os.environ.get("NANOVLLM_MODEL"),
-        help="HF model path for CUDA, or GGUF model path for llama.cpp backends.",
+        default=None,
+        help="HF model path for CUDA, or GGUF model path for staged/native CPU/Vulkan backends.",
     )
     parser.add_argument(
         "--backend",
-        default=os.environ.get("NANOVLLM_BACKEND", "llamacpp_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan"),
+        default=os.environ.get("NANOVLLM_BACKEND", "native_cpu"),
+        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "native_cpu", "native_vulkan"),
         help="Execution backend.",
     )
     parser.add_argument("--gguf-model", default=os.environ.get("NANOVLLM_GGUF_MODEL"))
-    parser.add_argument("--library-path", default=os.environ.get("NANOVLLM_LLAMA_BACKEND_LIB"))
+    parser.add_argument(
+        "--tokenizer",
+        default=os.environ.get("NANOVLLM_TOKENIZER"),
+        help="Local Hugging Face tokenizer directory required by native CPU/Vulkan backends.",
+    )
+    parser.add_argument(
+        "--library-path",
+        default=os.environ.get("NANOVLLM_LLAMA_BACKEND_LIB"),
+        help="External backend library path for legacy llamacpp_* backends only.",
+    )
     parser.add_argument("--max-model-len", type=int, default=int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "2048")))
     parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "1")))
+    parser.add_argument(
+        "--num-kvcache-blocks",
+        type=int,
+        default=int(os.environ.get("NANOVLLM_NUM_KVCACHE_BLOCKS", "-1")),
+        help="Total physical KV blocks. -1 derives the minimum from max-model-len.",
+    )
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -63,6 +90,7 @@ def parse_args() -> argparse.Namespace:
         help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
     )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
+    parser.add_argument("--device-index", type=int, default=int(os.environ.get("NANOVLLM_DEVICE_INDEX", "0")))
     parser.add_argument("--threads-batch", type=int, default=int(os.environ.get("NANOVLLM_THREADS_BATCH", "8")))
     parser.add_argument("--gpu-layers", type=int, default=int(os.environ.get("NANOVLLM_GPU_LAYERS", "-1")))
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("NANOVLLM_BENCH_BATCH", "1")))
@@ -71,6 +99,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=int(os.environ.get("NANOVLLM_BENCH_REPEAT", "3")))
     parser.add_argument("--warmup", type=int, default=int(os.environ.get("NANOVLLM_BENCH_WARMUP", "1")))
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_ENABLE_MTP", "0") == "1",
+        help="Enable built-in Qwen3.5 MTP greedy speculative decoding.",
+    )
+    parser.add_argument(
+        "--mtp-max-draft-tokens",
+        type=int,
+        default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "3")),
+    )
     parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
@@ -89,8 +128,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_llm(args: argparse.Namespace) -> LLM:
-    model = args.model
+    model = args.model or (
+        os.environ.get("NANOVLLM_MODEL")
+        if args.backend == "cuda"
+        else args.gguf_model
+    )
     gguf_model = args.gguf_model or model
+    if args.backend.startswith("native"):
+        if not gguf_model:
+            raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
+        if not args.tokenizer:
+            raise SystemExit("Native backends require --tokenizer or NANOVLLM_TOKENIZER pointing to the HF tokenizer directory.")
+        return LLM(
+            gguf_model,
+            backend=args.backend,
+            model_format="gguf",
+            gguf_model=gguf_model,
+            tokenizer=args.tokenizer,
+            tokenizer_backend="hf",
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            num_kvcache_blocks=args.num_kvcache_blocks,
+            enable_mtp=args.enable_mtp,
+            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+            device_config={
+                "n_threads": args.threads,
+                "device_index": args.device_index,
+            },
+        )
     if args.backend.startswith("llamacpp"):
         if not gguf_model:
             raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
@@ -103,12 +169,15 @@ def build_llm(args: argparse.Namespace) -> LLM:
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            num_kvcache_blocks=args.num_kvcache_blocks,
+            enable_mtp=args.enable_mtp,
+            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             device_config={
                 "library_path": args.library_path,
                 "n_ubatch": args.ubatch_size or None,
                 "n_threads": args.threads,
                 "n_threads_batch": args.threads_batch,
-                "n_gpu_layers": args.gpu_layers,
+                "n_gpu_layers": 0 if args.backend == "llamacpp_cpu" else args.gpu_layers,
             },
         )
 
@@ -152,7 +221,7 @@ def make_prompt_token_ids(llm: LLM, seed_text: str, prompt_len: int) -> list[int
 def get_vocab_size(llm: LLM) -> int:
     if llm.config.tokenizer_backend == "llamacpp":
         return int(llm.model_runner.vocab_size)
-    return int(llm.config.hf_config.vocab_size)
+    return len(llm.tokenizer)
 
 
 def make_batch_prompts(
@@ -197,13 +266,20 @@ def run_generation_once(
         llm.flush_backend_releases()
         elapsed = perf_counter() - t0
 
-        generated_tokens += sum(seq.num_completion_tokens - before for seq, before in zip(seqs, completion_counts))
+        retained_tokens = sum(
+            seq.num_completion_tokens - before
+            for seq, before in zip(seqs, completion_counts)
+        )
+        generated_tokens += retained_tokens
         if is_prefill:
             prefill_s += elapsed
             prefill_tokens += scheduled_tokens
         else:
             decode_s += elapsed
-            decode_tokens += sum(len(token_ids) for token_ids in result.token_ids)
+            # MTP may return more verified tokens than the request can still
+            # retain. Count only the completion delta accepted by Scheduler so
+            # the reported decode throughput is not inflated by that overrun.
+            decode_tokens += retained_tokens
 
     return {
         "total_s": perf_counter() - total_start,
@@ -216,10 +292,27 @@ def run_generation_once(
 
 
 def benchmark(args: argparse.Namespace) -> BenchResult:
-    if args.batch_size <= 0 or args.gen_len <= 0 or args.repeat <= 0 or args.warmup < 0:
-        raise SystemExit("--batch-size, --gen-len and --repeat must be positive; --warmup must be non-negative.")
+    if (
+        args.batch_size <= 0
+        or args.prompt_len <= 0
+        or args.gen_len <= 0
+        or args.repeat <= 0
+        or args.warmup < 0
+    ):
+        raise SystemExit(
+            "--batch-size, --prompt-len, --gen-len and --repeat must be positive; "
+            "--warmup must be non-negative."
+        )
     if args.batch_size > args.max_num_seqs:
         raise SystemExit("--batch-size must be <= --max-num-seqs.")
+    if args.prompt_len + args.gen_len > args.max_model_len:
+        raise SystemExit("--prompt-len + --gen-len must be <= --max-model-len.")
+    if args.backend != "cuda" and args.temperature != 0:
+        raise SystemExit("CPU/Vulkan GGUF backends currently require --temperature 0.")
+    if args.backend != "cuda" and args.use_prefix_cache:
+        raise SystemExit("--use-prefix-cache is currently supported only by the CUDA backend.")
+    if args.backend == "cuda" and args.enable_mtp:
+        raise SystemExit("--enable-mtp is supported only by CPU/Vulkan GGUF backends.")
 
     load_start = perf_counter()
     llm = build_llm(args)
@@ -233,12 +326,35 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         for _ in range(args.batch_size)
     ]
 
+    mtp_baseline = {
+        "drafted_tokens": 0,
+        "accepted_tokens": 0,
+        "verification_steps": 0,
+    }
+    mtp_stats = {
+        "drafted_tokens": 0,
+        "accepted_tokens": 0,
+        "verification_steps": 0,
+    }
+    actual_num_kvcache_blocks = int(llm.config.num_kvcache_blocks)
+    actual_model = os.fspath(llm.config.gguf_model or llm.config.model)
+    ggml_commit = ""
+    vulkan_compiled = False
+    if args.backend.startswith("native"):
+        from nanovllm.backends.native import build_info
+
+        native_info = build_info()
+        ggml_commit = str(native_info["ggml_commit"])
+        vulkan_compiled = bool(native_info["vulkan"])
+    get_mtp_stats = getattr(llm.model_runner, "mtp_stats", None)
     try:
         run_index = 0
         for _ in range(args.warmup):
             prompts = make_batch_prompts(prompt_ids, args.batch_size, vocab_size, run_index, args.use_prefix_cache)
             run_generation_once(llm, prompts, sampling_params)
             run_index += 1
+        if callable(get_mtp_stats):
+            mtp_baseline.update(get_mtp_stats())
 
         totals = {
             "total_s": 0.0,
@@ -255,19 +371,38 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
             for key in totals:
                 totals[key] += result[key]
     finally:
+        if callable(get_mtp_stats):
+            mtp_stats.update(get_mtp_stats())
         llm.exit()
 
     prefill_tok_s = totals["prefill_tokens"] / totals["prefill_s"] if totals["prefill_s"] > 0 else 0.0
     decode_tok_s = totals["decode_tokens"] / totals["decode_s"] if totals["decode_s"] > 0 else 0.0
     generated_tok_s = totals["generated_tokens"] / totals["total_s"] if totals["total_s"] > 0 else 0.0
+    drafted_tokens = int(mtp_stats["drafted_tokens"] - mtp_baseline["drafted_tokens"])
+    accepted_tokens = int(mtp_stats["accepted_tokens"] - mtp_baseline["accepted_tokens"])
+    acceptance_rate = accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
     return BenchResult(
         backend=args.backend,
-        model=args.gguf_model or args.model or "",
+        model=actual_model,
         batch_size=args.batch_size,
         prompt_len=len(prompt_ids),
         gen_len=args.gen_len,
         use_prefix_cache=args.use_prefix_cache,
         repeat=args.repeat,
+        warmup=args.warmup,
+        threads=args.threads,
+        device_index=args.device_index,
+        num_kvcache_blocks=actual_num_kvcache_blocks,
+        enable_mtp=args.enable_mtp,
+        mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+        mtp_drafted_tokens=drafted_tokens,
+        mtp_accepted_tokens=accepted_tokens,
+        mtp_verification_steps=int(
+            mtp_stats["verification_steps"] - mtp_baseline["verification_steps"]
+        ),
+        mtp_acceptance_rate=acceptance_rate,
+        ggml_commit=ggml_commit,
+        vulkan_compiled=vulkan_compiled,
         load_s=load_s,
         load_rss_mib=load_rss_mib,
         total_s=totals["total_s"],
@@ -291,6 +426,14 @@ def print_result(result: BenchResult) -> None:
     print(f"gen tokens/seq:     {result.gen_len}")
     print(f"prefix cache:       {result.use_prefix_cache}")
     print(f"repeat:             {result.repeat}")
+    print(f"warmup:             {result.warmup}")
+    print(f"threads:            {result.threads}")
+    print(f"device index:       {result.device_index}")
+    print(f"KV blocks:          {result.num_kvcache_blocks}")
+    print(f"MTP:                {result.enable_mtp} (K={result.mtp_max_draft_tokens})")
+    if result.ggml_commit:
+        print(f"GGML commit:        {result.ggml_commit}")
+        print(f"Vulkan compiled:    {result.vulkan_compiled}")
     print(f"load time:          {result.load_s:.3f} s")
     if result.load_rss_mib > 0:
         print(f"load RSS:           {result.load_rss_mib:.2f} MiB")
@@ -299,6 +442,12 @@ def print_result(result: BenchResult) -> None:
     print(f"prefill             {result.prefill_tokens:>8}  {result.prefill_s:>10.3f}  {result.prefill_tok_s:>9.2f}")
     print(f"decode steps        {result.decode_tokens:>8}  {result.decode_s:>10.3f}  {result.decode_tok_s:>9.2f}")
     print(f"generated total     {result.generated_tokens:>8}  {result.total_s:>10.3f}  {result.generated_tok_s:>9.2f}")
+    if result.enable_mtp:
+        print(
+            "MTP drafted/accepted/verifications: "
+            f"{result.mtp_drafted_tokens}/{result.mtp_accepted_tokens}/"
+            f"{result.mtp_verification_steps}; acceptance={result.mtp_acceptance_rate:.2%}"
+        )
 
 
 def main() -> int:

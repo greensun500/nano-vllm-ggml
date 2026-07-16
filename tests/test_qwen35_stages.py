@@ -48,6 +48,7 @@ class Qwen35Tests(unittest.TestCase):
             enable_preemption=False,
             enable_mtp=False,
             mtp_max_draft_tokens=3,
+            max_model_len=256,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1], SamplingParams(max_tokens=4))
@@ -99,6 +100,7 @@ class Qwen35Tests(unittest.TestCase):
             enable_preemption=False,
             enable_mtp=False,
             mtp_max_draft_tokens=3,
+            max_model_len=512,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1] * 256, SamplingParams(max_tokens=2))
@@ -119,6 +121,7 @@ class Qwen35Tests(unittest.TestCase):
             enable_preemption=False,
             enable_mtp=True,
             mtp_max_draft_tokens=3,
+            max_model_len=512,
         )
         scheduler = Scheduler(config)
         sequence = Sequence([1] * 253, SamplingParams(max_tokens=8))
