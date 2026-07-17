@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.3
+# nano-vLLM 当前执行流程：v3.4
 
 ## 1. 架构边界
 
@@ -6,7 +6,7 @@ nano-vLLM Python 层负责 request、scheduler、sequence、block table、slot m
 
 in-tree C++ runtime 负责 GGUF 加载、Qwen3.5 target/MTP GGML graph、CPU/Vulkan backend、6 层 attention PagedKV、18 层 GDN recurrent state 及 K+1 snapshot planes。
 
-项目只编译官方 llama.cpp 的 GGML 子目录；不链接 `libllama`、不创建 `llama_context`、不使用 CUDA。llama.cpp 提供 GGML tensor、graph、CPU/Vulkan backend 和底层算子，调度与缓存所有权仍属于 nano-vLLM。
+项目只编译 llama.cpp 的 GGML 子目录；上游基线为官方 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，其上带有 nano-vLLM 的 Mali shape-policy 子模块提交 `5ed3338`。项目不链接 `libllama`、不创建 `llama_context`、不使用 CUDA。llama.cpp 提供 GGML tensor、graph、CPU/Vulkan backend 和底层算子，调度与缓存所有权仍属于 nano-vLLM。
 
 ## 2. 构建阶段
 
@@ -202,7 +202,7 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 ## 11. 当前 backend 策略边界
 
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
-- 当前官方 Vulkan 默认把 Mali Q4_0 的 T=1 和 T=2～4 都路由到 MMVQ。实测表明 T=1 应走 DMMV，T=2～4 应保留 MMVQ；v3.3 尚未自动混合，下一版修正。
+- v3.4 默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
 - CPU 权重当前仍在 default buffer，尚未进入 CPU_REPACK。
 - MTP 的串行 draft、tied Q6_K head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。
 
