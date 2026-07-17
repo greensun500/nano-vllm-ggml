@@ -37,6 +37,7 @@ struct TargetPersistentView {
 };
 
 enum class TargetChunkOutputMode {
+    None,
     Last,
     All,
 };
@@ -94,7 +95,8 @@ struct TargetChunkGraph {
 
     // Hidden remains readable only when retain_hidden=true was requested.
     ggml_tensor * hidden = nullptr;        // F32 [2048, T]
-    ggml_tensor * greedy_tokens = nullptr; // I32 [1] for Last, I32 [T] for All
+    // Null for None, I32 [1] for Last, or I32 [T] for All.
+    ggml_tensor * greedy_tokens = nullptr;
 
     std::vector<ggml_tensor *> critical_compute_nodes;
 };

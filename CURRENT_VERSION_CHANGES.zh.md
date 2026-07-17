@@ -1,146 +1,114 @@
-# nano-vLLM 当前版本修改说明：v3.2 TargetChunkGraph
+# nano-vLLM 当前版本修改说明：v3.3 Arm/Mali 执行路径调优
 
 ## 1. 版本定位
 
 本文件只描述当前代码版本。旧版本说明不在工作树中累积，历史由 Git 提交保存。
 
-- 基线提交：`fb5a028`（v3.1 MTP KV-only quick path）
-- 当前迭代：v3.2
+- 基线提交：`65f8b79`（v3.2 TargetChunkGraph）
+- 当前迭代：v3.3
 - GGML：官方 llama.cpp `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`
 - 模型：Qwen3.5-2B-Q4_0.gguf，内置单层 MTP
 - 后端：CPU、Vulkan；不使用 CUDA、`libllama` 或 `llama_context`
 - 采样：greedy only
 
-## 2. 本轮目标与结论
+v3.3 修正 AArch64 构建未启用 dotprod/i8mm 的问题，并针对 Mali-G720 将长 target prefill 自动切成 64-token 图。CPU 的三项正式指标均比 v3.0 MTP-off 基线高 30% 以上；Vulkan prefill 和组合吞吐大幅提高，但默认的单 token MMVQ 路由仍使普通 decode 回退，已通过独立 A/B 定位，留给下一迭代按 shape 修正。
 
-v3.2 将单序列的多个 target token 合并到一张 GGML graph，覆盖普通 prompt prefill 和 MTP verification。目标是减少重复 graph 调度，并让同一权重的多个 token projection 共享一次矩阵计算。
+## 2. 本轮修改
 
-结果分成两部分：
+### 2.1 Arm dotprod+i8mm 自动探测
 
-1. 结构改造与正确性验证完成。CPU/Vulkan 的 greedy token、MTP full/partial/reject、rollback 后下一轮状态均通过真实模型 oracle。
-2. 性能目标未完成。CPU prefill 提升 50.3%，组合项提升 33.8%；但 CPU/Vulkan MTP decode 分别比 v3.0 MTP-off 基线慢 24.2% 和 33.9%。
+`scripts/build_native_runtime.sh` 不再假设异构 Arm 上的 `-mcpu=native` 一定包含所有 GGML 需要的 ISA：
 
-本轮揭示了一个重要事实：正确的批处理结构不等于当前硬件上一定更快。远程 ARM CPU 的原构建没有启用 dotprod/i8mm，也没有把 Q4/Q6 权重放入 CPU_REPACK；Mali-G720 对 `T<=8` 选择 DMMV 小批量 kernel。固定 `T=4` 还会在首次 mismatch 后继续计算，而 v3.1 平均只执行约 3.25～3.33 个 target 行。
+1. 仅在主机为 `aarch64/arm64`，且调用方没有显式传入 `GGML_NATIVE` 或 `GGML_CPU_ARM_ARCH` 时进入自动探测。
+2. `/proc/cpuinfo` 的每个 `Features` 行都必须含有 `asimddp` 和 `i8mm`，避免只在部分 CPU 核支持时生成不可安全调度的指令。
+3. 当前 C 编译器必须通过 `-march=armv8.6-a+dotprod+i8mm` 编译探针。
+4. 成功后注入 `GGML_NATIVE=OFF` 和 `GGML_CPU_ARM_ARCH=armv8.6-a+dotprod+i8mm`。
+5. `NANOVLLM_NATIVE_ARM_ARCH=off` 可关闭自动选择；其他值可显式指定架构；命令行 CMake 参数始终优先。
 
-因此 v3.2 是已验证但未达 30% 门槛的中间迭代，下一轮继续优化。
-
-## 3. 代码修改
-
-### 3.1 单序列多 token TargetChunkGraph
-
-新增 `TargetChunkGraph`，输入为：
+远程构建已出现预期日志：
 
 ```text
-tokens        I32 [T]
-positions     I32 [4*T]
-write_slots   I32 [T]
-read_slots    I32 [C]
-causal_mask   F32 [C,T]（T=1 时省略）
+nano-vLLM: enabling Arm dotprod+i8mm kernels (armv8.6-a+dotprod+i8mm)
 ```
 
-一次 graph 中执行完整 24 层 target trunk，并把输出模式分为：
+all-CPU 检查中的 awk 循环变量使用 `field`，兼容远端 mawk，避免将内建函数名 `index` 当成变量而产生语法错误。
 
-- `Last`：只对最后一列 hidden 执行 tied vocab head，供普通 prefill/decode 使用；
-- `All`：对全部 T 列执行 vocab head，供 MTP greedy verification 使用。
+### 2.2 Vulkan shader compiler 显式入口
 
-`Last` 避免在长 prompt 上物化约 `vocab_size × T` 的 logits。
-
-### 3.2 多 token causal attention
-
-6 个 full-attention 层一次投影 T 个 token 的 Q/K/V，批量写入 PagedKV，然后按 block table 展开的物理 slot gather 完整上下文。
-
-mask 语义为：第 i 个 query 只能看到历史 KV 和当前 chunk 的 `0..i` 行。它同时满足：
-
-- prompt chunk causal prefill；
-- MTP verification 的 `[x_p,d1,...,dK]`；
-- 非连续物理 KV slot 下的逻辑时序。
-
-### 3.3 多 token Gated Delta Net
-
-18 个 recurrent 层改为在一张图内按 token 递推：
-
-- convolution 输入由旧的 3 行状态与本 chunk 的 T 行 QKV 拼接；
-- delta state 在 graph 内逐 token 更新；
-- 普通 prefill 只提交最新 canonical state；
-- verification 按 newest-first 写入 K+1 个 snapshot plane。
-
-verification 输入 index 与 snapshot plane 的关系为：
+新增 `NANOVLLM_VULKAN_GLSLC`：设置后会校验文件可执行，并向 CMake 传递 `Vulkan_GLSLC_EXECUTABLE`。远程使用新版 glslc 后启动信息为：
 
 ```text
-index 0 -> plane K
-index 1 -> plane K-1
-...
-index K -> plane 0
+Mali-G720-Immortalis | int dot: 1 | matrix cores: KHR_coopmat
 ```
 
-接受 a 个 draft 后选择 `plane K-a`，无需重算 target trunk。
+该信息证明设备能力和 shader 构建路径可用，不代表所有矩阵 shape 已自动选择最优 kernel。
 
-### 3.4 普通 prefill
+### 2.3 `TargetChunkOutputMode::None`
 
-`run()` 不再逐 token 建 target graph，而是每个 scheduler sequence chunk 执行一次 `TargetChunkGraph(Last)`：
+TargetChunkGraph 现在有三种输出模式：
 
 ```text
-T 个 token
-  -> 一次 24-layer target chunk
-  -> 批量写 target PagedKV
-  -> 提交最新 recurrent state
-  -> 仅最后一列 vocab head/argmax
+None -> 0 个 prediction；按 retain_hidden 决定是否保留 normalized hidden
+Last -> 只对最后一列执行 tied vocab head/argmax
+All  -> 对全部 T 列执行 tied vocab head/argmax
 ```
 
-CPU pp512 因此从约 512 张 target graph 降为 1 张，并获得本轮最明显的收益。
+- `None + retain_hidden=false` 只执行 target trunk 及其 KV/recurrent side effects，省去 output norm、约 248K 行 tied vocab head、argmax 和 token readback。
+- `None + retain_hidden=true` 仍产生 MTP maintenance 所需的 normalized hidden，但跳过 vocab head、argmax 和 token readback。
+- runtime 按 `None/Last/All` 推导 0/1/T 个 prediction，仅在输出存在时读取 `greedy_tokens`。
 
-### 3.5 MTP prefill hidden 右移
+### 2.4 Mali-G720 的 64-token target prefill
 
-开启 MTP 时，target chunk 返回全部 target hidden。MTP maintenance 输入保持严格右移：
+在当前模型和 Mali-G720 上，T=64 的 target projection 比单张 T=512 图更快。因此 native runtime 在不改变 Python scheduler admission 的前提下，将一个长 sequence chunk 内部分片：
 
 ```text
-mtp_hidden[0] = 进入 chunk 前的 pending_hidden
-mtp_hidden[i] = target_hidden[i-1]
+Python scheduler 提交 T-token plan
+  -> CPU / 非 Mali Vulkan：一张 TargetChunkGraph(T, Last)
+  -> Mali Vulkan：按 64 token 循环
+       非最终片：TargetChunkGraph(None)
+       最终片：TargetChunkGraph(Last)
+       每片重新展开 context read slots
+       每片提交最新 recurrent state
+       整段只返回最后一片的 greedy token
 ```
 
-随后一次执行 batched MTP KV-only graph，chunk 最后一行 target hidden 成为下一轮 `pending_hidden`。
-
-### 3.6 一图 verification
-
-K 个 draft 仍串行产生，target verification 从最多 K+1 张 token graph 改为一张：
+MTP 开启时，每片仍读取 target hidden、执行 batched MTP KV-only maintenance，并保持跨片右移关系：
 
 ```text
-verification_inputs = [x_p, d1, ..., dK]
-TargetChunkGraph(T=K+1, output=All, snapshots=K+1)
-  -> K+1 个 target predictions
-  -> K+1 个 target hidden
-  -> K+1 组 recurrent snapshots
+mtp_hidden[0] = 进入当前片前的 pending_hidden
+mtp_hidden[i] = 当前片 target_hidden[i-1]
+pending_hidden = 当前片最后一个 target hidden
 ```
 
-host 端比较 draft 与 target prediction，得到 accepted 数 a，选择 `plane K-a`，回滚未提交的尾部，并继续使用 v3.1 的 batched MTP KV catch-up。
+因此分片没有改变 block table、slot mapping、PagedKV 所有权或 MTP pending-hidden 语义。
 
-### 3.7 兼容性
+## 3. 正确性验证
 
-旧的单 token graph API 保留，新增 chunk graph 没有改变 Python scheduler 的 plan ABI、block table 所有权或 request 生命周期。
+本地：
 
-## 4. 正确性验证
-
-本地验证：
-
-- native CPU extension 构建通过；
-- C++ `graph_executor_placement` 通过；
+- `bash -n scripts/build_native_runtime.sh` 与 `git diff --check` 通过；
 - 34 项 Python 测试通过，5 项按环境跳过；
-- 4 项真实 Qwen3.5 CPU oracle 全部通过。
+- C++ `graph_executor_placement` 通过；
+- 4 项真实 Qwen3.5-2B CPU oracle 全部通过，覆盖 target trace、MTP 全接受/部分接受/立即拒绝、rollback 后下一轮、near-boundary 和完整 scheduler 路径。
 
-远程验证：
+远程：
 
-- CPU+Vulkan extension 构建通过；
-- C++ 与 Python 测试通过；
-- 4 项 CPU 真实模型 oracle 通过；
-- Vulkan 专项 oracle 通过 fixed trace、full accept、partial accept、immediate reject、下一轮状态和 near-boundary 场景。
+- CPU+Vulkan extension 使用 Arm dotprod+i8mm 和指定 glslc 构建成功；
+- build info 对应官方 GGML 完整 hash；
+- 34 项 Python 测试通过，5 项跳过，4 项 CPU 真实模型 oracle 通过；
+- Vulkan fixed trace 与 MTP K=3 full/partial/reject、rollback 后下一轮、near-boundary oracle 通过；
+- 512-token 长提示分别在 MTP-off/on 下比较 scheduler 直接 64-token chunk 与 runtime 内部 64-token 分片，8 个输出 token 逐 token 一致。
 
-这些测试确认 v3.2 的下降来自执行成本与 kernel 选择，而不是 token 或状态语义错误。
+长分片等价结果：
 
-## 5. 基准口径
+```text
+MTP=False: [15, 15, 15, 15, 15, 15, 15, 15]
+MTP=True:  [9419, 1814, 9419, 1814, 9419, 1814, 9419, 1814]
+```
 
-远程：12 核 Cortex-A720/A520、Mali-G720-Immortalis。
+## 4. 正式基准口径
 
-公共参数：
+远程硬件为 12 核 Cortex-A720/A520 和 Mali-G720-Immortalis。公共参数：
 
 ```text
 max_model_len=768
@@ -152,7 +120,6 @@ device_index=0
 temperature=0
 warmup=1
 repeat=3
-MTP K=3
 ```
 
 测试映射：
@@ -163,55 +130,84 @@ tg128       = prompt_len 1, gen_len 129，读取 decode_tok_s
 pp521+tg128 = prompt_len 521, gen_len 129，读取 processed_tok_s
 ```
 
-## 6. 远程实测
+所有“相对基线”均相对同机 v3.0 MTP-off。MTP 的纯净收益另外用同版本 on/off 表示，二者不能混用。
 
-变化均相对同机 v3.0 MTP-off 基线。30% 目标分别为：
-
-- CPU：pp 24.270、tg 20.060、组合 22.932 tok/s；
-- Vulkan：pp 41.337、tg 27.480、组合 37.317 tok/s。
-
-### CPU
+## 5. CPU 正式结果
 
 | 版本/模式 | pp512 tok/s | 相对基线 | tg128 tok/s | 相对基线 | pp521+tg128 tok/s | 相对基线 |
 |---|---:|---:|---:|---:|---:|---:|
 | v3.0 MTP-off | 18.669 | - | 15.431 | - | 17.640 | - |
-| v3.2 MTP-off | 28.065 | +50.32% | 15.380 | -0.33% | 23.599 | +33.78% |
-| v3.2 MTP-on | 27.858 | +49.22% | 11.701 | -24.17% | 22.753 | +28.98% |
+| v3.3 MTP-off | 68.737 | +268.18% | 20.141 | +30.52% | 36.042 | +104.32% |
+| v3.3 MTP-on, K=3 | 68.197 | +265.29% | 21.038 | +36.34% | 39.053 | +121.39% |
 
-### Vulkan
+同版本 MTP-on 相对 MTP-off：pp512 -0.79%，tg128 +4.46%，组合 +8.35%。CPU 的主要增益来自 v3.2 multi-token graph 与本轮 Arm ISA 修正的叠加，不能全部归因于 MTP。
+
+## 6. Vulkan 正式结果
+
+### 6.1 当前默认行为
 
 | 版本/模式 | pp512 tok/s | 相对基线 | tg128 tok/s | 相对基线 | pp521+tg128 tok/s | 相对基线 |
 |---|---:|---:|---:|---:|---:|---:|
 | v3.0 MTP-off | 31.797 | - | 21.139 | - | 28.706 | - |
-| v3.2 MTP-off | 36.199 | +13.84% | 21.266 | +0.60% | 28.591 | -0.40% |
-| v3.2 MTP-on | 35.821 | +12.65% | 13.978 | -33.88% | 25.998 | -9.43% |
+| v3.3 MTP-off | 72.227 | +127.15% | 17.994 | -14.88% | 40.144 | +39.85% |
+| v3.3 MTP-on, K=3 | 69.224 | +117.70% | 17.887 | -15.38% | 42.384 | +47.65% |
+| v3.3 MTP-on, K=2 | - | - | 19.187 | -9.23% | 41.566 | +44.80% |
 
-K sweep 进一步确认批宽与 kernel 的相关性：K=1（target T=2）在 Vulkan 上优于 K=3（T=4），但仍未达到 tg128 的 30% 目标。
+同版本比较：K=3 相对默认 off 的 tg128 -0.59%、组合 +5.58%；K=2 的 tg128 +6.63%、组合 +3.54%。K=3 在短 prompt repeat=3 中的接受率为 75%，K=2 为 81.42%；两者在组合项的长 prompt 中均为 100%。接受率差异是吞吐的重要变量。
 
-## 7. 本轮反思
+### 6.2 MTP-off 的 DMMV 诊断配置
 
-### 7.1 已经成立的优化
+设置 `GGML_VK_DISABLE_MMVQ=1` 后：
 
-- 长 prompt target batching 成立，CPU prefill/组合项显著提升；
-- causal attention、multi-token GDN 与 snapshot rollback 语义成立；
-- `Last` 模式成功避免长 prompt 的全量 logits；
-- target verification 图数从 K+1 降到 1。
+| 模式 | pp512 tok/s | tg128 tok/s | pp521+tg128 tok/s |
+|---|---:|---:|---:|
+| 默认 MTP-off | 72.227 | 17.994 | 40.144 |
+| 全局 DMMV MTP-off | 72.262 | 21.287 | 42.991 |
+| 变化 | +0.05% | +18.30% | +7.09% |
 
-### 7.2 为什么 MTP decode 变慢
+该环境变量不能作为最终默认：它虽然恢复 T=1 普通 decode，却同时使 MTP K=2 从 quick probe 的 21.533 降到 17.411 tok/s。下一版应只让 Mali/intdot/Q4_0 的 T=1 走 DMMV，T=2～4 继续走 MMVQ。
 
-1. v3.1 可在 mismatch 后 early-stop，平均只执行约 3.25～3.33 个 target 行；v3.2 固定执行 4 行，多算约 20%～23%。
-2. 原远程 ARM 构建的 `-mcpu=native` 没有启用 dotprod/i8mm；Q4_0/Q6_K 的 T=4 无法形成期望的多行高效矩阵内核。
-3. nano loader 只使用默认 CPU buffer，`GGML_CPU_REPACK=ON` 并不代表模型权重实际进入 CPU_REPACK。
-4. Vulkan 对 `T<=8` 固定选择 DMMV；Mali 无 int-dot 和 matrix-core，T=4 没有获得预期的权重复用。
-5. 18 层 GDN 为 K+1 个候选状态分别执行 snapshot CPY。
-6. K 个 MTP draft 仍是 K 张串行图，并且每张都扫描约 398 MiB tied Q6_K vocab head。
+## 7. Vulkan A/B 诊断
 
-### 7.3 下一轮优先级
+以下为 warmup=1、repeat=1，目的是定位 kernel/submit，不与正式表混算。
 
-1. 修正 AArch64 构建自动探测，明确启用 dotprod+i8mm，并用运行时 feature query/反汇编验证。
-2. CPU 按 tensor 使用 CPU_REPACK；保留 embedding 原布局，单独复制 tied output head 到 repack buffer。
-3. Vulkan 实测 prompt chunk 和 verification T=2/3/4 的最优形状，不假设 CPU 最优形状适用于 Mali。
-4. 引入 backend-aware K/shape 策略；必要时保留 early-stop 小图路径。
-5. 将连续 draft 与 target verification 尽可能合并为单图，减少 graph build、同步和 host readback。
-6. 避免物化所有 snapshot 副本，改为按 accepted index 提交或缩小复制范围。
-7. 增加 graph-build、backend compute、readback、head、trunk、catch-up 分段计时，按实测继续迭代。
+### 7.1 MMVQ 路由
+
+| 路由 | MTP-off tg128 | MTP K=2 tg128 | K=2 acceptance |
+|---|---:|---:|---:|
+| 默认 | 18.091 | 21.533 | 97.73% |
+| 强制 MMVQ | 14.666 | 15.947 | 97.73% |
+| 禁用 MMVQ | 21.285 | 17.411 | 97.73% |
+
+结论：T=1 的 Q8_1 激活量化/额外 dispatch 无法摊薄，DMMV 更优；T=2～4 的 integer-dot MMVQ 更优，需要 shape-aware 混合路由。
+
+### 7.2 `GGML_VK_MAX_NODES_PER_SUBMIT`
+
+| max nodes | MTP-off tg128 | MTP K=2 tg128 |
+|---:|---:|---:|
+| 20 | 17.861 | 21.328 |
+| 100 | 18.080 | 21.463 |
+| 512 | 18.073 | 21.479 |
+| 2048 | 18.154 | 21.424 |
+
+100～2048 基本处于噪声带，20 反而退化。节点硬上限不是主因；官方 Vulkan 当前用上一张 graph 的 `last_total_flops / 40` 决定下一张 graph 的提交粒度，交替的小 draft/大 target 图仍值得按当前 graph FLOPs 继续优化。
+
+## 8. 本轮反思
+
+已经成立：
+
+- Arm dotprod+i8mm 修正确实解除 CPU 量化 kernel 的主要限制；
+- Mali T=64 prefill 策略将 Vulkan pp512 提高到 72 tok/s 以上；
+- `None` 安全地消除了非最终 MTP-off 分片的 output norm/head/readback；
+- 跨分片的 target KV、GDN recurrent state 和 MTP pending-hidden 语义已被真实模型等价测试证明。
+
+尚未解决：
+
+1. Vulkan 默认 T=1 错选 MMVQ，使普通 decode 比 v3.0 低约 15%。
+2. K 必须同时考虑接受率、verification 宽度和 draft/target kernel，单次 K sweep 不能直接决定永久默认。
+3. 每轮仍有 K 张串行 draft graph；每张扫描约 398 MiB tied Q6_K vocab head。
+4. verification 仍读取 predictions 和全部 hidden，并在 host 计算 accepted；catch-up 是独立 graph。
+5. 18 层 GDN 仍物化 K+1 份 snapshot；graph metadata/context 每轮重建。
+6. CPU loader 尚未把 Q4 linear/tied output head 放入 CPU_REPACK。
+
+下一迭代按可独立归因的顺序推进：Mali Q4 shape-aware kernel 路由、当前图 submit 策略、packed readback 与 catch-up 融图、Q4 MMVQ 多列 shader、CPU_REPACK、持久化 DraftChain/Round graph、snapshot 选择性提交和 draft-only 低精度 head。

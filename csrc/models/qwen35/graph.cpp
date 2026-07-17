@@ -946,6 +946,13 @@ void finalize_chunk_outputs(
         ggml_set_output(result.hidden);
     }
 
+    if (output_mode == TargetChunkOutputMode::None) {
+        if (retain_hidden) {
+            ggml_build_forward_expand(result.graph, result.hidden);
+        }
+        return;
+    }
+
     ggml_tensor * head_input = hidden;
     if (output_mode == TargetChunkOutputMode::Last && n_tokens > 1) {
         head_input = ggml_view_2d(
@@ -1062,7 +1069,8 @@ TargetChunkGraph build_target_chunk_graph(
         snapshot_count > 0 && snapshot_count <= n_tokens,
         "target chunk snapshot count must be in [1, n_tokens]");
     require(
-        output_mode == TargetChunkOutputMode::Last ||
+        output_mode == TargetChunkOutputMode::None ||
+            output_mode == TargetChunkOutputMode::Last ||
             output_mode == TargetChunkOutputMode::All,
         "target chunk output mode is invalid");
 
@@ -1132,20 +1140,25 @@ TargetChunkGraph build_target_chunk_graph(
         attention_index == persistent.attention.size(),
         "target chunk graph has an unused attention cache record");
 
-    current = ops::rms_norm(
-        ctx,
-        current,
-        weights.global().output_norm,
-        config.attention_layer_norm_rms_epsilon,
-        "qwen35.target_chunk.output_norm");
-    finalize_chunk_outputs(
-        ctx,
-        result,
-        current,
-        weights.global().output_head,
-        n_tokens,
-        output_mode,
-        retain_hidden);
+    // A non-final MTP-off prefill slice only needs its persistent KV/recurrent
+    // side effects.  Its final hidden, output norm and 248K-row vocabulary head
+    // have no consumer.  MTP maintenance still requests the normalized hidden.
+    if (output_mode != TargetChunkOutputMode::None || retain_hidden) {
+        current = ops::rms_norm(
+            ctx,
+            current,
+            weights.global().output_norm,
+            config.attention_layer_norm_rms_epsilon,
+            "qwen35.target_chunk.output_norm");
+        finalize_chunk_outputs(
+            ctx,
+            result,
+            current,
+            weights.global().output_head,
+            n_tokens,
+            output_mode,
+            retain_hidden);
+    }
     return result;
 }
 

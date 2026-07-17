@@ -30,6 +30,10 @@ namespace {
 
 constexpr std::size_t kGraphMetadataBytes = 32U * 1024U * 1024U;
 constexpr std::size_t kGraphNodeCapacity = 4096;
+// Mali-G720 is substantially faster at the model's projection shapes with 64
+// prompt columns than with one 512-column graph.  Keep this backend policy in
+// the native runtime so callers do not have to distort scheduler admission.
+constexpr std::size_t kVulkanTargetPrefillChunk = 64;
 
 [[noreturn]] void fail(const std::string & detail) {
     throw std::runtime_error("native Qwen3.5 runtime: " + detail);
@@ -606,14 +610,23 @@ struct Qwen35Runtime::Impl {
         executor->compute(graph.graph);
 
         TargetChunkResult result;
-        const std::size_t prediction_count =
-            output_mode == qwen35::TargetChunkOutputMode::All ? tokens.size() : 1;
-        result.predictions.resize(prediction_count, -1);
-        ggml_backend_tensor_get(
-            graph.greedy_tokens,
-            result.predictions.data(),
-            0,
-            result.predictions.size() * sizeof(result.predictions.front()));
+        std::size_t prediction_count = 0;
+        if (output_mode == qwen35::TargetChunkOutputMode::All) {
+            prediction_count = tokens.size();
+        } else if (output_mode == qwen35::TargetChunkOutputMode::Last) {
+            prediction_count = 1;
+        }
+        if (prediction_count > 0) {
+            if (graph.greedy_tokens == nullptr) {
+                fail("target chunk omitted requested greedy output");
+            }
+            result.predictions.resize(prediction_count, -1);
+            ggml_backend_tensor_get(
+                graph.greedy_tokens,
+                result.predictions.data(),
+                0,
+                result.predictions.size() * sizeof(result.predictions.front()));
+        }
         if (retain_hidden) {
             result.hidden.resize(checked_product(
                 tokens.size(),
@@ -753,57 +766,88 @@ struct Qwen35Runtime::Impl {
                 plan.tokens, item.token_offset, item.token_count);
             const std::vector<std::int32_t> write_slots = slice(
                 plan.slot_mapping, item.token_offset, item.token_count);
-            const std::vector<std::int32_t> context = paged_kv->context_indices(
-                item.block_table, item.start_position + item.token_count);
-            const std::size_t input_plane = recurrent->active_snapshot_plane(
-                item.sequence_slot);
-            TargetChunkResult target = execute_target_chunk(
-                item.sequence_slot,
-                target_tokens,
-                item.start_position,
-                write_slots,
-                context,
-                input_plane,
-                1,
-                qwen35::TargetChunkOutputMode::Last,
-                options.enable_mtp);
-            recurrent->select_latest(item.sequence_slot);
-            if (target.predictions.size() != 1 || target.predictions.front() < 0) {
-                fail("target chunk did not produce one greedy token");
-            }
-
-            if (options.enable_mtp) {
-                const std::size_t embedding = model->config().embedding_length;
-                const std::size_t hidden_elements = checked_product(
-                    item.token_count, embedding, "MTP prefill hidden input");
-                if (target.hidden.size() != hidden_elements) {
-                    fail("target chunk returned the wrong hidden-output shape");
+            const BackendDeviceInfo & device = primary_backend->device_info();
+            const bool is_mali_vulkan =
+                primary_backend->kind() == BackendKind::Vulkan &&
+                (device.name.find("Mali") != std::string::npos ||
+                 device.description.find("Mali") != std::string::npos);
+            const std::size_t chunk_limit = is_mali_vulkan
+                ? kVulkanTargetPrefillChunk
+                : item.token_count;
+            std::int32_t final_prediction = -1;
+            for (std::size_t offset = 0; offset < item.token_count;) {
+                const std::size_t chunk_count = std::min(
+                    chunk_limit, item.token_count - offset);
+                const std::size_t chunk_position = item.start_position + offset;
+                const bool is_final = offset + chunk_count == item.token_count;
+                const std::vector<std::int32_t> chunk_tokens = slice(
+                    target_tokens, offset, chunk_count);
+                const std::vector<std::int32_t> chunk_write_slots = slice(
+                    write_slots, offset, chunk_count);
+                const std::vector<std::int32_t> context =
+                    paged_kv->context_indices(
+                        item.block_table, chunk_position + chunk_count);
+                const std::size_t input_plane =
+                    recurrent->active_snapshot_plane(item.sequence_slot);
+                TargetChunkResult target = execute_target_chunk(
+                    item.sequence_slot,
+                    chunk_tokens,
+                    chunk_position,
+                    chunk_write_slots,
+                    context,
+                    input_plane,
+                    1,
+                    is_final ? qwen35::TargetChunkOutputMode::Last
+                             : qwen35::TargetChunkOutputMode::None,
+                    options.enable_mtp);
+                recurrent->select_latest(item.sequence_slot);
+                if (is_final) {
+                    if (target.predictions.size() != 1 ||
+                        target.predictions.front() < 0) {
+                        fail("final target chunk did not produce one greedy token");
+                    }
+                    final_prediction = target.predictions.front();
+                } else if (!target.predictions.empty()) {
+                    fail("non-final target chunk unexpectedly produced a greedy token");
                 }
-                std::vector<std::size_t> mtp_positions(item.token_count);
-                std::iota(
-                    mtp_positions.begin(),
-                    mtp_positions.end(),
-                    item.start_position);
-                std::vector<float> mtp_hidden_inputs;
-                mtp_hidden_inputs.reserve(hidden_elements);
-                mtp_hidden_inputs.insert(
-                    mtp_hidden_inputs.end(),
-                    sequence.pending_hidden.begin(),
-                    sequence.pending_hidden.end());
-                if (item.token_count > 1) {
+
+                if (options.enable_mtp) {
+                    const std::size_t embedding = model->config().embedding_length;
+                    const std::size_t hidden_elements = checked_product(
+                        chunk_count, embedding, "MTP prefill hidden input");
+                    if (target.hidden.size() != hidden_elements) {
+                        fail("target chunk returned the wrong hidden-output shape");
+                    }
+                    std::vector<std::size_t> mtp_positions(chunk_count);
+                    std::iota(
+                        mtp_positions.begin(),
+                        mtp_positions.end(),
+                        chunk_position);
+                    std::vector<float> mtp_hidden_inputs;
+                    mtp_hidden_inputs.reserve(hidden_elements);
                     mtp_hidden_inputs.insert(
                         mtp_hidden_inputs.end(),
-                        target.hidden.begin(),
-                        target.hidden.end() - static_cast<std::ptrdiff_t>(embedding));
+                        sequence.pending_hidden.begin(),
+                        sequence.pending_hidden.end());
+                    if (chunk_count > 1) {
+                        mtp_hidden_inputs.insert(
+                            mtp_hidden_inputs.end(),
+                            target.hidden.begin(),
+                            target.hidden.end() - static_cast<std::ptrdiff_t>(embedding));
+                    }
+                    execute_mtp_kv_update(
+                        chunk_tokens,
+                        mtp_positions,
+                        chunk_write_slots,
+                        mtp_hidden_inputs);
+                    sequence.pending_hidden.assign(
+                        target.hidden.end() - static_cast<std::ptrdiff_t>(embedding),
+                        target.hidden.end());
                 }
-                execute_mtp_kv_update(
-                    target_tokens, mtp_positions, write_slots, mtp_hidden_inputs);
-                sequence.pending_hidden.assign(
-                    target.hidden.end() - static_cast<std::ptrdiff_t>(embedding),
-                    target.hidden.end());
+                offset += chunk_count;
             }
             sequence.next_position = item.start_position + item.token_count;
-            outputs.push_back(target.predictions.front());
+            outputs.push_back(final_prediction);
         }
         return outputs;
     }
