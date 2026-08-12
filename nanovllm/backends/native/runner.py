@@ -85,6 +85,8 @@ class NativeRunner:
             return "cpu"
         if backend.endswith("_vulkan"):
             return "vulkan"
+        if backend.endswith("_cuda"):
+            return "cuda"
         raise ValueError(f"the native Qwen3.5 runner cannot use backend {backend!r}")
 
     def call(self, method_name, *args):
@@ -219,6 +221,13 @@ class NativeRunner:
             "evictions": int(stats.get("evictions", 0)),
             "active_entries": int(stats.get("active_entries", 0)),
         }
+
+    def memory_stats(self) -> dict[str, int]:
+        runtime = self._require_live_runtime()
+        method = getattr(runtime, "memory_stats", None)
+        if not callable(method):
+            return {}
+        return {key: int(value) for key, value in method().items()}
 
     def _make_native_plan(self, plan: BackendExecutionPlan) -> dict[str, Any]:
         n_tokens = len(plan.input_ids)

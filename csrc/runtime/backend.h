@@ -12,11 +12,13 @@ namespace nanovllm::native {
 enum class BackendKind {
     Cpu,
     Vulkan,
+    Cuda,
 };
 
 const char * backend_kind_name(BackendKind kind) noexcept;
 BackendKind parse_backend_kind(std::string_view kind);
 bool vulkan_backend_compiled() noexcept;
+bool cuda_backend_compiled() noexcept;
 
 struct BackendConfig {
     BackendKind kind = BackendKind::Cpu;
@@ -25,6 +27,7 @@ struct BackendConfig {
 
     static BackendConfig cpu(int threads);
     static BackendConfig vulkan(std::size_t device_index = 0);
+    static BackendConfig cuda(std::size_t device_index = 0);
 };
 
 struct BackendDeviceInfo {
@@ -36,8 +39,8 @@ struct BackendDeviceInfo {
     std::size_t memory_total = 0;
 };
 
-// Returns the CPU device followed by the compiled and currently visible Vulkan
-// devices.  Device discovery never creates a llama_model or llama_context.
+// Returns the CPU device followed by compiled and currently visible accelerator
+// devices. Device discovery never creates a llama_model or llama_context.
 std::vector<BackendDeviceInfo> available_backend_devices();
 
 // Owns one GGML execution backend.  A moved-from Backend is valid only for
@@ -76,13 +79,14 @@ private:
 };
 
 // Owns the ordered backends that a future ggml_backend_sched will consume.
-// Vulkan execution is always [vulkan, cpu], because lower scheduler indices
-// have higher priority.  CPU-only execution is always [cpu].  This class does
+// Accelerator execution is always [accelerator, cpu], because lower scheduler
+// indices have higher priority. CPU-only execution is always [cpu]. This class does
 // not create a scheduler or own graph-allocation buffers.
 class BackendList {
 public:
     static BackendList cpu_only(int cpu_threads);
     static BackendList vulkan_with_cpu(int cpu_threads, std::size_t vulkan_device_index = 0);
+    static BackendList cuda_with_cpu(int cpu_threads, std::size_t cuda_device_index = 0);
 
     BackendList(const BackendList &) = delete;
     BackendList & operator=(const BackendList &) = delete;

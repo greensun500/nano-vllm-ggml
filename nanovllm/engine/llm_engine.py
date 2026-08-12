@@ -7,7 +7,7 @@ from nanovllm.config import Config
 from nanovllm.backends import create_backend
 from nanovllm.backends.base import build_execution_plan
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 
 
@@ -21,6 +21,33 @@ def _hf_eog_token_ids(tokenizer, include_qwen_eog: bool = False) -> tuple[int, .
             if isinstance(token_id, int) and token_id >= 0 and token_id != unknown:
                 values.append(token_id)
     return tuple(dict.fromkeys(values))
+
+
+class ChatSession:
+    """A retained single-user chat context backed by one native sequence slot."""
+
+    def __init__(self, engine: "LLMEngine", sequence: "Sequence"):
+        self._engine = engine
+        self._sequence = sequence
+
+    @property
+    def session_id(self) -> int:
+        return self._sequence.seq_id
+
+    @property
+    def is_open(self) -> bool:
+        return self._sequence.status == SequenceStatus.PARKED
+
+    def generate(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        use_tqdm: bool = False,
+    ) -> dict:
+        return self._engine._continue_session(self._sequence, prompt, sampling_params, use_tqdm)
+
+    def close(self):
+        self._engine._close_session(self._sequence)
 
 
 class LLMEngine:
@@ -47,6 +74,14 @@ class LLMEngine:
             self.model_runner = create_backend(config)
         self.config = config
         self.closed = False
+        self._runtime_metrics = {
+            "tokenize_seconds": 0.0,
+            "schedule_seconds": 0.0,
+            "plan_seconds": 0.0,
+            "native_run_seconds": 0.0,
+            "postprocess_seconds": 0.0,
+            "steps": 0,
+        }
         if config.tokenizer_backend == "llamacpp":
             self.tokenizer = None
             config.eos_token_ids = self.model_runner.call("eog_token_ids")
@@ -57,7 +92,7 @@ class LLMEngine:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
             config.eos_token_ids = _hf_eog_token_ids(
                 self.tokenizer,
-                include_qwen_eog=config.backend in ("native_cpu", "native_vulkan"),
+                include_qwen_eog=config.backend in ("native_cpu", "native_vulkan", "native_cuda"),
             )
         self.scheduler = Scheduler(config)#调度器
         atexit.register(self.exit)#整个程序退出时候字段调用
@@ -73,26 +108,105 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            if self.config.tokenizer_backend == "llamacpp":
-                prompt = self.model_runner.call("tokenize", prompt)
-            else:
-                prompt = self.tokenizer.encode(prompt)#把prompt转换为tokenizer期望的格式
+        prompt = self._tokenize_prompt(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
+
+    def start_session(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        use_tqdm: bool = False,
+    ) -> tuple[ChatSession, dict]:
+        if not self.config.enable_session_cache:
+            raise RuntimeError("session cache is disabled; set enable_session_cache=True")
+        seq = Sequence(self._tokenize_prompt(prompt), sampling_params)
+        seq.retain_cache = True
+        self.scheduler.add(seq)
+        output = self._run_session_turn(seq, use_tqdm)
+        return ChatSession(self, seq), output
+
+    def _continue_session(
+        self,
+        seq: "Sequence",
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        use_tqdm: bool,
+    ) -> dict:
+        if self.closed:
+            raise RuntimeError("LLM engine is closed")
+        token_ids = self._tokenize_prompt(prompt)
+        if len(seq) + len(token_ids) > self.config.max_model_len:
+            raise ValueError("chat turn exceeds max_model_len")
+        seq.begin_turn(token_ids, sampling_params)
+        self.scheduler.resume(seq)
+        return self._run_session_turn(seq, use_tqdm)
+
+    def _close_session(self, seq: "Sequence"):
+        if seq.status != SequenceStatus.PARKED:
+            raise RuntimeError("chat session is already closed or still running")
+        self.scheduler.close_parked(seq)
+        self.flush_backend_releases()
+
+    def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
+        if not isinstance(prompt, str):
+            return prompt
+        started = perf_counter()
+        try:
+            if self.config.tokenizer_backend == "llamacpp":
+                return self.model_runner.call("tokenize", prompt)
+            return self.tokenizer.encode(prompt)
+        finally:
+            self._runtime_metrics["tokenize_seconds"] += perf_counter() - started
+
+    def _decode_tokens(self, token_ids: list[int]) -> str:
+        if self.config.tokenizer_backend == "llamacpp":
+            return self.model_runner.call("detokenize", token_ids)
+        return self.tokenizer.decode(token_ids)
+
+    def _run_session_turn(self, seq: "Sequence", use_tqdm: bool) -> dict:
+        pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        try:
+            while seq.status != SequenceStatus.PARKED:
+                if seq.is_finished:
+                    raise RuntimeError("chat session was evicted before its turn completed")
+                completed_before = seq.num_turn_completion_tokens
+                self.step()
+                pbar.update(seq.num_turn_completion_tokens - completed_before)
+        finally:
+            pbar.close()
+        token_ids = list(seq.turn_completion_token_ids)
+        return {"text": self._decode_tokens(token_ids), "token_ids": token_ids}
 
     def flush_backend_releases(self):
         for block_ids, seq_id in self.scheduler.pop_block_releases():
             self.model_runner.call("release_blocks", block_ids, [seq_id])
 
+    def runtime_metrics(self) -> dict[str, int | float]:
+        metrics = dict(self._runtime_metrics)
+        memory_stats = getattr(self.model_runner, "memory_stats", None)
+        if callable(memory_stats):
+            metrics.update({f"native_{key}": value for key, value in memory_stats().items()})
+        return metrics
+
     def step(self):
+        started = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()#调度返回这一轮要计算的seq列表（包括prompt+采样参数），以及是否是prefill
+        self._runtime_metrics["schedule_seconds"] += perf_counter() - started
         self.flush_backend_releases()
+        started = perf_counter()
         plan = build_execution_plan(seqs, is_prefill, self.config.kvcache_block_size)
+        self._runtime_metrics["plan_seconds"] += perf_counter() - started
+        started = perf_counter()
         result = self.model_runner.call("run", plan)
+        self._runtime_metrics["native_run_seconds"] += perf_counter() - started
         num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill
                       else -sum(len(token_ids) for token_ids in result.token_ids))#计算这轮处理了多少token数据
+        started = perf_counter()
         self.scheduler.postprocess(seqs, result, is_prefill)
+        self._runtime_metrics["postprocess_seconds"] += perf_counter() - started
+        self._runtime_metrics["steps"] += 1
         self.flush_backend_releases()
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
@@ -129,8 +243,5 @@ class LLMEngine:
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        if self.config.tokenizer_backend == "llamacpp":
-            outputs = [{"text": self.model_runner.call("detokenize", token_ids), "token_ids": token_ids} for token_ids in outputs]
-        else:
-            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self._decode_tokens(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs

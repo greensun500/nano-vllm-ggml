@@ -52,25 +52,25 @@ class BenchResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="nano-vLLM benchmark CLI for CUDA, staged llama.cpp, and native CPU/Vulkan backends.",
+        description="nano-vLLM benchmark CLI for native CPU, Vulkan, and CUDA backends.",
     )
     parser.add_argument(
         "model",
         nargs="?",
         default=None,
-        help="HF model path for CUDA, or GGUF model path for staged/native CPU/Vulkan backends.",
+        help="GGUF model path for the native backend.",
     )
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "native_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "native_cpu", "native_vulkan"),
+        choices=("native_cpu", "native_vulkan", "native_cuda"),
         help="Execution backend.",
     )
     parser.add_argument("--gguf-model", default=os.environ.get("NANOVLLM_GGUF_MODEL"))
     parser.add_argument(
         "--tokenizer",
         default=os.environ.get("NANOVLLM_TOKENIZER"),
-        help="Local Hugging Face tokenizer directory required by native CPU/Vulkan backends.",
+        help="Local Hugging Face tokenizer directory required by native backends.",
     )
     parser.add_argument(
         "--library-path",

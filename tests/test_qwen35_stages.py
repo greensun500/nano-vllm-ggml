@@ -8,7 +8,7 @@ from nanovllm.backends.base import BackendExecutionResult, build_execution_plan
 from nanovllm.cli.chat import format_chat_prompt
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -140,6 +140,211 @@ class Qwen35Tests(unittest.TestCase):
         )
         self.assertEqual(sequence.completion_token_ids, [2, 3, 4, 5, 6])
         self.assertEqual(sequence.num_cached_tokens, 257)
+
+    def test_session_sequence_parks_then_prefills_only_its_pending_token_and_new_turn(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=1,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=256,
+            enable_session_cache=True,
+            max_retained_sessions=1,
+            max_consecutive_prefill_rounds=0,
+        )
+        scheduler = Scheduler(config)
+        sequence = Sequence([1], SamplingParams(max_tokens=1))
+        sequence.retain_cache = True
+        scheduler.add(sequence)
+
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
+        self.assertEqual(sequence.status, SequenceStatus.PARKED)
+        self.assertEqual(sequence.num_cached_tokens, 1)
+        self.assertEqual(sequence.token_ids, [1, 2])
+        self.assertEqual(scheduler.pop_block_releases(), [])
+
+        sequence.begin_turn([3, 4], SamplingParams(max_tokens=1))
+        scheduler.resume(sequence)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(sequence.num_scheduled_tokens, 3)
+        plan = build_execution_plan(scheduled, is_prefill, 256)
+        self.assertEqual(plan.input_ids, [2, 3, 4])
+        scheduler.postprocess(scheduled, BackendExecutionResult([[5]]), is_prefill)
+        self.assertEqual(sequence.status, SequenceStatus.PARKED)
+        self.assertEqual(sequence.turn_completion_token_ids, [5])
+
+        scheduler.close_parked(sequence)
+        self.assertEqual(sequence.status, SequenceStatus.FINISHED)
+        self.assertEqual(scheduler.pop_block_releases(), [([0], sequence.seq_id)])
+
+    def test_session_cache_evicts_the_oldest_parked_sequence(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=2,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=256,
+            enable_session_cache=True,
+            max_retained_sessions=1,
+            max_consecutive_prefill_rounds=0,
+        )
+        scheduler = Scheduler(config)
+        first = Sequence([1], SamplingParams(max_tokens=1))
+        second = Sequence([2], SamplingParams(max_tokens=1))
+        first.retain_cache = second.retain_cache = True
+
+        for sequence, output in ((first, 11), (second, 12)):
+            scheduler.add(sequence)
+            scheduled, is_prefill = scheduler.schedule()
+            scheduler.postprocess(scheduled, BackendExecutionResult([[output]]), is_prefill)
+
+        self.assertEqual(first.status, SequenceStatus.FINISHED)
+        self.assertEqual(second.status, SequenceStatus.PARKED)
+        self.assertEqual(scheduler.pop_block_releases(), [([0], first.seq_id)])
+
+    def test_resumed_session_expands_its_block_table_before_prefill(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=512,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=2,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=512,
+            enable_session_cache=True,
+            max_retained_sessions=1,
+            max_consecutive_prefill_rounds=0,
+        )
+        scheduler = Scheduler(config)
+        sequence = Sequence(list(range(256)), SamplingParams(max_tokens=1))
+        sequence.retain_cache = True
+        scheduler.add(sequence)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, BackendExecutionResult([[256]]), is_prefill)
+        self.assertEqual(sequence.status, SequenceStatus.PARKED)
+        self.assertEqual(sequence.num_cached_tokens, 256)
+        self.assertEqual(sequence.block_table, [0])
+
+        sequence.begin_turn([257], SamplingParams(max_tokens=1))
+        scheduler.resume(sequence)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(sequence.block_table, [0, 1])
+        self.assertEqual(sequence.num_scheduled_tokens, 2)
+        self.assertEqual(build_execution_plan(scheduled, is_prefill, 256).input_ids, [256, 257])
+
+    def test_new_native_request_evicts_idle_session_when_its_slot_is_needed(self):
+        config = SimpleNamespace(
+            backend="native_cpu",
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=2,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=256,
+            enable_session_cache=True,
+            max_retained_sessions=1,
+            max_consecutive_prefill_rounds=0,
+        )
+        scheduler = Scheduler(config)
+        parked = Sequence([1], SamplingParams(max_tokens=1))
+        parked.retain_cache = True
+        scheduler.add(parked)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
+        self.assertEqual(parked.status, SequenceStatus.PARKED)
+
+        incoming = Sequence([3], SamplingParams(max_tokens=1))
+        scheduler.add(incoming)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [incoming])
+        self.assertEqual(parked.status, SequenceStatus.FINISHED)
+        self.assertEqual(scheduler.pop_block_releases(), [([0], parked.seq_id)])
+
+    def test_new_request_evicts_idle_session_when_its_blocks_are_needed(self):
+        config = SimpleNamespace(
+            max_num_seqs=2,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=1,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=256,
+            enable_session_cache=True,
+            max_retained_sessions=1,
+            max_consecutive_prefill_rounds=0,
+        )
+        scheduler = Scheduler(config)
+        parked = Sequence([1], SamplingParams(max_tokens=1))
+        parked.retain_cache = True
+        scheduler.add(parked)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
+
+        incoming = Sequence([3], SamplingParams(max_tokens=1))
+        scheduler.add(incoming)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [incoming])
+        self.assertEqual(parked.status, SequenceStatus.FINISHED)
+        self.assertEqual(scheduler.pop_block_releases(), [([0], parked.seq_id)])
+
+    def test_decode_runs_after_the_configured_prefill_budget(self):
+        config = SimpleNamespace(
+            max_num_seqs=1,
+            max_num_batched_tokens=256,
+            eos_token_ids=(),
+            kvcache_block_size=256,
+            num_kvcache_blocks=2,
+            enable_prefix_cache=False,
+            enable_preemption=False,
+            enable_mtp=False,
+            mtp_max_draft_tokens=3,
+            max_model_len=256,
+            enable_session_cache=False,
+            max_retained_sessions=0,
+            max_consecutive_prefill_rounds=1,
+        )
+        scheduler = Scheduler(config)
+        running = Sequence([1], SamplingParams(max_tokens=4))
+        scheduler.add(running)
+        scheduled, is_prefill = scheduler.schedule()
+        scheduler.postprocess(scheduled, BackendExecutionResult([[2]]), is_prefill)
+
+        waiting = Sequence([3, 4], SamplingParams(max_tokens=4))
+        scheduler.add(waiting)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [waiting])
+        scheduler.postprocess(scheduled, BackendExecutionResult([[5]]), is_prefill)
+
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [running])
 
 
 if __name__ == "__main__":

@@ -11,8 +11,18 @@
 #include "runtime/qwen35_model.h"
 #include "python/qwen35_runtime_binding.h"
 
+#ifndef NANOVLLM_NATIVE_HAS_VULKAN
+#define NANOVLLM_NATIVE_HAS_VULKAN 0
+#endif
+#ifndef NANOVLLM_NATIVE_HAS_CUDA
+#define NANOVLLM_NATIVE_HAS_CUDA 0
+#endif
+
 #if NANOVLLM_NATIVE_HAS_VULKAN
 #include "ggml-vulkan.h"
+#endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+#include "ggml-cuda.h"
 #endif
 
 #include <algorithm>
@@ -116,6 +126,7 @@ PyObject * py_build_info(PyObject *, PyObject *) {
             info, "ggml_base_commit", PyUnicode_FromString(NANOVLLM_GGML_BASE_COMMIT)) &&
         dict_set_owned(info, "cpu", PyBool_FromLong(1)) &&
         dict_set_owned(info, "vulkan", PyBool_FromLong(NANOVLLM_NATIVE_HAS_VULKAN)) &&
+        dict_set_owned(info, "cuda", PyBool_FromLong(NANOVLLM_NATIVE_HAS_CUDA)) &&
         dict_set_owned(info, "persistent_cpu_threadpool", PyBool_FromLong(1)) &&
         dict_set_owned(info, "uses_llama_context", PyBool_FromLong(0));
     if (!ok) {
@@ -153,6 +164,20 @@ PyObject * py_available_backends(PyObject *, PyObject *) {
         std::array<char, 256> description{};
         ggml_backend_vk_get_device_description(index, description.data(), description.size());
         PyObject * record = backend_record("vulkan", description.data(), index);
+        if (record == nullptr || PyList_Append(result, record) < 0) {
+            Py_XDECREF(record);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        Py_DECREF(record);
+    }
+#endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+    const int cuda_count = ggml_backend_cuda_get_device_count();
+    for (int index = 0; index < cuda_count; ++index) {
+        std::array<char, 256> description{};
+        ggml_backend_cuda_get_device_description(index, description.data(), description.size());
+        PyObject * record = backend_record("cuda", description.data(), index);
         if (record == nullptr || PyList_Append(result, record) < 0) {
             Py_XDECREF(record);
             Py_DECREF(result);
@@ -226,10 +251,18 @@ ggml_backend_t create_backend(const char * kind, int threads) {
         return ggml_backend_vk_init(0);
     }
 #endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+    if (std::strcmp(kind, "cuda") == 0) {
+        if (ggml_backend_cuda_get_device_count() <= 0) {
+            PyErr_SetString(PyExc_RuntimeError, "native runtime was built with CUDA but no CUDA device is available");
+            return nullptr;
+        }
+        return ggml_backend_cuda_init(0);
+    }
+#endif
     PyErr_Format(
         PyExc_ValueError,
-        "backend must be 'cpu'%s, got %s",
-        NANOVLLM_NATIVE_HAS_VULKAN ? " or 'vulkan'" : "",
+        "backend must be 'cpu', 'vulkan', or 'cuda'; got %s",
         kind);
     return nullptr;
 }
@@ -490,7 +523,9 @@ PyObject * py_qwen35_weight_load_smoke(PyObject *, PyObject * args, PyObject * k
         const BackendKind kind = nanovllm::native::parse_backend_kind(backend_kind);
         BackendList backends = kind == BackendKind::Cpu
             ? BackendList::cpu_only(threads)
-            : BackendList::vulkan_with_cpu(threads);
+            : kind == BackendKind::Vulkan
+                ? BackendList::vulkan_with_cpu(threads)
+                : BackendList::cuda_with_cpu(threads);
         auto weights = std::make_unique<GgufWeights>(path);
         const auto manifest = nanovllm::native::qwen35::validate(
             weights->metadata(), weights->tensor_context());

@@ -101,6 +101,16 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat \
   --temperature 0
 ```
 
+For an NVIDIA machine, build the same native extension with GGML CUDA and then
+select `native_cuda`:
+
+```bash
+NANOVLLM_NATIVE_CUDA=ON scripts/build_native_runtime.sh
+python -m nanovllm.cli.chat /path/to/Qwen3.5.gguf \
+  --backend native_cuda \
+  --tokenizer /path/to/Qwen3.5-tokenizer
+```
+
 The earlier `llamacpp_cpu`/`llamacpp_vulkan` external-library path remains only
 as a migration oracle. It is not used by either native backend. The current
 runtime flow is documented in

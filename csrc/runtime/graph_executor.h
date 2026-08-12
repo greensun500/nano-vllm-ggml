@@ -48,9 +48,11 @@ struct GraphPlacementAudit {
     std::vector<GraphNodePlacement> nodes;
     std::size_t compute_cpu_nodes = 0;
     std::size_t compute_vulkan_nodes = 0;
+    std::size_t compute_cuda_nodes = 0;
     std::size_t unassigned_compute_nodes = 0;
     std::size_t storage_cpu_nodes = 0;
     std::size_t storage_vulkan_nodes = 0;
+    std::size_t storage_cuda_nodes = 0;
     std::size_t unassigned_storage_nodes = 0;
     std::size_t storage_view_nodes = 0;
     std::size_t pure_metadata_view_nodes = 0;
@@ -71,6 +73,7 @@ bool is_graph_compute_op(enum ggml_op op) noexcept;
 // Supported backend layouts are deliberately narrow:
 //   * CPU:    [cpu]
 //   * Vulkan: [vulkan, cpu]
+//   * CUDA:   [cuda, cpu]
 //
 // The CPU entry in the Vulkan layout remains available for scheduler-managed
 // graph inputs and transfers.  A strict Vulkan model graph should call

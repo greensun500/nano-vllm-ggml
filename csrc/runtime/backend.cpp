@@ -5,9 +5,15 @@
 #ifndef NANOVLLM_NATIVE_HAS_VULKAN
 #define NANOVLLM_NATIVE_HAS_VULKAN 0
 #endif
+#ifndef NANOVLLM_NATIVE_HAS_CUDA
+#define NANOVLLM_NATIVE_HAS_CUDA 0
+#endif
 
 #if NANOVLLM_NATIVE_HAS_VULKAN
 #include "ggml-vulkan.h"
+#endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+#include "ggml-cuda.h"
 #endif
 
 #include <array>
@@ -108,6 +114,32 @@ ggml_backend_t create_backend_handle(const BackendConfig & config) {
             throw std::runtime_error(
                 "Vulkan backend requested, but NANOVLLM_NATIVE_HAS_VULKAN is disabled");
 #endif
+        case BackendKind::Cuda:
+#if NANOVLLM_NATIVE_HAS_CUDA
+        {
+            const int count = ggml_backend_cuda_get_device_count();
+            if (count <= 0) {
+                throw std::runtime_error(
+                    "native runtime was built with CUDA, but no CUDA device is available");
+            }
+            if (config.device_index >= static_cast<std::size_t>(count)) {
+                std::ostringstream message;
+                message << "CUDA device index " << config.device_index
+                        << " is out of range; " << count << " device(s) are available";
+                throw std::runtime_error(message.str());
+            }
+            ggml_backend_t backend = ggml_backend_cuda_init(static_cast<int>(config.device_index));
+            if (backend == nullptr) {
+                std::ostringstream message;
+                message << "failed to initialize GGML CUDA device " << config.device_index;
+                throw std::runtime_error(message.str());
+            }
+            return backend;
+        }
+#else
+            throw std::runtime_error(
+                "CUDA backend requested, but NANOVLLM_NATIVE_HAS_CUDA is disabled");
+#endif
     }
     throw std::runtime_error("unknown backend kind");
 }
@@ -120,6 +152,8 @@ const char * backend_kind_name(BackendKind kind) noexcept {
             return "cpu";
         case BackendKind::Vulkan:
             return "vulkan";
+        case BackendKind::Cuda:
+            return "cuda";
     }
     return "unknown";
 }
@@ -131,11 +165,18 @@ BackendKind parse_backend_kind(std::string_view kind) {
     if (kind == "vulkan") {
         return BackendKind::Vulkan;
     }
-    throw std::runtime_error("backend kind must be 'cpu' or 'vulkan'");
+    if (kind == "cuda") {
+        return BackendKind::Cuda;
+    }
+    throw std::runtime_error("backend kind must be 'cpu', 'vulkan', or 'cuda'");
 }
 
 bool vulkan_backend_compiled() noexcept {
     return NANOVLLM_NATIVE_HAS_VULKAN != 0;
+}
+
+bool cuda_backend_compiled() noexcept {
+    return NANOVLLM_NATIVE_HAS_CUDA != 0;
 }
 
 BackendConfig BackendConfig::cpu(int threads) {
@@ -152,6 +193,13 @@ BackendConfig BackendConfig::cpu(int threads) {
 BackendConfig BackendConfig::vulkan(std::size_t device_index) {
     BackendConfig config;
     config.kind = BackendKind::Vulkan;
+    config.device_index = device_index;
+    return config;
+}
+
+BackendConfig BackendConfig::cuda(std::size_t device_index) {
+    BackendConfig config;
+    config.kind = BackendKind::Cuda;
     config.device_index = device_index;
     return config;
 }
@@ -178,6 +226,21 @@ std::vector<BackendDeviceInfo> available_backend_devices() {
         devices.push_back(std::move(info));
     }
 #endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+    const int cuda_count = ggml_backend_cuda_get_device_count();
+    for (int index = 0; index < cuda_count; ++index) {
+        std::array<char, 256> description{};
+        ggml_backend_cuda_get_device_description(index, description.data(), description.size());
+
+        Backend backend(BackendConfig::cuda(static_cast<std::size_t>(index)));
+        BackendDeviceInfo info = backend.device_info();
+        if (description[0] != '\0') {
+            info.description = description.data();
+        }
+        ggml_backend_cuda_get_device_memory(index, &info.memory_free, &info.memory_total);
+        devices.push_back(std::move(info));
+    }
+#endif
     return devices;
 }
 
@@ -199,6 +262,14 @@ Backend::Backend(const BackendConfig & config)
         if (config_.kind == BackendKind::Vulkan) {
             std::array<char, 256> description{};
             ggml_backend_vk_get_device_description(
+                static_cast<int>(config_.device_index), description.data(), description.size());
+            fallback_description = description.data();
+        }
+#endif
+#if NANOVLLM_NATIVE_HAS_CUDA
+        if (config_.kind == BackendKind::Cuda) {
+            std::array<char, 256> description{};
+            ggml_backend_cuda_get_device_description(
                 static_cast<int>(config_.device_index), description.data(), description.size());
             fallback_description = description.data();
         }
@@ -286,6 +357,15 @@ BackendList BackendList::vulkan_with_cpu(int cpu_threads, std::size_t vulkan_dev
     result.backends_.reserve(2);
     // Scheduler priority is positional: Vulkan must precede the CPU fallback.
     result.backends_.emplace_back(BackendConfig::vulkan(vulkan_device_index));
+    result.backends_.emplace_back(BackendConfig::cpu(cpu_threads));
+    return result;
+}
+
+BackendList BackendList::cuda_with_cpu(int cpu_threads, std::size_t cuda_device_index) {
+    BackendList result;
+    result.backends_.reserve(2);
+    // Scheduler priority is positional: CUDA must precede the CPU fallback.
+    result.backends_.emplace_back(BackendConfig::cuda(cuda_device_index));
     result.backends_.emplace_back(BackendConfig::cpu(cpu_threads));
     return result;
 }

@@ -54,7 +54,8 @@ void validate_backend_layout(const BackendList & backends) {
         return;
     }
     if (backends.size() == 2 &&
-        backends.at(0).kind() == BackendKind::Vulkan &&
+        (backends.at(0).kind() == BackendKind::Vulkan ||
+         backends.at(0).kind() == BackendKind::Cuda) &&
         backends.at(1).kind() == BackendKind::Cpu) {
         return;
     }
@@ -67,7 +68,7 @@ void validate_backend_layout(const BackendList & backends) {
         }
         message << backend_kind_name(backends.at(i).kind());
     }
-    message << "]; expected [cpu] or [vulkan, cpu]";
+    message << "]; expected [cpu], [vulkan, cpu], or [cuda, cpu]";
     throw GraphExecutorError(message.str());
 }
 
@@ -434,10 +435,16 @@ GraphPlacementAudit GraphExecutor::audit_placement(ggml_cgraph * graph) const {
                     backends_->at(placement.compute.backend_index).kind();
                 placement.compute.backend_name =
                     safe_string(ggml_backend_name(backend), "<unnamed>");
-                if (placement.compute.backend_kind == BackendKind::Vulkan) {
-                    ++audit.compute_vulkan_nodes;
-                } else {
-                    ++audit.compute_cpu_nodes;
+                switch (placement.compute.backend_kind) {
+                    case BackendKind::Cpu:
+                        ++audit.compute_cpu_nodes;
+                        break;
+                    case BackendKind::Vulkan:
+                        ++audit.compute_vulkan_nodes;
+                        break;
+                    case BackendKind::Cuda:
+                        ++audit.compute_cuda_nodes;
+                        break;
                 }
             }
         }
@@ -452,10 +459,16 @@ GraphPlacementAudit GraphExecutor::audit_placement(ggml_cgraph * graph) const {
                 backends_->at(placement.storage.backend_index).kind();
             placement.storage.backend_name =
                 safe_string(ggml_backend_name(storage), "<unnamed>");
-            if (placement.storage.backend_kind == BackendKind::Vulkan) {
-                ++audit.storage_vulkan_nodes;
-            } else {
-                ++audit.storage_cpu_nodes;
+            switch (placement.storage.backend_kind) {
+                case BackendKind::Cpu:
+                    ++audit.storage_cpu_nodes;
+                    break;
+                case BackendKind::Vulkan:
+                    ++audit.storage_vulkan_nodes;
+                    break;
+                case BackendKind::Cuda:
+                    ++audit.storage_cuda_nodes;
+                    break;
             }
         }
         audit.nodes.push_back(std::move(placement));

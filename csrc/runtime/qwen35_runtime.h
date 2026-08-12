@@ -30,6 +30,15 @@ struct Qwen35GraphReuseStats {
     std::uint64_t active_entries = 0;
 };
 
+struct Qwen35MemoryStats {
+    std::uint64_t weights_bytes = 0;
+    std::uint64_t paged_kv_bytes = 0;
+    std::uint64_t recurrent_state_bytes = 0;
+    std::uint64_t graph_metadata_bytes = 0;
+    std::uint64_t graph_cache_entries = 0;
+    std::uint64_t known_persistent_bytes = 0;
+};
+
 // Owning C++ representation of the nano-vLLM Python execution-plan ABI.
 // Tokens belonging to a sequence are contiguous and scheduled_token_counts
 // partitions every token-level vector in sequence-row order.
@@ -80,6 +89,7 @@ public:
         const std::vector<std::int32_t> & sequence_ids,
         std::size_t block_size);
     Qwen35GraphReuseStats graph_reuse_stats() const;
+    Qwen35MemoryStats memory_stats() const;
     void shutdown();
     bool is_shutdown() const noexcept;
 

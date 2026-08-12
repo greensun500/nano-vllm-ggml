@@ -5,6 +5,7 @@ project(nanovllm_native_runtime LANGUAGES C CXX)
 include(CTest)
 
 option(NANOVLLM_NATIVE_VULKAN "Build the native runtime with the GGML Vulkan backend" OFF)
+option(NANOVLLM_NATIVE_CUDA "Build the native runtime with the GGML CUDA backend" OFF)
 set(
     NANOVLLM_LLAMA_CPP_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp"
@@ -52,7 +53,7 @@ set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_CPU ON CACHE BOOL "" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA ${NANOVLLM_NATIVE_CUDA} CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${NANOVLLM_NATIVE_VULKAN} CACHE BOOL "" FORCE)
 
 add_subdirectory(
@@ -85,6 +86,7 @@ target_compile_definitions(_C PRIVATE
     NANOVLLM_GGML_COMMIT="${NANOVLLM_GGML_COMMIT}"
     NANOVLLM_GGML_BASE_COMMIT="${NANOVLLM_GGML_BASE_COMMIT}"
     NANOVLLM_NATIVE_HAS_VULKAN=$<BOOL:${NANOVLLM_NATIVE_VULKAN}>
+    NANOVLLM_NATIVE_HAS_CUDA=$<BOOL:${NANOVLLM_NATIVE_CUDA}>
 )
 set_target_properties(_C PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/nanovllm"
@@ -105,6 +107,7 @@ if(BUILD_TESTING)
     target_link_libraries(nanovllm_graph_executor_test PRIVATE ggml::ggml)
     target_compile_definitions(nanovllm_graph_executor_test PRIVATE
         NANOVLLM_NATIVE_HAS_VULKAN=$<BOOL:${NANOVLLM_NATIVE_VULKAN}>
+        NANOVLLM_NATIVE_HAS_CUDA=$<BOOL:${NANOVLLM_NATIVE_CUDA}>
     )
     add_test(NAME graph_executor_placement COMMAND nanovllm_graph_executor_test)
 endif()

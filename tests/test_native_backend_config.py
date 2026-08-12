@@ -29,6 +29,8 @@ class NativeBackendConfigTests(unittest.TestCase):
         self.assertEqual(config.tokenizer_backend, "hf")
         self.assertEqual(config.num_kvcache_blocks, 3)
         self.assertEqual(config.max_model_len, 513)
+        self.assertEqual(config.max_num_seqs, 1)
+        self.assertEqual(config.max_num_batched_tokens, 2048)
 
     def test_native_backend_requires_the_explicit_hf_tokenizer_contract(self):
         with self.make_model() as model, tempfile.TemporaryDirectory() as tokenizer:
@@ -108,8 +110,8 @@ class NativeBackendConfigTests(unittest.TestCase):
             ):
                 Config(model="unused.gguf", backend="native_cpu", **overrides)
 
-    def test_factory_constructs_native_runner_for_cpu_and_vulkan(self):
-        for backend in ("native_cpu", "native_vulkan"):
+    def test_factory_constructs_native_runner_for_all_native_backends(self):
+        for backend in ("native_cpu", "native_vulkan", "native_cuda"):
             config = SimpleNamespace(backend=backend)
             sentinel = object()
             with self.subTest(backend=backend), patch(

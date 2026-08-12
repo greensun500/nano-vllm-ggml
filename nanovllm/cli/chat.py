@@ -30,6 +30,15 @@ def format_chat_prompt(messages: list[dict[str, str]], system_prompt: str, templ
     return prompt
 
 
+def format_next_turn(user_text: str, template: str) -> str:
+    if template == "plain":
+        return f"\nUser: {user_text}\nAssistant:"
+    prompt = f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+    if template == "qwen35":
+        prompt += "<think>\n\n</think>\n\n"
+    return prompt
+
+
 def clean_response(text: str, template: str) -> str:
     if template in ("qwen", "qwen35"):
         for stop in QWEN_STOPS:
@@ -40,29 +49,29 @@ def clean_response(text: str, template: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive nano-vLLM chat CLI for CUDA, staged llama.cpp, or native CPU/Vulkan backends.",
+        description="Interactive nano-vLLM chat CLI for native CPU, Vulkan, or CUDA backends.",
     )
     parser.add_argument(
         "model",
         nargs="?",
         default=None,
-        help="HF model path for CUDA, or GGUF model path for staged/native CPU/Vulkan backends.",
+        help="GGUF model path for the native backend.",
     )
     parser.add_argument(
         "--backend",
         default=os.environ.get("NANOVLLM_BACKEND", "native_cpu"),
-        choices=("cuda", "llamacpp_cpu", "llamacpp_vulkan", "native_cpu", "native_vulkan"),
+        choices=("native_cpu", "native_vulkan", "native_cuda"),
         help="Execution backend.",
     )
     parser.add_argument(
         "--gguf-model",
         default=os.environ.get("NANOVLLM_GGUF_MODEL"),
-        help="GGUF model path. Defaults to the positional model path for staged/native backends.",
+        help="GGUF model path. Defaults to the positional model path.",
     )
     parser.add_argument(
         "--tokenizer",
         default=os.environ.get("NANOVLLM_TOKENIZER"),
-        help="Local Hugging Face tokenizer directory required by native CPU/Vulkan backends.",
+        help="Local Hugging Face tokenizer directory required by native backends.",
     )
     parser.add_argument(
         "--library-path",
@@ -234,6 +243,7 @@ def main() -> int:
     )
     messages: list[dict[str, str]] = []
     system_prompt = args.system
+    session = None
 
     print(f"nano-vLLM chat ready. backend={args.backend}, template={args.template}")
     print_help()
@@ -254,6 +264,9 @@ def main() -> int:
                 continue
             if user_input == "/reset":
                 messages.clear()
+                if session is not None:
+                    session.close()
+                    session = None
                 print("history cleared")
                 continue
             if user_input == "/history":
@@ -265,16 +278,33 @@ def main() -> int:
             if user_input.startswith("/system "):
                 system_prompt = user_input[len("/system ") :].strip()
                 messages.clear()
+                if session is not None:
+                    session.close()
+                    session = None
                 print("system prompt updated and history cleared")
                 continue
 
             messages.append({"role": "user", "content": user_input})
-            prompt = format_chat_prompt(messages, system_prompt, args.template)
-            outputs = llm.generate([prompt], sampling_params, use_tqdm=args.tqdm)
-            response = clean_response(outputs[0]["text"], args.template)
+            if args.backend.startswith("native"):
+                if session is None:
+                    prompt = format_chat_prompt(messages, system_prompt, args.template)
+                    session, output = llm.start_session(prompt, sampling_params, use_tqdm=args.tqdm)
+                else:
+                    output = session.generate(
+                        format_next_turn(user_input, args.template),
+                        sampling_params,
+                        use_tqdm=args.tqdm,
+                    )
+                response = clean_response(output["text"], args.template)
+            else:
+                prompt = format_chat_prompt(messages, system_prompt, args.template)
+                outputs = llm.generate([prompt], sampling_params, use_tqdm=args.tqdm)
+                response = clean_response(outputs[0]["text"], args.template)
             messages.append({"role": "assistant", "content": response})
             print(f"\nassistant> {response}")
     finally:
+        if session is not None and session.is_open:
+            session.close()
         if hasattr(llm, "exit"):
             llm.exit()
     return 0

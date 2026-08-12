@@ -17,8 +17,8 @@ class Config:
     tokenizer: str | None = None
     tokenizer_backend: str = "hf"
     device_config: dict | None = None
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
+    max_num_batched_tokens: int | None = None
+    max_num_seqs: int | None = None
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
@@ -30,13 +30,38 @@ class Config:
     enable_mtp: bool = False
     mtp_max_draft_tokens: int = 3
     enable_graph_reuse: bool = True
+    enable_session_cache: bool = True
+    max_retained_sessions: int = 1
+    max_consecutive_prefill_rounds: int = 4
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
+        is_native = self.backend in ("native_cpu", "native_vulkan", "native_cuda")
+        if self.max_num_batched_tokens is None:
+            self.max_num_batched_tokens = 2048 if is_native else 16384
+        if self.max_num_seqs is None:
+            # Recurrent state is allocated per native sequence slot.  A small
+            # default keeps an edge-device launch from reserving hundreds of
+            # state rows before it has received its first request.
+            self.max_num_seqs = 1 if is_native else 512
         _require(self.max_num_batched_tokens > 0, "max_num_batched_tokens must be positive")
         _require(self.max_num_seqs > 0, "max_num_seqs must be positive")
         _require(self.max_model_len > 0, "max_model_len must be positive")
+        _require(self.max_retained_sessions >= 0, "max_retained_sessions must be non-negative")
+        _require(
+            self.max_consecutive_prefill_rounds >= 0,
+            "max_consecutive_prefill_rounds must be non-negative",
+        )
+        if self.enable_session_cache:
+            _require(
+                self.max_retained_sessions > 0,
+                "max_retained_sessions must be positive when session cache is enabled",
+            )
+            _require(
+                self.max_retained_sessions <= self.max_num_seqs,
+                "max_retained_sessions must not exceed max_num_seqs",
+            )
         _require(self.kvcache_block_size > 0, "kvcache_block_size must be positive")
         _require(
             self.num_kvcache_blocks == -1 or self.num_kvcache_blocks > 0,
@@ -48,6 +73,7 @@ class Config:
             "llamacpp_vulkan",
             "native_cpu",
             "native_vulkan",
+            "native_cuda",
         ), f"unsupported backend: {self.backend}")
         _require(self.model_format in ("hf", "gguf"), "model_format must be 'hf' or 'gguf'")
         _require(
@@ -82,7 +108,6 @@ class Config:
             self.hf_config = AutoConfig.from_pretrained(self.model)
             self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         else:
-            is_native = self.backend in ("native_cpu", "native_vulkan")
             if is_native:
                 _require(
                     not self.enable_prefix_cache,

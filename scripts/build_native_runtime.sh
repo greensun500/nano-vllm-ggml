@@ -3,12 +3,23 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENABLE_VULKAN="${NANOVLLM_NATIVE_VULKAN:-OFF}"
+ENABLE_CUDA="${NANOVLLM_NATIVE_CUDA:-OFF}"
 BUILD_KIND="cpu"
 if [[ "${ENABLE_VULKAN}" == "ON" || "${ENABLE_VULKAN}" == "1" ]]; then
     ENABLE_VULKAN="ON"
     BUILD_KIND="vulkan"
 else
     ENABLE_VULKAN="OFF"
+fi
+if [[ "${ENABLE_CUDA}" == "ON" || "${ENABLE_CUDA}" == "1" ]]; then
+    ENABLE_CUDA="ON"
+    if [[ "${BUILD_KIND}" != "cpu" ]]; then
+        echo "nano-vLLM: build either Vulkan or CUDA at a time" >&2
+        exit 2
+    fi
+    BUILD_KIND="cuda"
+else
+    ENABLE_CUDA="OFF"
 fi
 BUILD_DIR="${NANOVLLM_NATIVE_BUILD_DIR:-${ROOT_DIR}/build/native-${BUILD_KIND}}"
 RUN_TESTS="${NANOVLLM_NATIVE_RUN_TESTS:-ON}"
@@ -104,6 +115,7 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING="${RUN_TESTS}" \
     -DNANOVLLM_NATIVE_VULKAN="${ENABLE_VULKAN}" \
+    -DNANOVLLM_NATIVE_CUDA="${ENABLE_CUDA}" \
     "${AUTO_CMAKE_ARGS[@]}" \
     "$@"
 cmake --build "${BUILD_DIR}" --target _C --parallel "${NANOVLLM_BUILD_JOBS:-$(nproc)}"

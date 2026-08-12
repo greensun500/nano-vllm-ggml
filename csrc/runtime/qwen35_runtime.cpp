@@ -16,6 +16,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -51,6 +52,19 @@ std::size_t checked_product(std::size_t left, std::size_t right, const char * la
         fail(std::string(label) + " overflows size_t");
     }
     return left * right;
+}
+
+std::uint64_t checked_sum(
+    std::initializer_list<std::uint64_t> values,
+    const char * label) {
+    std::uint64_t result = 0;
+    for (const std::uint64_t value : values) {
+        if (value > std::numeric_limits<std::uint64_t>::max() - result) {
+            fail(std::string(label) + " overflows uint64_t");
+        }
+        result += value;
+    }
+    return result;
 }
 
 Qwen35RuntimeOptions validate_options(Qwen35RuntimeOptions options) {
@@ -91,7 +105,10 @@ BackendList create_backend_list(const Qwen35RuntimeOptions & options) {
         }
         return BackendList::cpu_only(options.cpu_threads);
     }
-    return BackendList::vulkan_with_cpu(options.cpu_threads, options.device_index);
+    if (kind == BackendKind::Vulkan) {
+        return BackendList::vulkan_with_cpu(options.cpu_threads, options.device_index);
+    }
+    return BackendList::cuda_with_cpu(options.cpu_threads, options.device_index);
 }
 
 class GraphContext {
@@ -602,11 +619,11 @@ struct Qwen35Runtime::Impl {
         return persistent;
     }
 
-    void place_vulkan_compute_nodes(GraphExecutor & graph_executor, ggml_cgraph * graph) {
-        if (primary_backend->kind() != BackendKind::Vulkan) {
+    void place_primary_compute_nodes(GraphExecutor & graph_executor, ggml_cgraph * graph) {
+        if (primary_backend->kind() == BackendKind::Cpu) {
             return;
         }
-        graph_executor.set_all_compute_nodes_backend(graph, BackendKind::Vulkan);
+        graph_executor.set_all_compute_nodes_backend(graph, primary_backend->kind());
     }
 
     void assert_compute_placement(
@@ -667,7 +684,7 @@ struct Qwen35Runtime::Impl {
                 output_mode,
                 retain_hidden,
                 true);
-            place_vulkan_compute_nodes(*entry.executor, entry.target_chunk.graph);
+            place_primary_compute_nodes(*entry.executor, entry.target_chunk.graph);
             entry.executor->allocate(entry.target_chunk.graph);
             assert_compute_placement(*entry.executor, entry.target_chunk.graph);
         }
@@ -689,7 +706,7 @@ struct Qwen35Runtime::Impl {
             qwen35::AttentionCacheView cache{layer.key, layer.value};
             entry.token = qwen35::build_mtp_token_graph(
                 entry.context.get(), *model, cache, n_kv_bucket, emit_greedy, true);
-            place_vulkan_compute_nodes(*entry.executor, entry.token.graph);
+            place_primary_compute_nodes(*entry.executor, entry.token.graph);
             entry.executor->allocate(entry.token.graph);
             assert_compute_placement(*entry.executor, entry.token.graph);
         }
@@ -707,7 +724,7 @@ struct Qwen35Runtime::Impl {
             qwen35::AttentionCacheView cache{layer.key, layer.value};
             entry.mtp_kv_update = qwen35::build_mtp_kv_update_graph(
                 entry.context.get(), *model, cache, n_tokens);
-            place_vulkan_compute_nodes(*entry.executor, entry.mtp_kv_update.graph);
+            place_primary_compute_nodes(*entry.executor, entry.mtp_kv_update.graph);
             entry.executor->allocate(entry.mtp_kv_update.graph);
             assert_compute_placement(*entry.executor, entry.mtp_kv_update.graph);
         }
@@ -759,7 +776,7 @@ struct Qwen35Runtime::Impl {
             graph_context.get(), sequence_slot, input_plane, output_plane);
         qwen35::TokenGraph token_graph = qwen35::build_target_token_graph(
             graph_context.get(), *model, persistent, read_slots.size(), emit_greedy);
-        place_vulkan_compute_nodes(*executor, token_graph.graph);
+        place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
@@ -967,7 +984,7 @@ struct Qwen35Runtime::Impl {
         //计算图建立完毕，开始进行实际执行
         // 让 GGML scheduler 为 graph 做节点放置和临时 tensor 分配。
         // 权重、PagedKV、recurrent state 属于持久化存储，前面初始化时已经有 backend storage。
-        place_vulkan_compute_nodes(*executor, graph.graph);
+        place_primary_compute_nodes(*executor, graph.graph);
         executor->allocate(graph.graph);    //为graph分配临时buffer
         assert_compute_placement(*executor, graph.graph);
         // 上传由 Python/native 调度层准备好的运行时输入。
@@ -1119,7 +1136,7 @@ struct Qwen35Runtime::Impl {
         qwen35::AttentionCacheView cache{layer.key, layer.value};
         qwen35::TokenGraph token_graph = qwen35::build_mtp_token_graph(
             graph_context.get(), *model, cache, read_slots.size(), emit_greedy);
-        place_vulkan_compute_nodes(*executor, token_graph.graph);
+        place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
@@ -1210,7 +1227,7 @@ struct Qwen35Runtime::Impl {
         qwen35::AttentionCacheView cache{layer.key, layer.value};
         qwen35::MtpKvUpdateGraph graph = qwen35::build_mtp_kv_update_graph(
             graph_context.get(), *model, cache, tokens.size());
-        place_vulkan_compute_nodes(*executor, graph.graph);
+        place_primary_compute_nodes(*executor, graph.graph);
         executor->allocate(graph.graph);
         assert_compute_placement(*executor, graph.graph);
         ggml_backend_tensor_set(
@@ -1572,6 +1589,27 @@ struct Qwen35Runtime::Impl {
         result.active_entries = graph_cache.size();
         return result;
     }
+
+    Qwen35MemoryStats memory_stats() const {
+        Qwen35MemoryStats result;
+        result.weights_bytes = static_cast<std::uint64_t>(
+            model_storage == nullptr ? 0 : model_storage->resident_buffer_bytes());
+        result.paged_kv_bytes = static_cast<std::uint64_t>(
+            paged_kv == nullptr ? 0 : paged_kv->resident_bytes());
+        result.recurrent_state_bytes = static_cast<std::uint64_t>(
+            recurrent == nullptr ? 0 : recurrent->resident_bytes());
+        result.graph_cache_entries = static_cast<std::uint64_t>(graph_cache.size());
+        const std::uint64_t graph_contexts = result.graph_cache_entries + 1;
+        result.graph_metadata_bytes = graph_contexts *
+            static_cast<std::uint64_t>(kGraphMetadataBytes);
+        result.known_persistent_bytes = checked_sum(
+            {result.weights_bytes,
+             result.paged_kv_bytes,
+             result.recurrent_state_bytes,
+             result.graph_metadata_bytes},
+            "runtime memory stats");
+        return result;
+    }
 };
 
 Qwen35Runtime::Qwen35Runtime(Qwen35RuntimeOptions options)
@@ -1610,6 +1648,13 @@ Qwen35GraphReuseStats Qwen35Runtime::graph_reuse_stats() const {
         fail("runtime has been shut down");
     }
     return impl_->graph_reuse_stats();
+}
+
+Qwen35MemoryStats Qwen35Runtime::memory_stats() const {
+    if (impl_ == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->memory_stats();
 }
 
 void Qwen35Runtime::shutdown() {

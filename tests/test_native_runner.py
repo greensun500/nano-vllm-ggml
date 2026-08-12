@@ -145,6 +145,10 @@ class NativeRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("library_path", kwargs)
 
+    def test_constructor_maps_native_cuda_to_the_ggml_cuda_runtime(self):
+        runner = self.make_runner(make_config(backend="native_cuda"))
+        self.assertEqual(runner.runtime.constructor_kwargs["backend"], "cuda")
+
     def test_greedy_run_flattens_and_converts_the_execution_plan(self):
         runner = self.make_runner()
         result = runner.run(make_plan())

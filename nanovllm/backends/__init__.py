@@ -10,7 +10,7 @@ def create_backend(config: Config, rank: int = 0, event=None):
         from nanovllm.backends.llamacpp.runner import LlamaCppRunner
 
         return LlamaCppRunner(config)
-    if config.backend in ("native_cpu", "native_vulkan"):
+    if config.backend in ("native_cpu", "native_vulkan", "native_cuda"):
         from nanovllm.backends.native.runner import NativeRunner
 
         return NativeRunner(config)

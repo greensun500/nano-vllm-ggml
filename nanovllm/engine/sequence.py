@@ -8,6 +8,7 @@ from nanovllm.sampling_params import SamplingParams
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    PARKED = auto()
     FINISHED = auto()
 
 
@@ -26,6 +27,8 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.retain_cache = False
+        self.turn_prompt_tokens = len(token_ids)
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -45,12 +48,20 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
+    def num_turn_completion_tokens(self):
+        return self.num_tokens - self.turn_prompt_tokens
+
+    @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def turn_completion_token_ids(self):
+        return self.token_ids[self.turn_prompt_tokens:]
 
     @property
     def num_blocks(self):
@@ -68,6 +79,21 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def begin_turn(self, token_ids: list[int], sampling_params: SamplingParams):
+        if self.status != SequenceStatus.PARKED:
+            raise RuntimeError("only a parked sequence can begin another chat turn")
+        if not token_ids:
+            raise ValueError("a chat turn requires at least one input token")
+        self.token_ids.extend(token_ids)
+        self.last_token = token_ids[-1]
+        self.num_tokens += len(token_ids)
+        self.turn_prompt_tokens = self.num_tokens
+        self.temperature = sampling_params.temperature
+        self.max_tokens = sampling_params.max_tokens
+        self.ignore_eos = sampling_params.ignore_eos
+        self.num_scheduled_tokens = 0
+        self.is_prefill = True
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

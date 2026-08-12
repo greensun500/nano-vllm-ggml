@@ -21,6 +21,7 @@ namespace {
 
 using nanovllm::native::Qwen35ExecutionPlan;
 using nanovllm::native::Qwen35GraphReuseStats;
+using nanovllm::native::Qwen35MemoryStats;
 using nanovllm::native::Qwen35MtpResult;
 using nanovllm::native::Qwen35Runtime;
 using nanovllm::native::Qwen35RuntimeOptions;
@@ -642,6 +643,48 @@ PyObject * runtime_graph_reuse_stats(PyObject * self_object, PyObject *) {
     }
 }
 
+PyObject * runtime_memory_stats(PyObject * self_object, PyObject *) {
+    auto * self = reinterpret_cast<PyQwen35Runtime *>(self_object);
+    Qwen35Runtime * runtime = require_runtime(self);
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        Qwen35MemoryStats stats;
+        {
+            AllowThreads allow_threads;
+            stats = runtime->memory_stats();
+        }
+        PyObject * result = PyDict_New();
+        if (result == nullptr) {
+            return nullptr;
+        }
+        const auto set_uint = [&](const char * key, std::uint64_t value) -> bool {
+            PyObject * object = PyLong_FromUnsignedLongLong(
+                static_cast<unsigned long long>(value));
+            if (object == nullptr) {
+                return false;
+            }
+            const int status = PyDict_SetItemString(result, key, object);
+            Py_DECREF(object);
+            return status == 0;
+        };
+        if (!set_uint("weights_bytes", stats.weights_bytes) ||
+            !set_uint("paged_kv_bytes", stats.paged_kv_bytes) ||
+            !set_uint("recurrent_state_bytes", stats.recurrent_state_bytes) ||
+            !set_uint("graph_metadata_bytes", stats.graph_metadata_bytes) ||
+            !set_uint("graph_cache_entries", stats.graph_cache_entries) ||
+            !set_uint("known_persistent_bytes", stats.known_persistent_bytes)) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        return result;
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
 PyCFunction cast_keyword_function(PyCFunctionWithKeywords function) noexcept {
     static_assert(
         sizeof(PyCFunction) == sizeof(PyCFunctionWithKeywords),
@@ -661,6 +704,8 @@ PyMethodDef runtime_methods[] = {
      "Release nano-vLLM Paged-KV blocks and native sequence state."},
     {"graph_reuse_stats", runtime_graph_reuse_stats, METH_NOARGS,
      "Return persistent graph cache hit/miss/eviction counters."},
+    {"memory_stats", runtime_memory_stats, METH_NOARGS,
+     "Return native persistent-memory accounting by allocation class."},
     {"shutdown", runtime_shutdown, METH_NOARGS,
      "Synchronize and shut down the native runtime. This operation is idempotent."},
     {nullptr, nullptr, 0, nullptr},

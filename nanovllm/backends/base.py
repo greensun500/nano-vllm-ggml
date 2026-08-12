@@ -12,6 +12,7 @@ BackendName = Literal[
     "llamacpp_vulkan",
     "native_cpu",
     "native_vulkan",
+    "native_cuda",
 ]
 PlanMode = Literal["prefill", "decode"]
 
