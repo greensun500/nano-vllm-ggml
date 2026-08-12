@@ -1,12 +1,12 @@
-# nano-vLLM 当前执行流程：v3.5
+# nano-vLLM 当前执行流程：v3.6
 
 ## 1. 架构边界
 
-nano-vLLM Python 层负责 request、scheduler、sequence、block table、slot mapping、PagedKV 分配、greedy speculative accept/rollback、EOS/max_tokens 和统计。
+nanovllm Python 层负责 request、scheduler、sequence、block table、slot mapping、PagedKV 分配、greedy speculative accept/rollback、EOS/max_tokens、会话保留和统计。
 
-in-tree C++ runtime 负责 GGUF 加载、Qwen3.5 target/MTP GGML graph、CPU/Vulkan backend、6 层 attention PagedKV、18 层 GDN recurrent state 及 K+1 snapshot planes。
+in-tree C++ runtime 负责 GGUF 加载、Qwen3.5 target/MTP GGML graph、CPU/Vulkan/CUDA backend、6 层 attention PagedKV、18 层 GDN recurrent state 及 K+1 snapshot planes。
 
-项目只编译 llama.cpp 的 GGML 子目录；上游基线为官方 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，其上带有 nano-vLLM 的 Mali shape-policy 子模块提交 `5ed3338`。项目不链接 `libllama`、不创建 `llama_context`、不使用 CUDA。llama.cpp 提供 GGML tensor、graph、CPU/Vulkan backend 和底层算子，调度与缓存所有权仍属于 nano-vLLM。
+项目只编译 llama.cpp 的 GGML 子目录；上游基线为官方 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，其上带有 nano-vLLM 的 Mali shape-policy 子模块提交 `5ed3338`。项目不链接 `libllama`、不创建 `llama_context`；GGML 提供 tensor、graph、CPU/Vulkan/CUDA backend 和底层算子，调度与缓存所有权仍属于 nano-vLLM。
 
 ## 2. 构建阶段
 
@@ -17,6 +17,7 @@ scripts/build_native_runtime.sh
   -> 编译器探测 armv8.6-a+dotprod+i8mm
   -> 成功时注入 GGML_NATIVE=OFF + GGML_CPU_ARM_ARCH
   -> 可选校验 NANOVLLM_VULKAN_GLSLC
+  -> 选择 GGML Vulkan 或 CUDA（两者互斥）
   -> CMake 编译 in-tree GGML + nanovllm._C
 ```
 
@@ -29,7 +30,7 @@ LLM(config)
   -> NativeRunner
   -> nanovllm._C.Qwen35Runtime
   -> validate Qwen3.5/Q4_0/MTP GGUF contract
-  -> create CPU or [Vulkan, CPU] backends
+  -> create [CPU]、[Vulkan, CPU] or [CUDA, CPU] backends
   -> load model tensors
   -> allocate target/MTP PagedKV
   -> allocate recurrent canonical/snapshot planes
@@ -37,7 +38,7 @@ LLM(config)
   -> lazy persistent graph bucket cache
 ```
 
-Vulkan 模式把模型 compute node 固定到 Vulkan，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。v3.5 默认开启 `enable_graph_reuse`，CPU 单序列 decode/MTP 会 lazy 创建 persistent graph bucket；多序列、Vulkan 和 prefill/chunk 仍走 fallback scheduler。
+accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。v3.6 默认开启 `enable_graph_reuse`，CPU 单序列 decode/MTP 会 lazy 创建 persistent graph bucket；多序列、Vulkan/CUDA 和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
 
 ## 4. Python 执行计划
 
@@ -58,6 +59,10 @@ temperatures
 
 NativeRunner 将 Python sequence ID 映射到 native sequence slot。C++ 根据 block table 展开物理 read/write slots，并校验 Python slot mapping 与同图重复写入。
 
+v3.6 在 native chat 中增加长期 session。首轮完整 prompt 创建 `Sequence(WAITING)`，完成后 status 变为 `PARKED`；下一轮将格式化后的新 user turn 追加到同一 sequence，保留原 block table、native sequence slot、target/MTP PagedKV、recurrent state 和 `pending_hidden`，只 prefill 新增 token。`/reset`、`/system`、显式 `close()` 或 LRU 淘汰会走 `release_blocks()`，统一清理这些 native 持久状态。
+
+Scheduler 仍是低开销 FIFO：有 waiting request 时优先 prefill；但 waiting 与 running 同时存在并连续 prefill 达到 `max_consecutive_prefill_rounds`（默认 4）时，强制插入一轮 decode，避免持续新请求使已有生成饿死。session cache 仅复用同一条对话；它不是跨请求 prefix cache。
+
 ## 5. TargetChunkGraph
 
 单 sequence 的 T 个 token 共用一张 graph：
@@ -71,7 +76,7 @@ tokens[T] + positions[4T]
   -> 按输出模式决定 output norm/head/argmax
 ```
 
-full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。
+full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。
 
 输出模式：
 
@@ -136,7 +141,7 @@ MTP(d1,  m0,      p+1) -> d2, m1
 MTP(d2,  m1,      p+2) -> d3
 ```
 
-三步有真实自回归依赖，v3.5 仍执行三张串行 draft graph。每步包含 MTP layer、tied vocab head 和 greedy argmax；单序列时 draft graph 使用 fixed `n_kv` bucket 复用同一个 graph/executor。
+三步有真实自回归依赖，当前仍执行三张串行 draft graph。每步包含 MTP layer、tied vocab head 和 greedy argmax；单序列 CPU 时 draft graph 使用 fixed `n_kv` bucket 复用同一个 graph/executor。
 
 ### 8.2 Target verification
 
@@ -173,7 +178,7 @@ positions     = p+1 ... p+a
 write_slots   = committed slots
 ```
 
-`a=0` 时不执行 catch-up。该 graph 在 v3.5 仍与 verification 分离，但单序列时 `T=1..K` 的 KV-only graph 会进入 persistent cache。
+`a=0` 时不执行 catch-up。该 graph 仍与 verification 分离，但单序列 CPU 时 `T=1..K` 的 KV-only graph 会进入 persistent cache。
 
 ## 9. 图数、同步与 readback
 
@@ -196,28 +201,29 @@ readback 规则：
 
 `GraphExecutor::compute()` 使用同步 GGML scheduler API。fallback 路径仍在 graph guard 退出时 reset transient allocation，并按轮重建 graph metadata。
 
-v3.5 的 CPU graph reuse 路径按 key 常驻独立 executor：
+v3.5 引入、v3.6 保留的 CPU graph reuse 路径按 key 常驻独立 executor：
 
 ```text
 graph_kind + T + n_kv_bucket + output_mode + snapshot_count
   + sequence_slot + input_plane + retain_hidden
 ```
 
-entry 首次 miss 时构图、Vulkan placement、scheduler allocation；命中时只更新 token、position、read/write slots、mask 和 hidden input，然后重复 `compute()`。bucket 只保存 graph metadata、scheduler allocation 和 transient activation buffer，不保存 KV cache、不复制权重。
+entry 首次 miss 时构图、accelerator placement、scheduler allocation；命中时只更新 token、position、read/write slots、mask 和 hidden input，然后重复 `compute()`。bucket 只保存 graph metadata、scheduler allocation 和 transient activation buffer，不保存 KV cache、不复制权重。
 
 `n_kv_bucket` 默认使用 `128/256/512/1024/2048/4096/max_model_len`。真实 KV slot 放在前缀，padding slot 重复最后一个真实 slot，并通过 causal mask 屏蔽；上下文不会被截断。
 
 ## 10. Release
 
-request release 会校验 sequence ID，清理 target/MTP KV block、recurrent planes、pending hidden/position，并释放 Python-to-native slot mapping。
+request release 会校验 sequence ID，清理 target/MTP KV block、recurrent planes、pending hidden/position，并释放 Python-to-native slot mapping。v3.6 的 parked session 被 LRU 淘汰或显式关闭时也走同一条 release 路径。
 
 ## 11. 当前 backend 策略边界
 
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
 - v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
-- v3.5 graph reuse 只保证 CPU 单序列 decode/MTP；Vulkan padded-mask bucket 仍需独立修正，当前 fallback 到每轮构图。
+- v3.5 graph reuse 在 v3.6 仍只保证 CPU 单序列 decode/MTP；Vulkan/CUDA 当前 fallback 到每轮构图。
 - CPU 权重当前仍在 default buffer，尚未进入 CPU_REPACK。
-- MTP 的串行 draft、tied Q6_K head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。
+- MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。
+- CUDA 已接入 build、backend discovery、placement audit 与 native runner，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。
 
 ## 12. 构建与基准命令结构
 
@@ -226,6 +232,9 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 NANOVLLM_NATIVE_VULKAN=ON \
 NANOVLLM_VULKAN_GLSLC=/path/to/glslc \
 scripts/build_native_runtime.sh
+
+# CUDA 与 Vulkan 不能在同一个 extension 中同时开启
+NANOVLLM_NATIVE_CUDA=ON scripts/build_native_runtime.sh
 
 # 禁用自动 Arm ISA 选择
 NANOVLLM_NATIVE_ARM_ARCH=off scripts/build_native_runtime.sh
@@ -251,4 +260,4 @@ python3 -m nanovllm.cli.bench "$MODEL" ... \
   --prompt-len 521 --gen-len 129 --warmup 1 --repeat 3 --json
 ```
 
-MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。
+MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。v3.6 native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。

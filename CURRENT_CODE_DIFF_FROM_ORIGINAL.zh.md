@@ -5,16 +5,13 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，HEAD `0220adb442bd0ca21b7722d45d38ddd3f8dfbcfd`
-- 当前工作区还包含 v3.5 graph reuse 的未提交修改，以及一个未跟踪测试文件：
-  - `tests/test_native_qwen35_long_context_oracle.py`
+- 当前分支：`qwen35-native-runtime`，版本提交 `aabd733 v3.6: Add native MTP stage profiling`
 
 总体规模：
 
-- 相对 `origin/main`，当前 tracked 代码约 `61 files changed, 14070 insertions, 165 deletions`
-- 当前工作区未提交部分约 `18 files changed, 798 insertions, 163 deletions`
+- 相对原始基线的具体规模会随文档、测试和子模块状态变化；学习时应以 `git diff origin/main...HEAD --stat` 重新计算。
 
-一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前版本在保留原 CUDA 路径的同时，加入了 llama.cpp/GGML CPU/Vulkan 方向，最终形成了一个 in-tree Qwen3.5-2B native runtime，支持 GGUF 加载、CPU/Vulkan backend、PagedKV、Qwen3.5 hybrid recurrent 结构、内置 MTP、benchmark/chat CLI 和 v3.5 CPU graph reuse。
+一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前 v3.6 在保留原 CUDA 路径的同时，形成了 in-tree Qwen3.5 native runtime，支持 GGUF 加载、GGML CPU/Vulkan/CUDA backend、PagedKV、hybrid recurrent state、内置 MTP、会话保留、公平调度、benchmark/chat CLI、CPU graph reuse 和 MTP/memory profiling。
 
 ## 1. 修改时间线
 
@@ -33,7 +30,10 @@
 | v3.2 | `65f8b79` | 引入 `TargetChunkGraph`，批量执行 target prefill/verification |
 | v3.3 | `a7d4b24` | Arm/Mali native 执行优化，包括 prefill chunk policy 和 Arm CPU 构建参数 |
 | v3.4 | `0220adb` | llama.cpp 子模块切到带 Mali Q4_0 DMMV shape routing 的修订 |
-| v3.5 工作区 | 未提交 | CPU 单序列 decode/MTP persistent graph bucket reuse；Vulkan 暂时 fallback |
+| v3.5 | `71bd889` | CPU 单序列 decode/MTP persistent graph bucket reuse；Vulkan fallback |
+| v3.6 | `12272ae` | native session cache、decode 饥饿保护、native CUDA、memory metrics |
+| v3.6 fix | `cd6ced0` | 恢复 Qwen3.5 attention query gate |
+| v3.6 profile | `aabd733` | 暴露 draft/verification/KV catch-up 分段计时 |
 
 ## 2. 目录级总览
 
@@ -59,7 +59,7 @@ csrc/
     weights.{h,cpp}
 ```
 
-这是当前版本和原始版本最大的差异。原始项目的模型执行基本在 Python/PyTorch/CUDA 内；现在 Qwen3.5 native 路径把 GGUF 权重、GGML graph、CPU/Vulkan backend、KV cache、recurrent state 都放到了 C++ extension 里。
+这是当前版本和原始版本最大的差异。原始项目的模型执行基本在 Python/PyTorch/CUDA 内；现在 Qwen3.5 native 路径把 GGUF 权重、GGML graph、CPU/Vulkan/CUDA backend、KV cache、recurrent state 都放到了 C++ extension 里。
 
 ### 2.2 新增 backend 抽象
 
@@ -166,12 +166,13 @@ enable_graph_reuse: bool = True
   - `llamacpp_vulkan`
   - `native_cpu`
   - `native_vulkan`
+  - `native_cuda`
 - CUDA 后端仍要求 HF model；
 - GGUF 后端要求 `gguf_model`；
 - native 后端要求本地 HF tokenizer，因为 native runtime 不使用 llama.cpp tokenizer；
 - staged llama.cpp 后端可以使用 `tokenizer_backend="llamacpp"`；
 - native / llama.cpp 后端暂不支持 prefix cache 和 preemption；
-- MTP 只能用于 GGUF CPU/Vulkan 后端；
+- MTP 使用 native GGUF 后端；CPU/Vulkan 已完成实测，CUDA 尚待 NVIDIA 实机验收；
 - `max_num_batched_tokens` 必须能容纳 MTP verification window；
 - `num_kvcache_blocks` 默认由 `max_model_len` 和 `kvcache_block_size` 推导。
 
@@ -591,7 +592,7 @@ graph_reuse_stats()
 作用：
 
 - 检查 extension 是否正确构建；
-- 检查 CPU/Vulkan backend 是否可用；
+- 检查 CPU/Vulkan/CUDA backend 是否可用；
 - 检查 GGUF 读取；
 - 检查 Q4_0 matmul 是否能跑；
 - 检查 Qwen3.5 权重 contract 和 tensor binding。
@@ -633,9 +634,10 @@ nanovllm._C.Qwen35Runtime
 - `BackendKind`
   - CPU
   - Vulkan
+  - CUDA
 - `BackendConfig`
   - CPU threads
-  - Vulkan device index
+  - Vulkan/CUDA device index
 - `Backend`
   - RAII 管理 `ggml_backend_t`
   - 查询 default buffer type
@@ -644,11 +646,12 @@ nanovllm._C.Qwen35Runtime
 - `BackendList`
   - CPU-only
   - Vulkan-with-CPU
+  - CUDA-with-CPU
 
-为什么 Vulkan 模式有 CPU：
+为什么 accelerator 模式仍有 CPU：
 
 - GGML graph 里有些输入/metadata/host side tensor 更适合留在 CPU；
-- compute node 可以放 Vulkan，输入和小张量可以在 CPU 或由 scheduler 复制。
+- compute node 可以放 Vulkan/CUDA，输入和小张量可以在 CPU 或由 scheduler 复制。
 
 ## 14. GraphExecutor
 
@@ -668,8 +671,8 @@ nanovllm._C.Qwen35Runtime
 - 设置 tensor backend；
 - 处理 view tensor 的真实 source；
 - 检查 compute node placement；
-- Vulkan placement audit；
-- 确认所有 compute 节点是否真的在 Vulkan。
+- Vulkan/CUDA placement audit；
+- 确认所有 compute 节点是否真的在目标 accelerator。
 
 它支撑两个路径：
 
@@ -965,7 +968,7 @@ plane K = pending/target token 后的状态
 
 ```text
 validate options
-create CPU or Vulkan backend list
+create CPU、Vulkan or CUDA backend list
 load GGUF
 validate Qwen3.5 model contract
 bind weights
@@ -1037,7 +1040,7 @@ prepare optional persistent graph cache
 
 ### 21.6 v3.5 persistent graph reuse
 
-当前工作区新增：
+v3.5 新增、v3.6 保留：
 
 - `Qwen35RuntimeOptions.enable_graph_reuse`
 - `Qwen35GraphReuseStats`
@@ -1071,9 +1074,9 @@ bucket：
 - bucket 保存 graph metadata、scheduler allocation、临时 activation buffer、输入/输出 tensor 指针；
 - 命中时只更新输入 tensor/mask/hidden，然后 `compute()`。
 
-## 22. Native graph reuse 对 graph/backend/binding 的连带修改
+## 22. Native graph reuse 与 v3.6 连带修改
 
-当前 v3.5 工作区还修改了：
+v3.5 graph reuse 与后续 v3.6 共涉及：
 
 - `csrc/models/qwen35/graph.h`
 - `csrc/models/qwen35/graph.cpp`
@@ -1097,6 +1100,14 @@ bucket：
 - Python binding 暴露 `enable_graph_reuse` 和 `graph_reuse_stats()`；
 - CLI 增加 `--no-graph-reuse`；
 - benchmark 输出 graph cache 统计。
+
+v3.6 在这条 native 链路上继续增加：
+
+- `BackendKind::Cuda`、`[cuda, cpu]` backend layout 和 CUDA placement audit；
+- `Qwen35Runtime.memory_stats()`，统计 weights、PagedKV、recurrent state、graph metadata；
+- `Qwen35Runtime.mtp_profile_stats()`，统计 draft、verification、KV catch-up 的 calls/tokens/setup/elapsed；
+- Python binding 和 `NativeRunner` 的相应包装；
+- attention weighted value 恢复乘 `sigmoid(query_gate)`，再进入 output projection。
 
 ## 23. 构建系统修改
 
@@ -1152,8 +1163,8 @@ third_party/llama.cpp -> https://github.com/ggml-org/llama.cpp.git
 
 `scripts/build_native_runtime.sh` 做了：
 
-- CPU/Vulkan build dir 选择；
-- 可选 `NANOVLLM_NATIVE_VULKAN=ON`；
+- CPU/Vulkan/CUDA build dir 选择；
+- 可选 `NANOVLLM_NATIVE_VULKAN=ON` 或 `NANOVLLM_NATIVE_CUDA=ON`（互斥）；
 - Arm aarch64 dotprod/i8mm 自动探测；
 - 可选 `NANOVLLM_VULKAN_GLSLC`；
 - 编译 `_C`；
@@ -1203,7 +1214,7 @@ third_party/llama.cpp -> https://github.com/ggml-org/llama.cpp.git
 学习重点：
 
 - benchmark 不再只面向 CUDA；
-- 它已经成为 native CPU/Vulkan correctness/performance 验收入口。
+- 它已经成为 native CPU/Vulkan/CUDA correctness/performance 验收入口；当前实测数据主要来自 CPU 与 Mali Vulkan。
 
 ## 25. README 和学习文档
 
@@ -1217,11 +1228,11 @@ third_party/llama.cpp -> https://github.com/ggml-org/llama.cpp.git
 
 作用：
 
-- README 增加 native Qwen3.5 CPU/Vulkan runtime 说明；
+- README 增加 native Qwen3.5 CPU/Vulkan/CUDA runtime 说明；
 - `LEARNING_GUIDE.zh.md` 是原始 nano-vLLM 源码学习路线；
 - `run_pipeline.md` 记录早期 llama.cpp backend 执行流程；
-- `CURRENT_RUNTIME_FLOW.zh.md` 记录当前 v3.5 runtime 流程；
-- `CURRENT_VERSION_CHANGES.zh.md` 记录当前版本变更、测试和性能结果。
+- `CURRENT_RUNTIME_FLOW.zh.md` 记录当前 v3.6 runtime、session 和 MTP 流程；
+- `CURRENT_VERSION_CHANGES.zh.md` 记录 v3.5 到 v3.6 的文件变更、测试和性能结果。
 
 历史上曾有更多中间文档，例如 v1/v2/v3.0 专文，v3.1 后被合并整理到当前两个 `CURRENT_*` 文档中。
 
@@ -1253,11 +1264,7 @@ tests/test_qwen35_stages.py
 - staged Qwen3.5 逻辑；
 - MTP 预留 block、greedy-only、prefix/preemption 禁用等行为。
 
-当前未跟踪文件：
-
-- `tests/test_native_qwen35_long_context_oracle.py`
-
-这个文件应加入版本控制，否则别人拉代码时不会得到长上下文/v3.5 bucket 升档验证。
+`tests/test_native_qwen35_long_context_oracle.py` 已纳入版本控制；v3.6 继续扩展 native backend、session 生命周期、调度公平性、memory stats 和 attention gate 的测试覆盖。
 
 ## 27. pyproject 修改
 
@@ -1289,7 +1296,7 @@ nanovllm-bench = "nanovllm.cli.bench:main"
 
 原因：
 
-- CPU/Vulkan native path 不应该强制安装 CUDA 栈；
+- CPU/Vulkan native path 不应该强制安装 CUDA 栈；native CUDA 使用单独构建环境。
 - CLI 需要可安装入口。
 
 ## 28. example.py 修改
@@ -1336,7 +1343,7 @@ Python scheduler
   -> Qwen35Runtime
   -> TargetChunkGraph / TokenGraph / MtpKvUpdateGraph
   -> PagedKV + RecurrentState
-  -> GGML CPU/Vulkan backend
+  -> GGML CPU/Vulkan/CUDA backend
 ```
 
 ## 30. Qwen2.5 / staged 路径和 Qwen3.5 native 路径的区别
@@ -1359,7 +1366,7 @@ nano-vLLM scheduler
   -> 自己构建 Qwen3.5 graph
   -> 自己管理 target/MTP PagedKV
   -> 自己管理 recurrent state
-  -> 只借 GGML CPU/Vulkan backend 和算子
+  -> 只借 GGML CPU/Vulkan/CUDA backend 和算子
 ```
 
 所以 Qwen3.5 的支持工作不是简单“换模型名”，而是实现了一个专用 runtime。
@@ -1524,30 +1531,28 @@ nanovllm/sampling_params.py
 pyproject.toml
 ```
 
-### 32.3 当前 v3.5 工作区未提交修改文件
+### 32.3 当前 v3.6 重点修改文件
 
 ```text
 CMakeLists.txt
-CURRENT_RUNTIME_FLOW.zh.md
-CURRENT_VERSION_CHANGES.zh.md
+scripts/build_native_runtime.sh
 csrc/models/qwen35/graph.cpp
-csrc/models/qwen35/graph.h
 csrc/native_module.cpp
 csrc/python/qwen35_runtime_binding.cpp
-csrc/runtime/backend.cpp
-csrc/runtime/backend.h
-csrc/runtime/qwen35_runtime.cpp
-csrc/runtime/qwen35_runtime.h
+csrc/runtime/backend.{h,cpp}
+csrc/runtime/graph_executor.{h,cpp}
+csrc/runtime/qwen35_runtime.{h,cpp}
+nanovllm/backends/{__init__,base}.py
 nanovllm/backends/native/runner.py
-nanovllm/cli/bench.py
-nanovllm/cli/chat.py
+nanovllm/cli/{bench,chat}.py
 nanovllm/config.py
-tests/native/test_graph_executor.cpp
+nanovllm/engine/{llm_engine,scheduler,sequence}.py
+tests/test_native_backend_config.py
 tests/test_native_runner.py
-tests/test_native_runtime.py
+tests/test_qwen35_stages.py
 ```
 
-这些主要对应 v3.5 graph reuse、stats、Vulkan fallback 和文档更新。
+这些是已提交的 v3.5/v3.6 版本代码：v3.5 graph reuse，v3.6 session/fair scheduling/CUDA/memory+MTP profile，以及 attention gate 正确性修复。
 
 ## 33. 最容易遗漏但很重要的小改动
 

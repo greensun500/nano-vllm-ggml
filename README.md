@@ -54,10 +54,10 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
-## In-tree Qwen3.5 CPU/Vulkan runtime
+## In-tree Qwen3.5 CPU/Vulkan/CUDA runtime
 
 The new runtime keeps request scheduling and cache ownership in nano-vLLM and
-statically embeds only the official GGML CPU/Vulkan implementation. It does not
+statically embeds only the official GGML CPU/Vulkan/CUDA implementation. It does not
 link `llama`, construct a `llama_context`, or require `--library-path`.
 
 ```bash
@@ -66,6 +66,11 @@ git submodule update --init --recursive
 
 # Build one module containing CPU plus Vulkan:
 NANOVLLM_NATIVE_VULKAN=ON ./scripts/build_native_runtime.sh
+
+# On Mali, point at a glslc that supports cooperative matrix and integer-dot shaders:
+NANOVLLM_NATIVE_VULKAN=ON \
+NANOVLLM_VULKAN_GLSLC=/path/to/glslc-2025.2 \
+./scripts/build_native_runtime.sh
 ```
 
 The native path implements the 24-layer Qwen3.5-2B target graph, six
@@ -86,6 +91,12 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat \
   --temperature 0
 ```
 
+The interactive native chat CLI retains one `ChatSession`: the first turn
+prefills the complete prompt, while later turns append only new tokens and
+reuse the same native sequence slot, PagedKV and recurrent state. `/reset` and
+`/system` release that state and begin a fresh session. This is per-session
+retention, not cross-request prefix caching.
+
 After a Vulkan-enabled build, change only the execution backend:
 
 ```bash
@@ -97,9 +108,12 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat \
   --max-num-batched-tokens 256 \
   --max-num-seqs 1 \
   --enable-mtp \
-  --mtp-max-draft-tokens 3 \
+  --mtp-max-draft-tokens 1 \
   --temperature 0
 ```
+
+On the current Mali long-decode benchmark, Vulkan MTP has not exceeded MTP-off
+throughput even with `K=1`; keep it opt-in and benchmark the target workload.
 
 For an NVIDIA machine, build the same native extension with GGML CUDA and then
 select `native_cuda`:
