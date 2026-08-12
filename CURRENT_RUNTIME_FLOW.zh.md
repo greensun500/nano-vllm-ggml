@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.4
+# nano-vLLM 当前执行流程：v3.5
 
 ## 1. 架构边界
 
@@ -33,10 +33,11 @@ LLM(config)
   -> load model tensors
   -> allocate target/MTP PagedKV
   -> allocate recurrent canonical/snapshot planes
-  -> create GGML graph scheduler
+  -> create fallback GGML graph scheduler
+  -> lazy persistent graph bucket cache
 ```
 
-Vulkan 模式把模型 compute node 固定到 Vulkan，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。
+Vulkan 模式把模型 compute node 固定到 Vulkan，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。v3.5 默认开启 `enable_graph_reuse`，CPU 单序列 decode/MTP 会 lazy 创建 persistent graph bucket；多序列、Vulkan 和 prefill/chunk 仍走 fallback scheduler。
 
 ## 4. Python 执行计划
 
@@ -135,7 +136,7 @@ MTP(d1,  m0,      p+1) -> d2, m1
 MTP(d2,  m1,      p+2) -> d3
 ```
 
-三步有真实自回归依赖，v3.3 仍执行三张串行 draft graph。每步包含 MTP layer、tied vocab head 和 greedy argmax。
+三步有真实自回归依赖，v3.5 仍执行三张串行 draft graph。每步包含 MTP layer、tied vocab head 和 greedy argmax；单序列时 draft graph 使用 fixed `n_kv` bucket 复用同一个 graph/executor。
 
 ### 8.2 Target verification
 
@@ -172,7 +173,7 @@ positions     = p+1 ... p+a
 write_slots   = committed slots
 ```
 
-`a=0` 时不执行 catch-up。该 graph 在 v3.3 仍与 verification 分离。
+`a=0` 时不执行 catch-up。该 graph 在 v3.5 仍与 verification 分离，但单序列时 `T=1..K` 的 KV-only graph 会进入 persistent cache。
 
 ## 9. 图数、同步与 readback
 
@@ -193,7 +194,18 @@ readback 规则：
 - verification：读取 K+1 predictions 与全部 target hidden；
 - MTP KV-only：无 host 输出。
 
-`GraphExecutor::compute()` 使用同步 GGML scheduler API，graph guard 退出时 reset transient allocation。当前每轮仍会重建 graph metadata/context，尚未做 persistent graph bucket。
+`GraphExecutor::compute()` 使用同步 GGML scheduler API。fallback 路径仍在 graph guard 退出时 reset transient allocation，并按轮重建 graph metadata。
+
+v3.5 的 CPU graph reuse 路径按 key 常驻独立 executor：
+
+```text
+graph_kind + T + n_kv_bucket + output_mode + snapshot_count
+  + sequence_slot + input_plane + retain_hidden
+```
+
+entry 首次 miss 时构图、Vulkan placement、scheduler allocation；命中时只更新 token、position、read/write slots、mask 和 hidden input，然后重复 `compute()`。bucket 只保存 graph metadata、scheduler allocation 和 transient activation buffer，不保存 KV cache、不复制权重。
+
+`n_kv_bucket` 默认使用 `128/256/512/1024/2048/4096/max_model_len`。真实 KV slot 放在前缀，padding slot 重复最后一个真实 slot，并通过 causal mask 屏蔽；上下文不会被截断。
 
 ## 10. Release
 
@@ -202,7 +214,8 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 ## 11. 当前 backend 策略边界
 
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
-- v3.4 默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
+- v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
+- v3.5 graph reuse 只保证 CPU 单序列 decode/MTP；Vulkan padded-mask bucket 仍需独立修正，当前 fallback 到每轮构图。
 - CPU 权重当前仍在 default buffer，尚未进入 CPU_REPACK。
 - MTP 的串行 draft、tied Q6_K head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。
 
@@ -238,4 +251,4 @@ python3 -m nanovllm.cli.bench "$MODEL" ... \
   --prompt-len 521 --gen-len 129 --warmup 1 --repeat 3 --json
 ```
 
-MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`。
+MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。

@@ -90,13 +90,13 @@ GraphExecutor::GraphExecutor(
     bool parallel,
     bool op_offload)
     : backends_(&backends), graph_size_(graph_size) {
-    validate_backend_layout(backends);
+    validate_backend_layout(backends);//检查后端布局是否符合要求目前只支持[cpu]或[vulkan, cpu]两种布局
     if (graph_size_ == 0) {
         throw GraphExecutorError("graph_size must be greater than zero");
     }
 
-    backend_handles_ = backends.raw_handles();
-    buffer_types_ = backends.default_buffer_types();
+    backend_handles_ = backends.raw_handles();//获取后端的原始句柄列表
+    buffer_types_ = backends.default_buffer_types();//获取后端的默认缓冲区类型列表
     if (backend_handles_.size() != buffer_types_.size()) {
         throw GraphExecutorError("backend handle and buffer-type counts do not match");
     }
@@ -107,14 +107,16 @@ GraphExecutor::GraphExecutor(
         static_cast<int>(backend_handles_.size()),
         graph_size_,
         parallel,
-        op_offload);
+        op_offload);//创建一个新的GGML调度器，传入后端句柄、缓冲区类型、后端数量、图大小、是否并行和操作卸载标志
     if (scheduler_ == nullptr) {
         throw GraphExecutorError("ggml_backend_sched_new returned a null scheduler");
     }
 
-    const int scheduler_backends = ggml_backend_sched_get_n_backends(scheduler_);
+    const int scheduler_backends = ggml_backend_sched_get_n_backends(scheduler_);// 获取调度器中后端的数量
+
+    // 检查调度器是否保留了请求的后端数量，否则把调度器释放掉并抛出异常
     if (scheduler_backends != static_cast<int>(backend_handles_.size())) {
-        ggml_backend_sched_free(scheduler_);
+        ggml_backend_sched_free(scheduler_);        // 把调度器释放掉
         scheduler_ = nullptr;
         throw GraphExecutorError("GGML scheduler did not retain the requested backend count");
     }

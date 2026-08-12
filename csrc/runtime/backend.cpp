@@ -184,6 +184,16 @@ std::vector<BackendDeviceInfo> available_backend_devices() {
 Backend::Backend(const BackendConfig & config)
     : handle_(create_backend_handle(config)), config_(config) {
     try {
+        if (config_.kind == BackendKind::Cpu) {
+            ggml_threadpool_params params =
+                ggml_threadpool_params_default(config_.cpu_threads);
+            threadpool_ = ggml_threadpool_new(&params);
+            if (threadpool_ == nullptr) {
+                throw std::runtime_error("failed to create the persistent GGML CPU threadpool");
+            }
+            ggml_backend_cpu_set_threadpool(handle_, threadpool_);
+        }
+
         std::string fallback_description;
 #if NANOVLLM_NATIVE_HAS_VULKAN
         if (config_.kind == BackendKind::Vulkan) {
@@ -197,35 +207,54 @@ Backend::Backend(const BackendConfig & config)
             handle_, config_.kind, config_.device_index, fallback_description);
         name_ = safe_string(ggml_backend_name(handle_), backend_kind_name(config_.kind));
     } catch (...) {
-        ggml_backend_free(handle_);
-        handle_ = nullptr;
+        release();
         throw;
     }
 }
 
 Backend::~Backend() {
-    if (handle_ != nullptr) {
-        ggml_backend_free(handle_);
-    }
+    release();
 }
 
 Backend::Backend(Backend && other) noexcept
     : handle_(std::exchange(other.handle_, nullptr)),
+      threadpool_(std::exchange(other.threadpool_, nullptr)),
       config_(other.config_),
       device_info_(std::move(other.device_info_)),
       name_(std::move(other.name_)) {}
 
 Backend & Backend::operator=(Backend && other) noexcept {
     if (this != &other) {
-        if (handle_ != nullptr) {
-            ggml_backend_free(handle_);
-        }
+        release();
         handle_ = std::exchange(other.handle_, nullptr);
+        threadpool_ = std::exchange(other.threadpool_, nullptr);
         config_ = other.config_;
         device_info_ = std::move(other.device_info_);
         name_ = std::move(other.name_);
     }
     return *this;
+}
+
+void Backend::release() noexcept {
+    if (handle_ != nullptr) {
+        if (threadpool_ != nullptr) {
+            // The threadpool is externally owned by Backend.  Stop all work and
+            // remove the CPU backend's borrowed reference before either object
+            // is destroyed.
+            ggml_backend_synchronize(handle_);
+            ggml_backend_cpu_set_threadpool(handle_, nullptr);
+        }
+        ggml_backend_free(handle_);
+        handle_ = nullptr;
+    }
+    if (threadpool_ != nullptr) {
+        ggml_threadpool_free(threadpool_);
+        threadpool_ = nullptr;
+    }
+}
+
+int Backend::threadpool_threads() const noexcept {
+    return threadpool_ == nullptr ? 0 : config_.cpu_threads;
 }
 
 ggml_backend_buffer_type_t Backend::default_buffer_type() const {

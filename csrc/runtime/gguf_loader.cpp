@@ -19,7 +19,7 @@ GgufWeights::GgufWeights(std::string path) : path_(std::move(path)) {
     gguf_init_params params{};
     params.no_alloc = true;
     params.ctx = &tensor_ctx_;
-    gguf_ = gguf_init_from_file(path_.c_str(), params);
+    gguf_ = gguf_init_from_file(path_.c_str(), params); //初始化GGUF上下文，读取GGUF文件的元数据和tensor描述符
     if (gguf_ == nullptr || tensor_ctx_ == nullptr) {
         if (tensor_ctx_ != nullptr) {
             ggml_free(tensor_ctx_);
@@ -29,11 +29,11 @@ GgufWeights::GgufWeights(std::string path) : path_(std::move(path)) {
     }
 
     try {
-        const int64_t count = gguf_get_n_tensors(gguf_);
-        tensors_.reserve(static_cast<size_t>(count));
-        for (int64_t index = 0; index < count; ++index) {
+        const int64_t count = gguf_get_n_tensors(gguf_);    //获取GGUF文件中tensor的数量
+        tensors_.reserve(static_cast<size_t>(count));   //预留空间，避免频繁的内存分配
+        for (int64_t index = 0; index < count; ++index) {   //遍历每个tensor
             const char * name = gguf_get_tensor_name(gguf_, index);
-            ggml_tensor * tensor = ggml_get_tensor(tensor_ctx_, name);
+            ggml_tensor * tensor = ggml_get_tensor(tensor_ctx_, name);  //根据tensor的名字获取对应的ggml_tensor对象
             if (tensor == nullptr) {
                 throw load_error(path_, "GGML descriptor is missing tensor '" + std::string(name) + "'");
             }
@@ -85,8 +85,8 @@ void GgufWeights::load(ggml_backend_t backend, size_t chunk_bytes) {
         throw std::invalid_argument("GGUF upload chunk size must be positive");
     }
 
-    const ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-    buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx_, buft);
+    const ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);//获取后端的默认缓冲区类型描述
+    buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx_, buft);  //在后端的默认缓冲区中为GGUF文件中的所有tensor分配内存，并返回一个指向该缓冲区的指针
     if (buffer_ == nullptr) {
         throw load_error(path_, "backend weight-buffer allocation failed");
     }
@@ -95,7 +95,7 @@ void GgufWeights::load(ggml_backend_t backend, size_t chunk_bytes) {
         throw load_error(path_, "backend returned an unexpected buffer type");
     }
 
-    try {
+    try {//此时缓冲区已经分配好了，接下来将GGUF文件中的tensor数据上传到后端缓冲区中
         std::ifstream file(path_, std::ios::binary);
         if (!file) {
             throw load_error(path_, "could not reopen file for tensor upload");

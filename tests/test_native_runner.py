@@ -63,6 +63,7 @@ def make_config(**overrides):
         "num_kvcache_blocks": 8,
         "enable_mtp": False,
         "mtp_max_draft_tokens": 3,
+        "enable_graph_reuse": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -139,6 +140,7 @@ class NativeRunnerTests(unittest.TestCase):
                 "device_index": 1,
                 "enable_mtp": False,
                 "mtp_max_draft_tokens": 3,
+                "enable_graph_reuse": True,
             },
         )
         self.assertNotIn("library_path", kwargs)

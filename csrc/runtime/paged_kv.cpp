@@ -61,7 +61,7 @@ void set_name(ggml_tensor * tensor, const std::string & name) {
 
 PagedKvCacheError::PagedKvCacheError(const std::string & message) : std::runtime_error(message) {}
 
-PagedKvCache::PagedKvCache(
+PagedKvCache::PagedKvCache(//初始化pagedkv缓存
     ggml_backend_t backend,
     const qwen35::Config & model_config,
     std::size_t block_size,
@@ -101,11 +101,11 @@ PagedKvCache::PagedKvCache(
 
     std::vector<std::uint32_t> target_layer_ids;
     for (std::uint32_t layer = 0; layer < model_config.main_layers; ++layer) {
-        if (model_config.is_full_attention_layer(layer)) {
+        if (model_config.is_full_attention_layer(layer)) {//把attention的层都放到target_layer_ids中
             target_layer_ids.push_back(layer);
         }
     }
-    if (target_layer_ids.size() != 6) {
+    if (target_layer_ids.size() != 6) {//这个是针对Qwen3.5模型的，Qwen3.5模型有6个full attention层,如果后续拓展其他模型，这里应该不需要
         std::ostringstream message;
         message << "expected exactly 6 target full-attention layers, got "
                 << target_layer_ids.size();
@@ -117,15 +117,15 @@ PagedKvCache::PagedKvCache(
             "the first native MTP cache requires exactly one bundled prediction layer"));
     }
 
-    const std::size_t tensor_count = (target_layer_ids.size() + (enable_mtp ? 1 : 0)) * 2;
+    const std::size_t tensor_count = (target_layer_ids.size() + (enable_mtp ? 1 : 0)) * 2;//kv两种cache，所以是两倍
     const std::size_t metadata_bytes = checked_product(
-        tensor_count, ggml_tensor_overhead(), "persistent tensor metadata size");
-    ggml_init_params params{
-        /* .mem_size = */ metadata_bytes,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc = */ true,
+        tensor_count, ggml_tensor_overhead(), "persistent tensor metadata size");//计算metadata所需的字节数
+    ggml_init_params params{        //ggml的初始化参数
+        /* .mem_size = */ metadata_bytes,   //总容量
+        /* .mem_buffer = */ nullptr,    //如果为nullptr，ggml会自己分配内存
+        /* .no_alloc = */ true, //ggml会为metadata(tensor shape\type访问很快，先分配内存，tensor的内存后面才会进行分配，
     };
-    tensor_ctx_ = ggml_init(params);
+    tensor_ctx_ = ggml_init(params);    //创建空的ggml上下文（只是能放下12个tensor的metadata，tensor的内存还没有分配）
     if (tensor_ctx_ == nullptr) {
         throw PagedKvCacheError(cache_error_message("could not allocate persistent tensor metadata"));
     }
@@ -136,7 +136,7 @@ PagedKvCache::PagedKvCache(
             PagedKvLayer layer;
             layer.domain = PagedKvDomain::Target;
             layer.model_layer = model_layer;
-            layer.key = ggml_new_tensor_2d(
+            layer.key = ggml_new_tensor_2d( //只是写入了tensor的metadata，tensor的data部分还只是指针
                 tensor_ctx_,
                 GGML_TYPE_F32,
                 key_width_,
@@ -180,7 +180,7 @@ PagedKvCache::PagedKvCache(
             throw PagedKvCacheError(cache_error_message("backend has no default buffer type"));
         }
         assert_buffer_type_compatible(backend_, buffer_type, "Paged-KV allocation");
-        buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx_, buffer_type);
+        buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx_, buffer_type);//遍历所有tensor，确认所有tensor需要多大的空间，然后分配连续的空间，并把data的指针赋值过来
         if (buffer_ == nullptr) {
             throw PagedKvCacheError(cache_error_message("persistent backend-buffer allocation failed"));
         }

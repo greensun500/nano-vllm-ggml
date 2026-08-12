@@ -20,6 +20,7 @@ namespace nanovllm::python {
 namespace {
 
 using nanovllm::native::Qwen35ExecutionPlan;
+using nanovllm::native::Qwen35GraphReuseStats;
 using nanovllm::native::Qwen35MtpResult;
 using nanovllm::native::Qwen35Runtime;
 using nanovllm::native::Qwen35RuntimeOptions;
@@ -325,6 +326,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     PyObject * device_index_object = nullptr;
     PyObject * enable_mtp_object = nullptr;
     PyObject * mtp_max_draft_tokens_object = nullptr;
+    PyObject * enable_graph_reuse_object = Py_True;
     static const char * keywords[] = {
         "model_path",
         "backend",
@@ -337,12 +339,13 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         "device_index",
         "enable_mtp",
         "mtp_max_draft_tokens",
+        "enable_graph_reuse",
         nullptr,
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO:Qwen35Runtime",
+            "OOOOOOOOOOO|O:Qwen35Runtime",
             const_cast<char **>(keywords),
             &model_path_object,
             &backend_object,
@@ -354,7 +357,8 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             &n_threads_object,
             &device_index_object,
             &enable_mtp_object,
-            &mtp_max_draft_tokens_object)) {
+            &mtp_max_draft_tokens_object,
+            &enable_graph_reuse_object)) {
         return -1;
     }
     if (self->runtime != nullptr) {
@@ -407,7 +411,11 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         !parse_size(
             mtp_max_draft_tokens_object,
             "mtp_max_draft_tokens",
-            options.mtp_max_draft_tokens)) {
+            options.mtp_max_draft_tokens) ||
+        !parse_bool(
+            enable_graph_reuse_object,
+            "enable_graph_reuse",
+            options.enable_graph_reuse)) {
         return -1;
     }
 
@@ -594,6 +602,46 @@ PyObject * runtime_shutdown(PyObject * self_object, PyObject *) {
     }
 }
 
+PyObject * runtime_graph_reuse_stats(PyObject * self_object, PyObject *) {
+    auto * self = reinterpret_cast<PyQwen35Runtime *>(self_object);
+    Qwen35Runtime * runtime = require_runtime(self);
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        Qwen35GraphReuseStats stats;
+        {
+            AllowThreads allow_threads;
+            stats = runtime->graph_reuse_stats();
+        }
+        PyObject * result = PyDict_New();
+        if (result == nullptr) {
+            return nullptr;
+        }
+        const auto set_uint = [&](const char * key, std::uint64_t value) -> bool {
+            PyObject * object = PyLong_FromUnsignedLongLong(
+                static_cast<unsigned long long>(value));
+            if (object == nullptr) {
+                return false;
+            }
+            const int status = PyDict_SetItemString(result, key, object);
+            Py_DECREF(object);
+            return status == 0;
+        };
+        if (!set_uint("hits", stats.hits) ||
+            !set_uint("misses", stats.misses) ||
+            !set_uint("evictions", stats.evictions) ||
+            !set_uint("active_entries", stats.active_entries)) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        return result;
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
 PyCFunction cast_keyword_function(PyCFunctionWithKeywords function) noexcept {
     static_assert(
         sizeof(PyCFunction) == sizeof(PyCFunctionWithKeywords),
@@ -611,6 +659,8 @@ PyMethodDef runtime_methods[] = {
     {"release_blocks", cast_keyword_function(runtime_release_blocks),
      METH_VARARGS | METH_KEYWORDS,
      "Release nano-vLLM Paged-KV blocks and native sequence state."},
+    {"graph_reuse_stats", runtime_graph_reuse_stats, METH_NOARGS,
+     "Return persistent graph cache hit/miss/eviction counters."},
     {"shutdown", runtime_shutdown, METH_NOARGS,
      "Synchronize and shut down the native runtime. This operation is idempotent."},
     {nullptr, nullptr, 0, nullptr},
@@ -637,7 +687,7 @@ PyObject * runtime_new(PyTypeObject * type, PyObject *, PyObject *) {
 
 }  // namespace
 
-int register_qwen35_runtime_type(PyObject * module) {
+int register_qwen35_runtime_type(PyObject * module) {//注册Qwen35Runtime类型到Python模块
     if (module == nullptr) {
         PyErr_SetString(PyExc_SystemError, "cannot register Qwen35Runtime on a null module");
         return -1;

@@ -15,7 +15,14 @@ class TestNativeRuntime(unittest.TestCase):
         info = self.native.build_info()
         self.assertEqual(info["runtime"], "nanovllm_native")
         self.assertEqual(info["abi_version"], 1)
+        self.assertEqual(
+            info["ggml_commit"], "5ed33380b4679533243ca45e172804d5ddfe59ec"
+        )
+        self.assertEqual(
+            info["ggml_base_commit"], "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb"
+        )
         self.assertTrue(info["cpu"])
+        self.assertTrue(info["persistent_cpu_threadpool"])
         self.assertFalse(info["uses_llama_context"])
 
     def test_cpu_matmul_graph(self):

@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -89,6 +90,24 @@ void run_test() {
             "SET_ROWS must not be a pure metadata view");
 
     BackendList backends = BackendList::cpu_only(1);
+    require(backends.at(0).has_persistent_threadpool(),
+            "CPU backend must own a persistent threadpool");
+    require(backends.at(0).threadpool_threads() == 1,
+            "CPU threadpool must use the configured thread count");
+
+    nanovllm::native::Backend moved_from(nanovllm::native::BackendConfig::cpu(2));
+    nanovllm::native::Backend moved_to(std::move(moved_from));
+    require(moved_from.get() == nullptr && !moved_from.has_persistent_threadpool(),
+            "moving a CPU backend must clear both source handles");
+    require(moved_to.has_persistent_threadpool() && moved_to.threadpool_threads() == 2,
+            "moving a CPU backend must transfer its persistent threadpool");
+    nanovllm::native::Backend move_assigned(nanovllm::native::BackendConfig::cpu(1));
+    move_assigned = std::move(moved_to);
+    require(moved_to.get() == nullptr && !moved_to.has_persistent_threadpool(),
+            "move-assigning a CPU backend must clear both source handles");
+    require(move_assigned.has_persistent_threadpool() &&
+                move_assigned.threadpool_threads() == 2,
+            "move-assigning a CPU backend must transfer its persistent threadpool");
 
     ContextHandle persistent_context;
     ggml_tensor * copy_destination =
@@ -184,6 +203,9 @@ void run_test() {
     ggml_backend_tensor_set(copy_source, copy_data.data(), 0, sizeof(copy_data));
     ggml_backend_tensor_set(rows_source, row_data.data(), 0, sizeof(row_data));
     ggml_backend_tensor_set(row_index, &index, 0, sizeof(index));
+    // Re-enter graph execution through the same Backend to exercise reuse of
+    // its externally owned threadpool across compute calls.
+    executor.compute(graph);
     executor.compute(graph);
     executor.synchronize();
 

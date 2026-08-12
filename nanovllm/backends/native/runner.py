@@ -57,6 +57,7 @@ class NativeRunner:
             device_index=int(device_config.get("device_index", 0)),
             enable_mtp=bool(config.enable_mtp),
             mtp_max_draft_tokens=int(config.mtp_max_draft_tokens),
+            enable_graph_reuse=bool(getattr(config, "enable_graph_reuse", True)),
         )
 
     @staticmethod
@@ -204,6 +205,19 @@ class NativeRunner:
             "drafted_tokens": self.mtp_drafted_tokens,
             "accepted_tokens": self.mtp_accepted_tokens,
             "verification_steps": self.mtp_verification_steps,
+        }
+
+    def graph_reuse_stats(self) -> dict[str, int]:
+        runtime = self._require_live_runtime()
+        method = getattr(runtime, "graph_reuse_stats", None)
+        if not callable(method):
+            return {"hits": 0, "misses": 0, "evictions": 0, "active_entries": 0}
+        stats = method()
+        return {
+            "hits": int(stats.get("hits", 0)),
+            "misses": int(stats.get("misses", 0)),
+            "evictions": int(stats.get("evictions", 0)),
+            "active_entries": int(stats.get("active_entries", 0)),
         }
 
     def _make_native_plan(self, plan: BackendExecutionPlan) -> dict[str, Any]:

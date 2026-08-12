@@ -57,6 +57,8 @@ public:
     BackendKind kind() const noexcept { return config_.kind; }
     const BackendConfig & config() const noexcept { return config_; }
     const BackendDeviceInfo & device_info() const noexcept { return device_info_; }
+    bool has_persistent_threadpool() const noexcept { return threadpool_ != nullptr; }
+    int threadpool_threads() const noexcept;
 
     const std::string & name() const noexcept { return name_; }
     ggml_backend_buffer_type_t default_buffer_type() const;
@@ -64,7 +66,10 @@ public:
     void synchronize() const;
 
 private:
+    void release() noexcept;
+
     ggml_backend_t handle_ = nullptr;
+    ggml_threadpool_t threadpool_ = nullptr;
     BackendConfig config_{};
     BackendDeviceInfo device_info_{};
     std::string name_;

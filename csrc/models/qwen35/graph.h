@@ -70,6 +70,7 @@ struct TokenGraph {
     ggml_tensor * positions = nullptr;   // I32 [4], IMRoPE channels
     ggml_tensor * write_slot = nullptr;  // I32 [1]
     ggml_tensor * read_slots = nullptr;  // I32 [n_kv]
+    ggml_tensor * causal_mask = nullptr; // F32 [n_kv, 1], optional
     ggml_tensor * hidden_input = nullptr;  // MTP only: F32 [2048, 1]
 
     ggml_tensor * hidden = nullptr;       // F32 [2048, 1], pre-LM-head
@@ -126,7 +127,8 @@ TokenGraph build_target_token_graph(
     const Qwen35Weights & weights,
     const TargetPersistentView & persistent,
     std::size_t n_kv,
-    bool emit_greedy);
+    bool emit_greedy,
+    bool use_causal_mask = false);
 
 TargetChunkGraph build_target_chunk_graph(
     ggml_context * ctx,
@@ -136,14 +138,16 @@ TargetChunkGraph build_target_chunk_graph(
     std::size_t n_kv,
     std::size_t snapshot_count,
     TargetChunkOutputMode output_mode,
-    bool retain_hidden);
+    bool retain_hidden,
+    bool force_causal_mask = false);
 
 TokenGraph build_mtp_token_graph(
     ggml_context * ctx,
     const Qwen35Weights & weights,
     const AttentionCacheView & cache,
     std::size_t n_kv,
-    bool emit_greedy);
+    bool emit_greedy,
+    bool use_causal_mask = false);
 
 MtpKvUpdateGraph build_mtp_kv_update_graph(
     ggml_context * ctx,

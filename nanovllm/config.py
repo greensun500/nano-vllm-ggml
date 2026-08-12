@@ -29,6 +29,7 @@ class Config:
     enable_preemption: bool | None = None
     enable_mtp: bool = False
     mtp_max_draft_tokens: int = 3
+    enable_graph_reuse: bool = True
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 

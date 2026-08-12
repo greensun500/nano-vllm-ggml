@@ -28,6 +28,11 @@ class BenchResult:
     mtp_accepted_tokens: int
     mtp_verification_steps: int
     mtp_acceptance_rate: float
+    enable_graph_reuse: bool
+    graph_cache_hits: int
+    graph_cache_misses: int
+    graph_cache_evictions: int
+    graph_cache_active_entries: int
     ggml_commit: str
     vulkan_compiled: bool
     load_s: float
@@ -113,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "3")),
     )
     parser.add_argument(
+        "--no-graph-reuse",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NO_GRAPH_REUSE", "0") == "1",
+        help="Disable native persistent graph bucket reuse for A/B measurements.",
+    )
+    parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
         help="Reuse identical prompts across runs to benchmark prefix-cache behavior.",
@@ -154,6 +165,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             num_kvcache_blocks=args.num_kvcache_blocks,
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+            enable_graph_reuse=not args.no_graph_reuse,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,
@@ -338,6 +350,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         "accepted_tokens": 0,
         "verification_steps": 0,
     }
+    graph_stats = {"hits": 0, "misses": 0, "evictions": 0, "active_entries": 0}
     actual_num_kvcache_blocks = int(llm.config.num_kvcache_blocks)
     actual_model = os.fspath(llm.config.gguf_model or llm.config.model)
     ggml_commit = ""
@@ -349,6 +362,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         ggml_commit = str(native_info["ggml_commit"])
         vulkan_compiled = bool(native_info["vulkan"])
     get_mtp_stats = getattr(llm.model_runner, "mtp_stats", None)
+    get_graph_stats = getattr(llm.model_runner, "graph_reuse_stats", None)
     try:
         run_index = 0
         for _ in range(args.warmup):
@@ -375,6 +389,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     finally:
         if callable(get_mtp_stats):
             mtp_stats.update(get_mtp_stats())
+        if callable(get_graph_stats):
+            graph_stats.update(get_graph_stats())
         llm.exit()
 
     prefill_tok_s = totals["prefill_tokens"] / totals["prefill_s"] if totals["prefill_s"] > 0 else 0.0
@@ -405,6 +421,11 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
             mtp_stats["verification_steps"] - mtp_baseline["verification_steps"]
         ),
         mtp_acceptance_rate=acceptance_rate,
+        enable_graph_reuse=not args.no_graph_reuse,
+        graph_cache_hits=int(graph_stats["hits"]),
+        graph_cache_misses=int(graph_stats["misses"]),
+        graph_cache_evictions=int(graph_stats["evictions"]),
+        graph_cache_active_entries=int(graph_stats["active_entries"]),
         ggml_commit=ggml_commit,
         vulkan_compiled=vulkan_compiled,
         load_s=load_s,
@@ -437,6 +458,7 @@ def print_result(result: BenchResult) -> None:
     print(f"device index:       {result.device_index}")
     print(f"KV blocks:          {result.num_kvcache_blocks}")
     print(f"MTP:                {result.enable_mtp} (K={result.mtp_max_draft_tokens})")
+    print(f"graph reuse:        {result.enable_graph_reuse}")
     if result.ggml_commit:
         print(f"GGML commit:        {result.ggml_commit}")
         print(f"Vulkan compiled:    {result.vulkan_compiled}")
@@ -455,6 +477,11 @@ def print_result(result: BenchResult) -> None:
             f"{result.mtp_drafted_tokens}/{result.mtp_accepted_tokens}/"
             f"{result.mtp_verification_steps}; acceptance={result.mtp_acceptance_rate:.2%}"
         )
+    print(
+        "graph cache hits/misses/evictions/active: "
+        f"{result.graph_cache_hits}/{result.graph_cache_misses}/"
+        f"{result.graph_cache_evictions}/{result.graph_cache_active_entries}"
+    )
 
 
 def main() -> int:

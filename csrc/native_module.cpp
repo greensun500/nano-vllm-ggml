@@ -112,8 +112,11 @@ PyObject * py_build_info(PyObject *, PyObject *) {
         dict_set_owned(info, "runtime", PyUnicode_FromString("nanovllm_native")) &&
         dict_set_owned(info, "abi_version", PyLong_FromLong(1)) &&
         dict_set_owned(info, "ggml_commit", PyUnicode_FromString(NANOVLLM_GGML_COMMIT)) &&
+        dict_set_owned(
+            info, "ggml_base_commit", PyUnicode_FromString(NANOVLLM_GGML_BASE_COMMIT)) &&
         dict_set_owned(info, "cpu", PyBool_FromLong(1)) &&
         dict_set_owned(info, "vulkan", PyBool_FromLong(NANOVLLM_NATIVE_HAS_VULKAN)) &&
+        dict_set_owned(info, "persistent_cpu_threadpool", PyBool_FromLong(1)) &&
         dict_set_owned(info, "uses_llama_context", PyBool_FromLong(0));
     if (!ok) {
         Py_DECREF(info);

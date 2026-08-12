@@ -447,10 +447,10 @@ ggml_tensor * RecurrentStateCache::view_conv(
     std::size_t sequence_slot,
     std::size_t snapshot_plane) const {
     require_context(graph_context, "view conv state");
-    const std::int32_t row = row_index(sequence_slot, snapshot_plane);
-    ggml_tensor * storage = conv_storage(model_layer);
-    const std::size_t offset = static_cast<std::size_t>(row) * storage->nb[1];
-    ggml_tensor * result = ggml_view_3d(
+    const std::int32_t row = row_index(sequence_slot, snapshot_plane);  //计算当前sequence的特定layer的state存储在那个roe
+    ggml_tensor * storage = conv_storage(model_layer);      //当前层，所以sequence的state都在这个tensor里面
+    const std::size_t offset = static_cast<std::size_t>(row) * storage->nb[1];//storage->nb[1]每一行的字节数，因为实际上的存储tensor是展平的，需要把二维变成一维
+    ggml_tensor * result = ggml_view_3d(    //创建一个新的 ggml_tensor 描述符，让 GGML graph 以 3D 形状来看 storage 中从 offset 开始的那块内存，为了和后续算子对齐（历史窗口长度（kernel-size-1），通道数（qkv-like）、batch）
         graph_context,
         storage,
         static_cast<std::int64_t>(conv_kernel_size_ - 1),

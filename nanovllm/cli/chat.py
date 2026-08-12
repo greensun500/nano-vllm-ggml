@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "3")),
     )
+    parser.add_argument(
+        "--no-graph-reuse",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NO_GRAPH_REUSE", "0") == "1",
+        help="Disable native persistent graph bucket reuse.",
+    )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
     parser.add_argument(
@@ -163,6 +169,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             num_kvcache_blocks=args.num_kvcache_blocks,
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+            enable_graph_reuse=not args.no_graph_reuse,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,

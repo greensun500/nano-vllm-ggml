@@ -20,6 +20,14 @@ struct Qwen35RuntimeOptions {
     std::size_t device_index = 0;
     bool enable_mtp = false;
     std::size_t mtp_max_draft_tokens = 0;
+    bool enable_graph_reuse = true;
+};
+
+struct Qwen35GraphReuseStats {
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t active_entries = 0;
 };
 
 // Owning C++ representation of the nano-vLLM Python execution-plan ABI.
@@ -71,6 +79,7 @@ public:
         const std::vector<std::int32_t> & block_ids,
         const std::vector<std::int32_t> & sequence_ids,
         std::size_t block_size);
+    Qwen35GraphReuseStats graph_reuse_stats() const;
     void shutdown();
     bool is_shutdown() const noexcept;
 

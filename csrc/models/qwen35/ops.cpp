@@ -112,7 +112,7 @@ QueryGate project_query_and_gate(
             query_gate_weight->ne[1] == head_dim * heads * 2,
         "joint query/gate weight shape is invalid");
 
-    ggml_tensor * joint = linear(ctx, query_gate_weight, input, "qwen35.query_gate_joint");
+    ggml_tensor * joint = linear(ctx, query_gate_weight, input, "qwen35.query_gate_joint"); //矩阵乘投影
     const size_t element = ggml_element_size(joint);
     QueryGate result;
     result.query = ggml_view_3d(

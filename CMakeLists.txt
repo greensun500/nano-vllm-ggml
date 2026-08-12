@@ -11,7 +11,12 @@ set(
     CACHE PATH
     "Pinned llama.cpp source tree; only its ggml subdirectory is compiled"
 )
-set(NANOVLLM_GGML_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
+# The embedded GGML tree is the official b9986 revision plus nano-vLLM's
+# reviewed Mali shape-routing patch.  Pin the actual gitlink so a fresh build
+# cannot silently compile a different tree, while reporting the official base
+# separately for upstream traceability.
+set(NANOVLLM_GGML_BASE_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
+set(NANOVLLM_GGML_COMMIT "5ed33380b4679533243ca45e172804d5ddfe59ec")
 
 if(NOT EXISTS "${NANOVLLM_LLAMA_CPP_DIR}/ggml/CMakeLists.txt")
     message(FATAL_ERROR
@@ -78,6 +83,7 @@ target_include_directories(_C PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/csrc")
 target_link_libraries(_C PRIVATE ggml::ggml)
 target_compile_definitions(_C PRIVATE
     NANOVLLM_GGML_COMMIT="${NANOVLLM_GGML_COMMIT}"
+    NANOVLLM_GGML_BASE_COMMIT="${NANOVLLM_GGML_BASE_COMMIT}"
     NANOVLLM_NATIVE_HAS_VULKAN=$<BOOL:${NANOVLLM_NATIVE_VULKAN}>
 )
 set_target_properties(_C PROPERTIES
