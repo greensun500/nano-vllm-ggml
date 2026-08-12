@@ -417,8 +417,7 @@ ggml_tensor * build_chunk_attention(
         static_cast<std::int64_t>(
             config.attention_value_length * config.attention_head_count),
         token_count);
-     
-
+    attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
         ctx, layer.attn_output, attended, (prefix + ".output").c_str());
     add_critical(result, output);
