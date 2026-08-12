@@ -22,6 +22,7 @@ namespace {
 using nanovllm::native::Qwen35ExecutionPlan;
 using nanovllm::native::Qwen35GraphReuseStats;
 using nanovllm::native::Qwen35MemoryStats;
+using nanovllm::native::Qwen35MtpProfileStats;
 using nanovllm::native::Qwen35MtpResult;
 using nanovllm::native::Qwen35Runtime;
 using nanovllm::native::Qwen35RuntimeOptions;
@@ -685,6 +686,54 @@ PyObject * runtime_memory_stats(PyObject * self_object, PyObject *) {
     }
 }
 
+PyObject * runtime_mtp_profile_stats(PyObject * self_object, PyObject *) {
+    auto * self = reinterpret_cast<PyQwen35Runtime *>(self_object);
+    Qwen35Runtime * runtime = require_runtime(self);
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        Qwen35MtpProfileStats stats;
+        {
+            AllowThreads allow_threads;
+            stats = runtime->mtp_profile_stats();
+        }
+        PyObject * result = PyDict_New();
+        if (result == nullptr) {
+            return nullptr;
+        }
+        const auto set_uint = [&](const char * key, std::uint64_t value) -> bool {
+            PyObject * object = PyLong_FromUnsignedLongLong(
+                static_cast<unsigned long long>(value));
+            if (object == nullptr) {
+                return false;
+            }
+            const int status = PyDict_SetItemString(result, key, object);
+            Py_DECREF(object);
+            return status == 0;
+        };
+        if (!set_uint("draft_calls", stats.draft_calls) ||
+            !set_uint("draft_tokens", stats.draft_tokens) ||
+            !set_uint("draft_graph_setup_elapsed_ns", stats.draft_graph_setup_elapsed_ns) ||
+            !set_uint("draft_elapsed_ns", stats.draft_elapsed_ns) ||
+            !set_uint("verification_calls", stats.verification_calls) ||
+            !set_uint("verification_tokens", stats.verification_tokens) ||
+            !set_uint("verification_graph_setup_elapsed_ns", stats.verification_graph_setup_elapsed_ns) ||
+            !set_uint("verification_elapsed_ns", stats.verification_elapsed_ns) ||
+            !set_uint("kv_update_calls", stats.kv_update_calls) ||
+            !set_uint("kv_update_tokens", stats.kv_update_tokens) ||
+            !set_uint("kv_update_graph_setup_elapsed_ns", stats.kv_update_graph_setup_elapsed_ns) ||
+            !set_uint("kv_update_elapsed_ns", stats.kv_update_elapsed_ns)) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        return result;
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
 PyCFunction cast_keyword_function(PyCFunctionWithKeywords function) noexcept {
     static_assert(
         sizeof(PyCFunction) == sizeof(PyCFunctionWithKeywords),
@@ -704,6 +753,8 @@ PyMethodDef runtime_methods[] = {
      "Release nano-vLLM Paged-KV blocks and native sequence state."},
     {"graph_reuse_stats", runtime_graph_reuse_stats, METH_NOARGS,
      "Return persistent graph cache hit/miss/eviction counters."},
+    {"mtp_profile_stats", runtime_mtp_profile_stats, METH_NOARGS,
+     "Return cumulative native MTP stage timing counters."},
     {"memory_stats", runtime_memory_stats, METH_NOARGS,
      "Return native persistent-memory accounting by allocation class."},
     {"shutdown", runtime_shutdown, METH_NOARGS,

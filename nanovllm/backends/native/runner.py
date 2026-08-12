@@ -209,6 +209,13 @@ class NativeRunner:
             "verification_steps": self.mtp_verification_steps,
         }
 
+    def mtp_profile_stats(self) -> dict[str, int]:
+        runtime = self._require_live_runtime()
+        method = getattr(runtime, "mtp_profile_stats", None)
+        if not callable(method):
+            return {}
+        return {key: int(value) for key, value in method().items()}
+
     def graph_reuse_stats(self) -> dict[str, int]:
         runtime = self._require_live_runtime()
         method = getattr(runtime, "graph_reuse_stats", None)

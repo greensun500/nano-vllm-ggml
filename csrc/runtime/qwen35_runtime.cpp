@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -65,6 +66,14 @@ std::uint64_t checked_sum(
         result += value;
     }
     return result;
+}
+
+std::uint64_t elapsed_nanoseconds(
+    const std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
 }
 
 Qwen35RuntimeOptions validate_options(Qwen35RuntimeOptions options) {
@@ -302,6 +311,7 @@ struct Qwen35Runtime::Impl {
     std::vector<SequenceState> sequences;
     std::vector<std::unique_ptr<PersistentGraphEntry>> graph_cache;
     Qwen35GraphReuseStats graph_stats;
+    Qwen35MtpProfileStats mtp_profile;
     std::uint64_t graph_use_clock = 0;
 
     bool graph_reuse_available() const noexcept {
@@ -808,7 +818,8 @@ struct Qwen35Runtime::Impl {
         std::size_t snapshot_count,
         qwen35::TargetChunkOutputMode output_mode,
         bool retain_hidden,
-        bool allow_graph_reuse) {
+        bool allow_graph_reuse,
+        bool profile_mtp_verification) {
         // 这是 native target model 执行连续 token chunk 的主路径。
         // 上层调度器已经决定了本轮要计算哪些 token，以及这些 token 的 K/V
         // 应该写到哪些物理 slot；这里负责把这些执行计划转成 GGML graph 的输入，
@@ -967,6 +978,7 @@ struct Qwen35Runtime::Impl {
         //   - 所有 full-attention 层的 PagedKV tensor。
         //   - 当前 sequence_slot 和 input_plane 对应的 recurrent conv/delta state。
         //   - 用于接收新 recurrent state 的输出 plane。
+        const auto graph_setup_started = std::chrono::steady_clock::now();
         qwen35::TargetChunkPersistentView persistent = make_target_chunk_persistent(
             graph_context.get(), sequence_slot, input_plane, snapshot_count);
         // 手写构建 T 个 token 的 Qwen3.5 forward graph：
@@ -987,6 +999,10 @@ struct Qwen35Runtime::Impl {
         place_primary_compute_nodes(*executor, graph.graph);
         executor->allocate(graph.graph);    //为graph分配临时buffer
         assert_compute_placement(*executor, graph.graph);
+        if (profile_mtp_verification) {
+            mtp_profile.verification_graph_setup_elapsed_ns +=
+                elapsed_nanoseconds(graph_setup_started);
+        }
         // 上传由 Python/native 调度层准备好的运行时输入。
         ggml_backend_tensor_set(
             graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
@@ -1132,6 +1148,7 @@ struct Qwen35Runtime::Impl {
         }
         graph_context.reset();
         ExecutorResetGuard reset_guard(*executor);
+        const auto graph_setup_started = std::chrono::steady_clock::now();
         const PagedKvLayer & layer = paged_kv->mtp_layer();
         qwen35::AttentionCacheView cache{layer.key, layer.value};
         qwen35::TokenGraph token_graph = qwen35::build_mtp_token_graph(
@@ -1139,6 +1156,7 @@ struct Qwen35Runtime::Impl {
         place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
+        mtp_profile.draft_graph_setup_elapsed_ns += elapsed_nanoseconds(graph_setup_started);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
         ggml_backend_tensor_set(
             token_graph.hidden_input,
@@ -1223,6 +1241,7 @@ struct Qwen35Runtime::Impl {
 
         graph_context.reset();
         ExecutorResetGuard reset_guard(*executor);
+        const auto graph_setup_started = std::chrono::steady_clock::now();
         const PagedKvLayer & layer = paged_kv->mtp_layer();
         qwen35::AttentionCacheView cache{layer.key, layer.value};
         qwen35::MtpKvUpdateGraph graph = qwen35::build_mtp_kv_update_graph(
@@ -1230,6 +1249,7 @@ struct Qwen35Runtime::Impl {
         place_primary_compute_nodes(*executor, graph.graph);
         executor->allocate(graph.graph);
         assert_compute_placement(*executor, graph.graph);
+        mtp_profile.kv_update_graph_setup_elapsed_ns += elapsed_nanoseconds(graph_setup_started);
         ggml_backend_tensor_set(
             graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
         ggml_backend_tensor_set(
@@ -1342,7 +1362,8 @@ struct Qwen35Runtime::Impl {
                     is_final ? qwen35::TargetChunkOutputMode::Last
                              : qwen35::TargetChunkOutputMode::None,
                     options.enable_mtp,
-                    !plan.is_prefill);
+                    !plan.is_prefill,
+                    false);
                 recurrent->select_latest(item.sequence_slot);
                 if (is_final) {
                     if (target.predictions.size() != 1 ||
@@ -1432,6 +1453,7 @@ struct Qwen35Runtime::Impl {
                     item.block_table, draft_position, 1).front();
                 const std::vector<std::int32_t> context =
                     paged_kv->context_indices(item.block_table, draft_position + 1);
+                const auto started = std::chrono::steady_clock::now();
                 TokenResult drafted = execute_mtp(
                     draft_input,
                     draft_position,
@@ -1441,6 +1463,9 @@ struct Qwen35Runtime::Impl {
                     true,
                     index + 1 < draft_count,
                     true);
+                ++mtp_profile.draft_calls;
+                ++mtp_profile.draft_tokens;
+                mtp_profile.draft_elapsed_ns += elapsed_nanoseconds(started);
                 if (drafted.token < 0) {
                     fail("MTP graph did not produce a greedy draft token");
                 }
@@ -1463,6 +1488,7 @@ struct Qwen35Runtime::Impl {
                     item.block_table, position + verification_count);
             const std::size_t input_plane =
                 recurrent->active_snapshot_plane(item.sequence_slot);
+            const auto verification_started = std::chrono::steady_clock::now();
             TargetChunkResult target = execute_target_chunk(
                 item.sequence_slot,
                 verification_inputs,
@@ -1473,7 +1499,11 @@ struct Qwen35Runtime::Impl {
                 verification_count,
                 qwen35::TargetChunkOutputMode::All,
                 true,
+                true,
                 true);
+            ++mtp_profile.verification_calls;
+            mtp_profile.verification_tokens += verification_count;
+            mtp_profile.verification_elapsed_ns += elapsed_nanoseconds(verification_started);
             if (target.predictions.size() != verification_count ||
                 std::any_of(
                     target.predictions.begin(),
@@ -1523,12 +1553,16 @@ struct Qwen35Runtime::Impl {
                 const std::vector<std::int32_t> catchup_slots =
                     paged_kv->physical_indices(
                         item.block_table, position + 1, accepted);
+                const auto kv_update_started = std::chrono::steady_clock::now();
                 execute_mtp_kv_update(
                     catchup_tokens,
                     catchup_positions,
                     catchup_slots,
                     catchup_hidden,
                     true);
+                ++mtp_profile.kv_update_calls;
+                mtp_profile.kv_update_tokens += accepted;
+                mtp_profile.kv_update_elapsed_ns += elapsed_nanoseconds(kv_update_started);
             }
             sequence.pending_hidden.assign(
                 target.hidden.begin() + static_cast<std::ptrdiff_t>(accepted * embedding),
@@ -1590,6 +1624,10 @@ struct Qwen35Runtime::Impl {
         return result;
     }
 
+    Qwen35MtpProfileStats mtp_profile_stats() const {
+        return mtp_profile;
+    }
+
     Qwen35MemoryStats memory_stats() const {
         Qwen35MemoryStats result;
         result.weights_bytes = static_cast<std::uint64_t>(
@@ -1648,6 +1686,13 @@ Qwen35GraphReuseStats Qwen35Runtime::graph_reuse_stats() const {
         fail("runtime has been shut down");
     }
     return impl_->graph_reuse_stats();
+}
+
+Qwen35MtpProfileStats Qwen35Runtime::mtp_profile_stats() const {
+    if (impl_ == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->mtp_profile_stats();
 }
 
 Qwen35MemoryStats Qwen35Runtime::memory_stats() const {

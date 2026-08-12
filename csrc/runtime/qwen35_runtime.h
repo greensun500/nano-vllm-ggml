@@ -30,6 +30,23 @@ struct Qwen35GraphReuseStats {
     std::uint64_t active_entries = 0;
 };
 
+// Cumulative wall-clock accounting for the native MTP execution stages.  Each
+// value includes graph setup, host/backend transfers and synchronous compute.
+struct Qwen35MtpProfileStats {
+    std::uint64_t draft_calls = 0;
+    std::uint64_t draft_tokens = 0;
+    std::uint64_t draft_graph_setup_elapsed_ns = 0;
+    std::uint64_t draft_elapsed_ns = 0;
+    std::uint64_t verification_calls = 0;
+    std::uint64_t verification_tokens = 0;
+    std::uint64_t verification_graph_setup_elapsed_ns = 0;
+    std::uint64_t verification_elapsed_ns = 0;
+    std::uint64_t kv_update_calls = 0;
+    std::uint64_t kv_update_tokens = 0;
+    std::uint64_t kv_update_graph_setup_elapsed_ns = 0;
+    std::uint64_t kv_update_elapsed_ns = 0;
+};
+
 struct Qwen35MemoryStats {
     std::uint64_t weights_bytes = 0;
     std::uint64_t paged_kv_bytes = 0;
@@ -89,6 +106,7 @@ public:
         const std::vector<std::int32_t> & sequence_ids,
         std::size_t block_size);
     Qwen35GraphReuseStats graph_reuse_stats() const;
+    Qwen35MtpProfileStats mtp_profile_stats() const;
     Qwen35MemoryStats memory_stats() const;
     void shutdown();
     bool is_shutdown() const noexcept;
