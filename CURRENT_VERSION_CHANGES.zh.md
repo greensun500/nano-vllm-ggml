@@ -36,7 +36,7 @@ v3.75 修复 v3.73 的 Arm-only correctness bug。`token_embd.weight` 在该 GGU
 
 v3.76 根据 Arm 真机 oracle 收回 v3.73 的默认启用：即使 embedding 保持原始布局，Q4_0 `q4_0_4x8` repack 仍会改变 MTP partial-rollback trace（5 个 oracle 中 4 个通过，1 个生成序列少一个 token）。因此项目新增 `NANOVLLM_NATIVE_CPU_REPACK=OFF`（默认）；构建脚本同名环境变量可显式开启实验 build，但它不得用于正确性基线或性能结论。保留 loader 的混合 buffer 代码和 v3.75 embedding 排除，是为了后续比对上游修复后的 repack traits；默认运行时重新使用原始 GGUF layout，优先保证 exact greedy token。
 
-v3.77 不改计算图和 token 语义。`bench --json` 读取 native runtime 已有的累计 MTP profile，并在排除 warmup 后导出 draft、target verification、MTP KV catch-up 三段的 wall time、建图时间和阶段 tok/s。远端 Mali-G720 K=1 A/B 已证明：打开 experimental Vulkan persistent graph reuse 后 cache hit 为 3227，但 decode 从 `18.58` 降至 `17.87 tok/s`；这与 profile 中 graph setup 仅占小部分的判断一致，开关保持默认关闭，后续优化聚焦 verification 的 target forward、词表 head 与 KV gather。
+v3.77 不改计算图和 token 语义。`bench --json` 读取 native runtime 已有的累计 MTP profile，并在排除 warmup 后导出 draft、target verification、MTP KV catch-up 三段的 wall time、建图时间和阶段 tok/s。远端 Mali-G720 K=1 A/B 已证明：打开 experimental Vulkan persistent graph reuse 后 cache hit 为 3227，但 decode 从 `18.58` 降至 `17.87 tok/s`；这与 profile 中 graph setup 仅占小部分的判断一致，开关保持默认关闭，后续优化聚焦 verification 的 target forward、词表 head 与 KV gather。新的完整 K=1 profile 为 draft `15.90s`、verification `72.06s`、KV catch-up `1.03s`，其中 verification setup 仅 `1.74s`；它占 decode wall 约 81%。同机 CPU K=3 试验性连续 snapshot + MTP prefill fusion 为 `32.62 tok/s`，相对 baseline `32.54 tok/s` 的差异在本轮重复测量噪声范围，故两个开关继续 opt-in。补充的 186-token Vulkan kernel log 显示一张 T=2 verification graph 为 `79.11ms`：Q6_K vocab `MUL_MAT_VEC` `15.15ms`、独立 `ARGMAX` `3.95ms`，而 13 次 `GET_ROWS` 合计 `0.25ms`。这给 fused head/argmax 明确的短上下文上限，也说明 direct paged attention 要以 8k 长上下文测量作为验收门槛。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -165,6 +165,8 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 | `nanovllm/cli/bench.py` | 在 warmup 后读取 `NativeRunner.mtp_profile_stats()`；JSON/人类可读输出分别给出 draft、verification、KV catch-up 的累计 wall/setup 时间和 token 吞吐。 |
 
 该字段包含 native 同步 compute、host/backend tensor 传输与建图，不能与 Python 侧 scheduler timer 混淆。它专用于判断 MTP 是否因低 acceptance、verification graph 或 KV catch-up 变慢；MTP-off 时字段为零。此改动也避免根据 graph cache hit 数推断收益：Mali K=1 的 graph reuse A/B 已显示高命中仍会退化。
+
+远端结果目录还保留 `GGML_VK_PERF_LOGGER=1` 的短 MTP kernel log。它不是端到端吞吐结论：每次 backend graph 的计时各自输出；但同一张 target verification 内，Q6_K head + argmax 已占约四分之一 GPU kernel 时间，说明自定义 head epilogue 有合理收益空间。反之，186-token 时 `GET_ROWS` 极小；direct paged kernel 的设计应直接读物理 slot/page table、执行 online softmax，并在 1k/4k/8k 三个 context 证明避免 gather 的收益。
 
 ## 3. 当前运行链路的新增部分
 
