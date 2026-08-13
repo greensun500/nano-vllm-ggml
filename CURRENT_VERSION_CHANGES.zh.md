@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.83 Mali argmax 验证结果
+# nano-vLLM 当前版本修改说明：v3.84 Mali Q6_K lm_head + argmax 融合
 
 ## 1. 版本定位
 
@@ -22,6 +22,7 @@
 - v3.81：`bcb7405 v3.81: record Mali auto attention benchmark`
 - v3.82：`891692c v3.82: widen Mali Vulkan argmax`（vendored GGML `1bd647a`）
 - v3.83 工作区：记录 v3.82 Arm Vulkan build、correctness 与统一 MTP benchmark 结果
+- v3.84 工作区：在 Arm Vulkan 图执行器中融合 Q6_K 词表 head 与 greedy argmax；远机 correctness/性能验收待本阶段完成后补录
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -47,6 +48,8 @@ v3.77 不改计算图和 token 语义。`bench --json` 读取 native runtime 已
 v3.80 将 Python/CLI 的 `native_attention_impl` 默认值从 `math` 改为 `auto`。这不是对 MTP 的算法改动：C++ 选择器在 MTP 仍无条件返回 math，因而 draft 与 verification 的数值路径、acceptance 和现有基线命令（它们显式传 `math`）保持不变。仅在 MTP-off 且 backend/shape probe 确认 `FLASH_ATTN_EXT` 可用时才选择 Flash；不支持时 `auto` 自动回退 math。这个默认值变更经过本地 31 项单测与真实 Qwen3.5 CPU oracle（MTP off/on）5/5 验证；Armv9.2/Mali-G720 的统一参数远端 A/B（Q4_0、prompt 186、generate 541、repeat 3、warmup 1、`taskset -c 0,5-11`）也完成：显式 math 的 prefill/decode/processed/generated 为 `69.62/20.81/25.36/18.90 tok/s`，v3.80 auto 为 `69.93/21.24/25.85/19.26 tok/s`，decode 提升 `2.07%`。完整 stdout/stderr/JSON、build info（GGML `5ed33380`）与参数位于远端 `v37-results/20260814-014951-v380-auto/`。
 
 v3.82 是 fused `lm_head + argmax` 前的独立、低风险归约阶段。Mali-G720 的 subgroup 为 16，而原 GGML `argmax.comp` 因此让每个 lane 扫描约 15500 个 Qwen3.5 vocab logits；Vulkan 后端现在仅对 Arm 设备创建 256-lane（受 `maxComputeWorkGroupInvocations` 限制）的同一 shader specialization。该 shader 仍以严格 `>` 比较、按低 index 优先处理相等值，语义与原 16-lane binary reduction 相同；非 Arm 保持上游 specialization。它不改变 Q6_K head 计算、输出 tensor 格式或 MTP acceptance。Armv9.2/Mali-G720 新建 `build/v382-vulkan` 已完成、CTest 通过、真实 Vulkan smoke 通过；统一 MTP K=1（math、186/541、repeat 3、warmup 1、`taskset -c 0,5-11`）的 drafted/accepted/verification 为 `810/810/810`、acceptance `100%`，decode 从 v3.76 baseline `18.58` 到 `19.92 tok/s`（`+7.24%`），verification `72.06 -> 68.05s`（`-5.57%`）。短 kernel profile 中 Q6_K head 仍为 T=1 `12.58ms`、T=2 `15.15ms`，而独立 `ARGMAX` 为约 `0.26ms`，相对 v3.77 profile 的 `3.95ms` 大幅缩短。完整 build/smoke/JSON/profile/build_info 位于远端 `v37-results/20260814-015954-v382/`。
+
+v3.84 继续处理同一段 MTP verification 的词表输出，但不把 `MUL_MAT` 和 `ARGMAX` 仅做 API 层串联。对 Arm Vulkan、连续 Q6_K 权重、连续 F32 hidden、`T<=4` 的唯一连续 `MUL_MAT -> ARGMAX` 图边，执行器改为两张专用 shader：第一张每个 16-row Q6_K workgroup 保持原 Q6_K 的 16-lane dot-product/reduction 顺序，只写一个 `{max_logit, vocab_id}` 候选；第二张以 256 lanes 对候选做稳定归约并直接写 I32 token。Qwen3.5 的约 248k 词表因此从每 token 约 0.95 MiB F32 logits 写入，缩减为约 0.12 MiB 的 transient candidate buffer，且不再让 graph allocator 为 logits 安排存活区间，也不再独立扫描完整 logits。相等分数显式选更小 id，与旧 `argmax.comp` 语义一致。该路径不改变 Python 请求/调度、MTP acceptance、CPU/CUDA 或非 Arm Vulkan；不满足条件的图仍走原 `MUL_MAT + ARGMAX`。`GGML_VK_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 可在远机得到逐项 A/B 基线。这里的描述只记录实现设计，性能和真实模型 correctness 必须以本阶段新建结果目录的验收为准。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
