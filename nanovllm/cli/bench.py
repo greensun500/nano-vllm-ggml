@@ -29,6 +29,7 @@ class BenchResult:
     mtp_verification_steps: int
     mtp_acceptance_rate: float
     enable_graph_reuse: bool
+    native_vulkan_graph_reuse: bool
     native_attention_impl: str
     native_batched_recurrent_snapshots: bool
     native_mtp_prefill_fusion: bool
@@ -129,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable native persistent graph bucket reuse for A/B measurements.",
     )
     parser.add_argument(
+        "--native-vulkan-graph-reuse",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE", "0") == "1",
+        help="Experimental: reuse stable single-sequence Vulkan decode/MTP graph buckets.",
+    )
+    parser.add_argument(
         "--native-attention-impl",
         choices=("math", "auto", "flash"),
         default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "math"),
@@ -189,6 +196,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             enable_graph_reuse=not args.no_graph_reuse,
+            native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
             native_attention_impl=args.native_attention_impl,
             native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
@@ -452,6 +460,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         ),
         mtp_acceptance_rate=acceptance_rate,
         enable_graph_reuse=not args.no_graph_reuse,
+        native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
         native_attention_impl=args.native_attention_impl,
         native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
         native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
@@ -494,6 +503,7 @@ def print_result(result: BenchResult) -> None:
     print(f"KV blocks:          {result.num_kvcache_blocks}")
     print(f"MTP:                {result.enable_mtp} (K={result.mtp_max_draft_tokens})")
     print(f"graph reuse:        {result.enable_graph_reuse}")
+    print(f"Vulkan graph reuse: {result.native_vulkan_graph_reuse}")
     print(f"attention impl:     {result.native_attention_impl}")
     print(f"batched snapshots:  {result.native_batched_recurrent_snapshots}")
     print(f"MTP prefill fusion: {result.native_mtp_prefill_fusion}")

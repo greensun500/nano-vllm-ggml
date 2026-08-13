@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.73 CPU 权重 repack 加载优化工作区（上一个版本提交 `b413650 v3.72: trim MTP draft hidden lifetime`）
+- 当前分支：`qwen35-native-runtime`，v3.74 Vulkan graph reuse 安全探针工作区（上一个版本提交 `d18b3d2 v3.73: enable CPU weight repacking`）
 
 总体规模：
 
@@ -37,7 +37,8 @@
 | v3.7 | `044e92e` | opt-in FlashAttention、连续 GDN snapshot 写回、MTP prefill 合图、opt-in CUDA Graph |
 | v3.71 | `21474dd` | 去除 fallback graph 的重复同步；plan speculative-tail 校验改为无 slot 向量分配的逻辑范围检查 |
 | v3.72 | `b413650` | 仅在 MTP draft 的调用方需要时将 hidden 声明为 GGML output；cache key 区分其活跃区间 |
-| v3.73 working tree | 未提交 | CPU loader 将符合 GGML 原生 ISA/shape 条件的 Q4_0/Q6_K 二维矩阵放入 CPU_REPACK，其余 tensor 保持 default buffer |
+| v3.73 | `d18b3d2` | CPU loader 将符合 GGML 原生 ISA/shape 条件的 Q4_0/Q6_K 二维矩阵放入 CPU_REPACK，其余 tensor 保持 default buffer |
+| v3.74 working tree | 未提交 | 默认关闭的 Vulkan 单序列 graph-reuse 探针；用于验证历史 padded-mask bucket 问题是否仍存在 |
 
 ## 2. 目录级总览
 
@@ -681,7 +682,7 @@ nanovllm._C.Qwen35Runtime
 它支撑两个路径：
 
 1. fallback path：每轮构图、placement、allocate、同步 compute、reset；v3.71 在 compute 成功后直接 reset scheduler，避免已同步 graph 再执行一次 backend synchronize；异常路径保留同步 reset；v3.72 仅在调用方需要 host readback 时将 TokenGraph hidden 标为 output；
-2. v3.5 persistent graph path：首次构图和 allocate，后续只更新输入 tensor 后 compute；v3.7 的 CUDA Graph 仅在显式开关时让 GGML capture/replay 稳定 CUDA graph。
+2. v3.5 persistent graph path：首次构图和 allocate，后续只更新输入 tensor 后 compute；v3.7 的 CUDA Graph 仅在显式开关时让 GGML capture/replay 稳定 CUDA graph；v3.74 仅通过默认关闭的开关让 Vulkan 进行同一机制的 oracle/A/B。
 
 学习重点：
 
@@ -1076,7 +1077,7 @@ bucket：
 
 - 默认 build 只启用 CPU 单序列 persistent graph reuse；native CUDA 只有在独立 CUDA Graph build 中才允许复用稳定图；
 - CUDA Graph build 必须同时显式传入 `NANOVLLM_NATIVE_CUDA=ON` 与 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON`；
-- Vulkan 由于 padded-mask bucket attention 行为不稳定，当前 fallback 到旧路径；
+- Vulkan 默认仍因历史 padded-mask bucket attention 风险走 fallback；v3.74 提供 `native_vulkan_graph_reuse` 实验开关，只有 oracle 通过才考虑改变默认；
 - prefill/chunk 暂不强制缓存。
 
 学习重点：

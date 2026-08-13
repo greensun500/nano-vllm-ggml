@@ -342,7 +342,9 @@ struct Qwen35Runtime::Impl {
             primary_backend == nullptr) {
             return false;
         }
-        if (primary_backend->kind() == BackendKind::Cpu) {
+        if (primary_backend->kind() == BackendKind::Cpu ||
+            (primary_backend->kind() == BackendKind::Vulkan &&
+             options.enable_vulkan_graph_reuse)) {
             return true;
         }
         // GGML captures CUDA work only after the graph's tensor metadata and

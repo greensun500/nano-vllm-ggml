@@ -361,6 +361,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     PyObject * enable_mtp_object = nullptr;
     PyObject * mtp_max_draft_tokens_object = nullptr;
     PyObject * enable_graph_reuse_object = Py_True;
+    PyObject * enable_vulkan_graph_reuse_object = Py_False;
     PyObject * attention_impl_object = nullptr;
     PyObject * enable_batched_recurrent_snapshots_object = Py_False;
     PyObject * enable_mtp_prefill_fusion_object = Py_False;
@@ -377,6 +378,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         "enable_mtp",
         "mtp_max_draft_tokens",
         "enable_graph_reuse",
+        "enable_vulkan_graph_reuse",
         "attention_impl",
         "enable_batched_recurrent_snapshots",
         "enable_mtp_prefill_fusion",
@@ -385,7 +387,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|OOOO:Qwen35Runtime",
+            "OOOOOOOOOOO|OOOOO:Qwen35Runtime",
             const_cast<char **>(keywords),
             &model_path_object,
             &backend_object,
@@ -399,6 +401,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             &enable_mtp_object,
             &mtp_max_draft_tokens_object,
             &enable_graph_reuse_object,
+            &enable_vulkan_graph_reuse_object,
             &attention_impl_object,
             &enable_batched_recurrent_snapshots_object,
             &enable_mtp_prefill_fusion_object)) {
@@ -459,6 +462,10 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             enable_graph_reuse_object,
             "enable_graph_reuse",
             options.enable_graph_reuse) ||
+        !parse_bool(
+            enable_vulkan_graph_reuse_object,
+            "enable_vulkan_graph_reuse",
+            options.enable_vulkan_graph_reuse) ||
         !parse_bool(
             enable_batched_recurrent_snapshots_object,
             "enable_batched_recurrent_snapshots",

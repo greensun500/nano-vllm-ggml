@@ -64,6 +64,7 @@ def make_config(**overrides):
         "enable_mtp": False,
         "mtp_max_draft_tokens": 3,
         "enable_graph_reuse": True,
+        "native_vulkan_graph_reuse": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -141,6 +142,7 @@ class NativeRunnerTests(unittest.TestCase):
                 "enable_mtp": False,
                 "mtp_max_draft_tokens": 3,
                 "enable_graph_reuse": True,
+                "enable_vulkan_graph_reuse": False,
                 "attention_impl": "math",
                 "enable_batched_recurrent_snapshots": False,
                 "enable_mtp_prefill_fusion": False,
@@ -159,12 +161,14 @@ class NativeRunnerTests(unittest.TestCase):
                 native_attention_impl="auto",
                 native_batched_recurrent_snapshots=True,
                 native_mtp_prefill_fusion=True,
+                native_vulkan_graph_reuse=True,
             )
         )
         kwargs = runner.runtime.constructor_kwargs
         self.assertEqual(kwargs["attention_impl"], "auto")
         self.assertTrue(kwargs["enable_batched_recurrent_snapshots"])
         self.assertTrue(kwargs["enable_mtp_prefill_fusion"])
+        self.assertTrue(kwargs["enable_vulkan_graph_reuse"])
 
     def test_greedy_run_flattens_and_converts_the_execution_plan(self):
         runner = self.make_runner()

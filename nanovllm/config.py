@@ -30,6 +30,7 @@ class Config:
     enable_mtp: bool = False
     mtp_max_draft_tokens: int = 3
     enable_graph_reuse: bool = True
+    native_vulkan_graph_reuse: bool = False
     native_attention_impl: str = "math"
     native_batched_recurrent_snapshots: bool = False
     native_mtp_prefill_fusion: bool = False
@@ -98,6 +99,11 @@ class Config:
         if self.native_mtp_prefill_fusion:
             _require(is_native, "native_mtp_prefill_fusion requires a native backend")
             _require(self.enable_mtp, "native_mtp_prefill_fusion requires enable_mtp=True")
+        if self.native_vulkan_graph_reuse:
+            _require(
+                self.backend == "native_vulkan",
+                "native_vulkan_graph_reuse requires backend='native_vulkan'",
+            )
         _require(
             1 <= self.tensor_parallel_size <= 8,
             "tensor_parallel_size must be between 1 and 8",

@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.73 CPU 权重 repack 加载优化
+# nano-vLLM 当前版本修改说明：v3.74 Vulkan graph reuse 安全探针
 
 ## 1. 版本定位
 
@@ -11,7 +11,8 @@
 - v3.7：`044e92e v3.7: add native runtime optimization controls`
 - v3.71：`21474dd v3.71: remove fallback runtime overhead`
 - v3.72：`b413650 v3.72: trim MTP draft hidden lifetime`
-- v3.73 工作区：CPU Q4_0/Q6_K 权重混合 buffer 与 GGML repack 加载优化，待本次提交固化
+- v3.73：`d18b3d2 v3.73: enable CPU weight repacking`
+- v3.74 工作区：默认关闭的 Vulkan persistent graph reuse 安全探针，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -25,6 +26,8 @@ v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去
 v3.72 保持 MTP draft 的计算和 host readback 内容不变，但让不需要 readback 的最后一张 draft graph 不再把 pre-LM-head hidden 声明为 GGML output，缩短 scheduler allocation 中该 activation 的不可复用生命周期。
 
 v3.73 不改模型图、量化格式或 token 语义。此前 CPU 路径把所有 GGUF tensor 放入 default buffer，即使本机 GGML 已启用 `CPU_REPACK`，Q4_0/Q6_K 的专用 matmul 内核也无法被选中。现在只对运行时 ISA、量化类型和矩阵行数均满足 GGML 原生条件的二维 Q4_0/Q6_K 权重分配 repack buffer，其余 tensor 仍留在 default buffer；因此不会把不支持的 norm、bias、embedding 或量化布局放入会在上传时解引用空 traits 的 buffer。
+
+v3.74 新增一个默认关闭的 Vulkan persistent graph reuse 安全探针。v3.5 曾记录 Mali 在 padded-mask bucket attention 下的不稳定行为，因此本版本不会改变 `native_vulkan` 默认执行链；只有显式 `--native-vulkan-graph-reuse` 或 `NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE=1` 才让单序列 decode/MTP 复用 CPU 已验证的同一 bucket 机制。该开关用于远机 correctness oracle 和与 `--no-graph-reuse` 的交替 A/B，bench JSON 会记录它；多序列、prefill 和 MTP prefill fusion 保持 eager graph。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -120,6 +123,16 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 
 候选选择与 GGML 当前原生实现一致的必要条件为：tensor 是二维；Q4_0 在 x86 AVX2 时行数为 8 的倍数、或 Arm NEON+dotprod/i8mm 时行数为 4 的倍数；Q6_K 仅在 Arm NEON+dotprod/i8mm 且行数为 8 的倍数时进入 repack。Qwen3.5-2B-Q4_0 的投影矩阵在 x86 本地验证实际进入 `q4_0_8x8`；Arm 还会覆盖 tied Q6_K vocab head。GGML 的 repack buffer 上传接口要求 `offset=0` 且完整 tensor，故只有这类矩阵在模型加载期临时整块读取；其他 tensor 保持原 16 MiB 有界分块上传。该峰值只发生一次，不进入 decode 热路径。
 
+### 2.10 v3.74 Vulkan graph reuse 安全探针
+
+| 文件 | v3.74 改动 |
+| --- | --- |
+| `nanovllm/config.py`、native runner、Python/C++ binding | 新增 `native_vulkan_graph_reuse` / `enable_vulkan_graph_reuse`，默认 `false` 且仅允许 `native_vulkan`。 |
+| `csrc/runtime/qwen35_runtime.cpp` | 显式开关开启时允许单 sequence Vulkan 命中已有 persistent graph bucket；仍复用原 key、LRU、输入更新和 placement audit。 |
+| chat/bench CLI | 新增 `--native-vulkan-graph-reuse` 和环境变量；bench 结果记录开关，便于交替 A/B。 |
+
+历史 profile 中 Vulkan MTP graph setup/placement/allocation 约占总 wall 的 1%–2%，因此即使通过也预期为小收益。更重要的是先证明带 padded causal mask 的 bucket 在当前 Mali/GGML revision 中保持 greedy token 一致；若 oracle 失败，开关保持关闭并将问题留给 direct paged attention/fused verification 图，而不将未验证路径变成默认。
+
 ## 3. 当前运行链路的新增部分
 
 ```text
@@ -191,6 +204,6 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 
 1. Native 不支持跨请求 prefix cache；hybrid recurrent state 不能像纯 attention KV 一样廉价地共享。
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
-3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收，Vulkan 仍按轮构图。
+3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收。Vulkan 的 bucket reuse 仅有 v3.74 默认关闭的实验开关，需先通过 Mali oracle。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
 5. v3.73 已让 CPU 用到 GGML 现有的量化 repack 内核；其 Arm decode 收益仍需目标设备实测。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。

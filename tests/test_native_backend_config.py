@@ -85,6 +85,14 @@ class NativeBackendConfigTests(unittest.TestCase):
             self.assertTrue(config.native_batched_recurrent_snapshots)
             self.assertTrue(config.native_mtp_prefill_fusion)
 
+            with self.assertRaisesRegex(ValueError, "native_vulkan_graph_reuse"):
+                Config(
+                    model=model.name,
+                    backend="native_cpu",
+                    tokenizer=tokenizer,
+                    native_vulkan_graph_reuse=True,
+                )
+
             with self.assertRaisesRegex(ValueError, "native_attention_impl"):
                 Config(
                     model=model.name,

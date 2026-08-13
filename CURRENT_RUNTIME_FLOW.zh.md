@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.73
+# nano-vLLM 当前执行流程：v3.74
 
 ## 1. 架构边界
 
@@ -38,7 +38,7 @@ LLM(config)
   -> lazy persistent graph bucket cache
 ```
 
-accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。默认 `enable_graph_reuse` 让 CPU 单序列 decode/MTP lazy 创建 persistent graph bucket；CUDA 只有 extension 由 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 编译时才允许 GGML CUDA Graph capture/replay。该能力是 GGML backend scope 行为，因此用独立 build variant 做 A/B，而不是同一进程中的 runtime toggle。多序列、Vulkan 和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
+accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。默认 `enable_graph_reuse` 让 CPU 单序列 decode/MTP lazy 创建 persistent graph bucket；CUDA 只有 extension 由 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 编译时才允许 GGML CUDA Graph capture/replay。Vulkan 默认仍走 fallback scheduler，但 v3.74 可用默认关闭的 `native_vulkan_graph_reuse` 对其稳定 bucket 做显式 oracle/A/B。多序列和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
 
 ## 4. Python 执行计划
 
@@ -226,7 +226,7 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
 - v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
-- graph reuse 默认只保证 CPU 单序列 decode/MTP；CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建的 extension，Vulkan 当前仍 fallback 到每轮构图。
+- graph reuse 默认只保证 CPU 单序列 decode/MTP；CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建的 extension。Vulkan 的 persistent bucket 只在显式 `native_vulkan_graph_reuse=true` 时实验性启用，因历史 Mali padded-mask 风险必须先经 oracle 验证。
 - CPU backend 在 GGML 报告支持 `CPU_REPACK` 时，加载器只将满足当前 ISA/shape 条件的二维 Q4_0/Q6_K 投影放入该 buffer；其余权重保持 default buffer。Vulkan/CUDA 不走此路径。
 - MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。
 - CUDA 已接入 build、backend discovery、placement audit、native runner 与 opt-in CUDA Graph，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。

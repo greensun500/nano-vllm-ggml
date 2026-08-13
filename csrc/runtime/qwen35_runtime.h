@@ -27,6 +27,7 @@ struct Qwen35RuntimeOptions {
     bool enable_mtp = false;
     std::size_t mtp_max_draft_tokens = 0;
     bool enable_graph_reuse = true;
+    bool enable_vulkan_graph_reuse = false;
     Qwen35AttentionImplementation attention_implementation =
         Qwen35AttentionImplementation::Math;
     bool enable_batched_recurrent_snapshots = false;
