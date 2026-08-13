@@ -42,6 +42,7 @@ class BenchResult:
     native_attention_impl: str
     native_batched_recurrent_snapshots: bool
     native_mtp_prefill_fusion: bool
+    native_mtp_verification_kv_fusion: bool
     graph_cache_hits: int
     graph_cache_misses: int
     graph_cache_evictions: int
@@ -163,6 +164,12 @@ def parse_args() -> argparse.Namespace:
         help="Fuse native MTP prefill hidden-to-KV maintenance into the target graph.",
     )
     parser.add_argument(
+        "--native-mtp-verification-kv-fusion",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_MTP_VERIFICATION_KV_FUSION", "0") == "1",
+        help="Fuse target-conditioned MTP KV maintenance into each verification graph.",
+    )
+    parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
         help="Reuse identical prompts across runs to benchmark prefix-cache behavior.",
@@ -209,6 +216,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             native_attention_impl=args.native_attention_impl,
             native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
+            native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,
@@ -502,6 +510,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         native_attention_impl=args.native_attention_impl,
         native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
         native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
+        native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
         graph_cache_hits=int(graph_stats["hits"]),
         graph_cache_misses=int(graph_stats["misses"]),
         graph_cache_evictions=int(graph_stats["evictions"]),
@@ -545,6 +554,7 @@ def print_result(result: BenchResult) -> None:
     print(f"attention impl:     {result.native_attention_impl}")
     print(f"batched snapshots:  {result.native_batched_recurrent_snapshots}")
     print(f"MTP prefill fusion: {result.native_mtp_prefill_fusion}")
+    print(f"MTP verification KV fusion: {result.native_mtp_verification_kv_fusion}")
     if result.ggml_commit:
         print(f"GGML commit:        {result.ggml_commit}")
         print(f"Vulkan compiled:    {result.vulkan_compiled}")

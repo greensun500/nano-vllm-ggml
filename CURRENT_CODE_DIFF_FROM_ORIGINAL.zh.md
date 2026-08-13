@@ -5,13 +5,13 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.87 direct paged-attention correctness-gate 工作区
+- 当前分支：`qwen35-native-runtime`，v3.88 MTP verification-KV fusion 工作区
 
 总体规模：
 
 - 相对原始基线的具体规模会随文档、测试和子模块状态变化；学习时应以 `git diff origin/main...HEAD --stat` 重新计算。
 
-一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前 v3.7 在保留原 CUDA 路径的同时，形成了 in-tree Qwen3.5 native runtime，支持 GGUF 加载、GGML CPU/Vulkan/CUDA backend、PagedKV、hybrid recurrent state、内置 MTP、会话保留、公平调度、benchmark/chat CLI、CPU graph reuse、可选 FlashAttention/GDN snapshot/MTP prefill fusion、可选 CUDA Graph 和 MTP/memory profiling。
+一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前 v3.8 在保留原 CUDA 路径的同时，形成了 in-tree Qwen3.5 native runtime，支持 GGUF 加载、GGML CPU/Vulkan/CUDA backend、PagedKV、hybrid recurrent state、内置 MTP、会话保留、公平调度、benchmark/chat CLI、CPU graph reuse、可选 FlashAttention/GDN snapshot/MTP prefill 与 verification KV fusion、可选 CUDA Graph 和 MTP/memory profiling。
 
 ## 1. 修改时间线
 
@@ -45,6 +45,7 @@
 | v3.80 | `fc160da` | 默认 `native_attention_impl=auto`；MTP 保持 math，non-MTP 仅在 runtime capability probe 支持时使用 FlashAttention；Mali 统一基准 MTP-off decode `20.81 -> 21.24 tok/s` |
 | v3.82 | `891692c` + vendored `1bd647a` | Mali Vulkan `ARGMAX` 使用 256-lane specialization，缩短全词表 greedy reduction；统一 MTP K=1 decode `18.58 -> 19.92 tok/s`、acceptance `100%` |
 | v3.86/v3.87 | working tree + vendored GGML | 新增 Vulkan `PAGED_ATTN` direct-cache kernel；v3.87 加入真实 context length input、消除孤立 mask，并将已验证范围限制为 T=1 decode |
+| v3.88 | current working tree | 可选地将 MTP verification 的后缀 KV 写入合入 `TargetChunkGraph`，消除 accepted draft 的独立 KV-only graph；Mali K=1 统一 A/B decode `19.885 -> 20.057 tok/s`，默认保持关闭 |
 
 ## 2. 目录级总览
 
@@ -823,7 +824,7 @@ is_mtp_layer(layer):
 ```cpp
 TokenGraph
 TargetChunkGraph
-MtpKvUpdateGraph
+MtpKvUpdateGraph（legacy / MTP prefill）
 ```
 
 ### 18.1 TokenGraph
@@ -860,7 +861,7 @@ causal_mask[C,T]
 
 - prefill chunk；
 - ordinary decode T=1；
-- MTP target verification T=K+1。
+- MTP target verification T=K+1；v3.88 可选在图中额外接收 draft 后缀的 token/position/write-slot，并用 `target_hidden[0:K]` 直接写 MTP PagedKV。
 
 ### 18.3 MtpKvUpdateGraph
 
@@ -883,7 +884,7 @@ token + shifted target hidden
 - vocab head；
 - greedy readback。
 
-这是 MTP 性能优化的一部分。
+这是 MTP 性能优化的一部分。v3.88 启用 verification fusion 时，accepted draft 不再走这个 graph：verification 在 acceptance 之前预写入完整 speculative 后缀，未接受尾部不会被后续 context 读取，并会在下一轮 draft 前覆盖；MTP prefill 和未启用 fusion 的 legacy verification 仍使用 KV-only graph。
 
 ### 18.4 full attention graph 差异
 
@@ -1039,7 +1040,7 @@ v3.71 的 speculative-tail 检查复用 PagedKV 的无分配逻辑范围校验�
 5. 比较 target prediction 和 draft token；
 6. 计算 accepted draft count；
 7. recurrent state rollback；
-8. accepted draft 的 MTP KV catch-up；
+8. legacy 路径为 accepted draft 执行 MTP KV catch-up；开启 `native_mtp_verification_kv_fusion` 时 verification graph 已预写完整 draft 后缀，跳过此步骤；
 9. 更新 pending token / pending hidden / pending position；
 10. 返回 accepted token 序列。
 
@@ -1070,8 +1071,8 @@ v3.7 只有在 CUDA build 显式具备 `GGML_CUDA_GRAPHS` 时才将同一机制�
 
 - MTP-off target decode：`TargetChunkGraph(T=1, Last)`
 - MTP draft：`TokenGraph(T=1)`
-- MTP target verification：`TargetChunkGraph(T=K+1, All, retain_hidden=true)`
-- MTP KV catch-up：`MtpKvUpdateGraph(T=1..K)`
+- MTP target verification：`TargetChunkGraph(T=K+1, All, retain_hidden=true[, verification_kv_fusion])`
+- MTP KV catch-up：`MtpKvUpdateGraph(T=1..K)`（legacy；verification fusion 时不创建）
 
 bucket：
 
@@ -1214,6 +1215,7 @@ third_party/llama.cpp -> https://github.com/ggml-org/llama.cpp.git
 - `--device-index`
 - `--enable-mtp`
 - `--mtp-max-draft-tokens`
+- `--native-mtp-verification-kv-fusion`
 - `--no-graph-reuse`
 - `--temperature`
 

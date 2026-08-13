@@ -1238,6 +1238,86 @@ void append_mtp_prefill_kv_update(
     ggml_build_forward_expand(result.graph, stored.value);
 }
 
+void append_mtp_verification_kv_update(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    TargetChunkGraph & result,
+    ggml_tensor * target_hidden,
+    const AttentionCacheView & cache,
+    std::size_t n_tokens) {
+    require(n_tokens > 1, "MTP verification fusion requires at least two target tokens");
+    const Config & config = weights.config();
+    require(config.nextn_predict_layers == 1, "MTP verification fusion requires one MTP layer");
+    const LayerWeights & layer = weights.layer(config.main_layers);
+    require(layer.is_mtp(), "last Qwen3.5 layer is not the bundled MTP block");
+
+    const std::int64_t suffix_count = static_cast<std::int64_t>(n_tokens - 1);
+    require_shape(
+        target_hidden,
+        {static_cast<std::int64_t>(config.embedding_length),
+         static_cast<std::int64_t>(n_tokens)},
+        "MTP verification fusion target hidden");
+    require(
+        ggml_is_contiguous(target_hidden),
+        "MTP verification fusion target hidden must be contiguous");
+
+    result.mtp_verification_tokens = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, suffix_count);
+    result.mtp_verification_positions = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, suffix_count * 4);
+    result.mtp_verification_write_slots = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, suffix_count);
+    ggml_set_input(result.mtp_verification_tokens);
+    ggml_set_input(result.mtp_verification_positions);
+    ggml_set_input(result.mtp_verification_write_slots);
+    set_name(result.mtp_verification_tokens, "qwen35.target_chunk.mtp_verification_tokens");
+    set_name(result.mtp_verification_positions, "qwen35.target_chunk.mtp_verification_positions");
+    set_name(result.mtp_verification_write_slots, "qwen35.target_chunk.mtp_verification_write_slots");
+
+    // target_hidden[i] is the target state conditioned on verification input
+    // i.  It updates the MTP cache row for verification token i + 1, hence the
+    // first T - 1 hidden columns pair with a separately supplied token suffix.
+    ggml_tensor * hidden_prefix = ggml_view_2d(
+        ctx,
+        target_hidden,
+        target_hidden->ne[0],
+        suffix_count,
+        target_hidden->nb[1],
+        0);
+    set_name(hidden_prefix, "qwen35.target_chunk.mtp_verification_hidden_prefix");
+    ggml_tensor * token_embedding = ggml_get_rows(
+        ctx, layer.mtp_token_embd, result.mtp_verification_tokens);
+    ggml_tensor * current = ops::mtp_merge_embedding_and_hidden(
+        ctx,
+        token_embedding,
+        hidden_prefix,
+        layer.nextn_enorm,
+        layer.nextn_hnorm,
+        layer.nextn_eh_proj,
+        config);
+    current = ops::rms_norm(
+        ctx,
+        current,
+        layer.attn_norm,
+        config.attention_layer_norm_rms_epsilon,
+        "qwen35.target_chunk.mtp_verification_attention_norm");
+
+    const StoredKeyValue stored = store_attention_key_value(
+        ctx,
+        current,
+        layer,
+        cache,
+        result.mtp_verification_positions,
+        result.mtp_verification_write_slots,
+        config,
+        suffix_count,
+        "qwen35.target_chunk.mtp_verification_kv_update");
+    add_critical(result, stored.key);
+    add_critical(result, stored.value);
+    ggml_build_forward_expand(result.graph, stored.key);
+    ggml_build_forward_expand(result.graph, stored.value);
+}
+
 }  // namespace
 
 TokenGraph build_target_token_graph(
@@ -1337,7 +1417,8 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     bool retain_hidden,
     bool force_causal_mask,
     AttentionImplementation attention_implementation,
-    const AttentionCacheView * mtp_prefill_cache) {
+    const AttentionCacheView * mtp_prefill_cache,
+    const AttentionCacheView * mtp_verification_cache) {
 
     //执行校验，保证参数有效，随时准备抛出异常
     require(ctx != nullptr, "target chunk GGML context is null");
@@ -1351,6 +1432,12 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
             output_mode == TargetChunkOutputMode::Last ||
             output_mode == TargetChunkOutputMode::All,
         "target chunk output mode is invalid");
+    require(
+        mtp_prefill_cache == nullptr || mtp_verification_cache == nullptr,
+        "target chunk cannot fuse MTP prefill and verification KV updates together");
+    require(
+        mtp_verification_cache == nullptr || n_tokens > 1,
+        "MTP verification KV fusion requires at least two target tokens");
 
     const Config & config = weights.config();   //模型配置
     require(config.main_layers == 24, "target chunk graph requires 24 decoder layers");
@@ -1427,7 +1514,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     // side effects.  Its final hidden, output norm and 248K-row vocabulary head
     // have no consumer.  MTP maintenance still requests the normalized hidden.
     if (output_mode != TargetChunkOutputMode::None || retain_hidden ||
-        mtp_prefill_cache != nullptr) {
+        mtp_prefill_cache != nullptr || mtp_verification_cache != nullptr) {
         current = ops::rms_norm(
             ctx,
             current,
@@ -1452,6 +1539,15 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
                 current,
                 *mtp_prefill_cache,
                 inputs,
+                n_tokens);
+        }
+        if (mtp_verification_cache != nullptr) {
+            append_mtp_verification_kv_update(
+                ctx,
+                weights,
+                result,
+                current,
+                *mtp_verification_cache,
                 n_tokens);
         }
     }

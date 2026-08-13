@@ -80,10 +80,12 @@ class NativeBackendConfigTests(unittest.TestCase):
                 native_attention_impl="auto",
                 native_batched_recurrent_snapshots=True,
                 native_mtp_prefill_fusion=True,
+                native_mtp_verification_kv_fusion=True,
             )
             self.assertEqual(config.native_attention_impl, "auto")
             self.assertTrue(config.native_batched_recurrent_snapshots)
             self.assertTrue(config.native_mtp_prefill_fusion)
+            self.assertTrue(config.native_mtp_verification_kv_fusion)
 
             paged = Config(
                 model=model.name,

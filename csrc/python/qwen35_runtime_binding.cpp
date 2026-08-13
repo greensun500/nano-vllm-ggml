@@ -369,6 +369,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     PyObject * attention_impl_object = nullptr;
     PyObject * enable_batched_recurrent_snapshots_object = Py_False;
     PyObject * enable_mtp_prefill_fusion_object = Py_False;
+    PyObject * enable_mtp_verification_kv_fusion_object = Py_False;
     static const char * keywords[] = {
         "model_path",
         "backend",
@@ -386,12 +387,13 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         "attention_impl",
         "enable_batched_recurrent_snapshots",
         "enable_mtp_prefill_fusion",
+        "enable_mtp_verification_kv_fusion",
         nullptr,
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|OOOOO:Qwen35Runtime",
+            "OOOOOOOOOOO|OOOOOO:Qwen35Runtime",
             const_cast<char **>(keywords),
             &model_path_object,
             &backend_object,
@@ -408,7 +410,8 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             &enable_vulkan_graph_reuse_object,
             &attention_impl_object,
             &enable_batched_recurrent_snapshots_object,
-            &enable_mtp_prefill_fusion_object)) {
+            &enable_mtp_prefill_fusion_object,
+            &enable_mtp_verification_kv_fusion_object)) {
         return -1;
     }
     if (self->runtime != nullptr) {
@@ -476,8 +479,11 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             options.enable_batched_recurrent_snapshots) ||
         !parse_bool(
             enable_mtp_prefill_fusion_object,
-            "enable_mtp_prefill_fusion",
-            options.enable_mtp_prefill_fusion)) {
+            "enable_mtp_prefill_fusion", options.enable_mtp_prefill_fusion) ||
+        !parse_bool(
+            enable_mtp_verification_kv_fusion_object,
+            "enable_mtp_verification_kv_fusion",
+            options.enable_mtp_verification_kv_fusion)) {
         return -1;
     }
     if (attention_impl_object != nullptr &&

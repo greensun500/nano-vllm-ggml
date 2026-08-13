@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.87 Vulkan direct paged attention correctness gate
+# nano-vLLM 当前版本修改说明：v3.88 MTP verification KV graph fusion
 
 ## 1. 版本定位
 
@@ -31,6 +31,8 @@
   的受审计 `5ed3338` revision 接受列表
 - v3.87：修复 direct paged graph 的孤立 mask/padded-slot 正确性问题；仅对
   已通过 oracle 的 T=1 decode 启用，T>1 prefill/MTP verification 保持 math
+- v3.88：把 verification 中 target-conditioned MTP KV 写入可选地附加到同一
+  TargetChunkGraph，消除 accepted-prefix 的独立 KV-only graph；默认关闭
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -86,6 +88,28 @@ gitlink 为 `0caa416`，但受操作约束，远程同步不能写入子模块 `
 metadata 仍报告已受审计的 `5ed3338`。CMake 现在同时接受新的 v3.86 gitlink、
 `5ed3338` 的远程 source snapshot 和既有 CPU_REPACK compatibility revision；
 这不会放宽到任意 revision，也不会改变 shader、图或默认运行路径。
+
+v3.88 专注于 MTP verification 的图边界，而不改变 target、MTP draft、LM head
+或 acceptance 规则。legacy 路径在 host 比较 accepted 数量后，才把
+`inputs[1:a+1]` 与 `target_hidden[0:a]` 送入独立 `MtpKvUpdateGraph`。新开关
+`native_mtp_verification_kv_fusion=True` 让 verification `TargetChunkGraph(T=K+1)`
+直接接收同一输入的 `[1,T)` token/position/slot 后缀，并以
+`target_hidden[0:T-1]` 在图内执行 MTP merge/norm/KV projection/`SET_ROWS`。
+它会预写未接受尾部的 MTP KV 行；这些行不在 `next_position` 的可见 context 内，
+且下一轮 draft 在读之前必定覆写，因此不需要额外清零。`pending_hidden` 和
+K+1 greedy prediction 仍需要 readback，recurrent rollback 也不变。
+
+该开关要求 native backend + MTP，Python `Config`、`NativeRunner`、C++ binding、
+chat/bench CLI 和 JSON 都显式记录它，默认 `False`。远端 Armv9.2/Mali-G720
+real-model short MTP oracle（full accept、partial accept、immediate reject、release、
+fusion A/B）5/5 通过；CPU 同一 oracle 5/5 通过。统一 Vulkan K=1 math A/B
+（prompt 186、generate 541、repeat 3、warmup 1、8 cores）两组均为
+`drafted/accepted/verification=810/810/810`、acceptance `100%`：legacy 的
+draft/verification/KV 为 `12.377/68.134/0.784s`，融合后为
+`12.311/68.303/0s`，decode `19.885 -> 20.057 tok/s`（`+0.87%`），generated
+`18.084 -> 18.226 tok/s`。收益很小且仍需更多 context/K 值验证，故不改变默认。
+完整 build、oracle、失败的历史 long-MTP baseline 与 JSON 位于远端
+`v37-results/20260814-041222-v388-mtp-verification-kv-fusion/`。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -147,10 +171,10 @@ Qwen3.5 attention 不只是标准 Q/K/V attention：query projection 还拆出 g
 | `csrc/runtime/recurrent_state.{h,cpp}`、`csrc/runtime/qwen35_runtime.cpp` | 为相邻 delta snapshot plane 创建连续 `[D,1,K,1]` view；启用时一个 `ggml_cpy` 写回全部 snapshot，CUDA 后端可匹配 GGML 现有的 GDN-to-cache 融合。 |
 | `csrc/runtime/qwen35_runtime.{h,cpp}` | 增加 `math/auto/flash` 选择、按真实 shape/backend probe Flash 能力、F32/F16 mask 上传转换；MTP 的 `auto` 固定 math，避免 Flash 的 shape-dependent rounding 压低 greedy acceptance；MTP prefill fusion 禁止复用旧 bucket，避免图结构与输入/输出语义混淆。 |
 | `CMakeLists.txt`、`scripts/build_native_runtime.sh`、`csrc/native_module.cpp` | 增加默认关闭的 `NANOVLLM_NATIVE_CUDA_GRAPHS` 构建开关和 build info；CUDA Graph 是 GGML backend scope 行为，因此以独立 build variant 作为 A/B 边界；若未同时开启 CUDA，CMake 和脚本都会明确拒绝该配置。 |
-| `nanovllm/config.py`、native runner、chat/bench CLI | 暴露 `native_attention_impl`、`native_batched_recurrent_snapshots`、`native_mtp_prefill_fusion`；v3.80 起 attention 默认为受 capability probe 保护的 `auto`，其余默认关闭，CLI/JSON 会记录运行时 A/B 配置。 |
+| `nanovllm/config.py`、native runner、chat/bench CLI | 暴露 `native_attention_impl`、`native_batched_recurrent_snapshots`、`native_mtp_prefill_fusion`、`native_mtp_verification_kv_fusion`；v3.80 起 attention 默认为受 capability probe 保护的 `auto`，其余默认关闭，CLI/JSON 会记录运行时 A/B 配置。 |
 | native tests | 增加精确 GQA FlashAttention layout/F16 causal-mask oracle、连续 GDN snapshot CPY plane-order 测试、Python 配置/ABI 传递测试，以及 opt-in real-model MTP trace oracle。 |
 
-关键边界：Flash 路径仍先 `SET_ROWS` 到 PagedKV、再 `GET_ROWS` gather，所以它不是新的 paged-attention kernel；只是在 gather 后把 QK、softmax、PV 的中间分数/概率留在 backend kernel 内。MTP verification 的 accepted 数量必须在 host 比较后才能知道，故其 catch-up 仍是独立 KV-only graph。Mali 实测显示 Flash 在正确性 oracle 中可用，但 draft `T=1` 与 verification `T=K+1` 的舍入差异会把 K=1 acceptance 从 100% 降至 50%，并让 decode 吞吐退化；因此 MTP 下 `auto` 保守选择 math，显式 `flash` 只作实验。`lm_head + argmax` 的全词表量化 matmul 仍是第二阶段课题；当前没有为了“融合”而添加不成熟的自定义 Q4 kernel。
+关键边界：Flash 路径仍先 `SET_ROWS` 到 PagedKV、再 `GET_ROWS` gather，所以它不是新的 paged-attention kernel；只是在 gather 后把 QK、softmax、PV 的中间分数/概率留在 backend kernel 内。v3.88 的 verification KV fusion 不需要事先知道 accepted 数量：只预写 `[1,T)` 后缀，未接受行不会被后续 context 索引且会被覆盖；但它仍保留 target hidden/prediction readback 和 host rollback。Mali 实测显示 Flash 在正确性 oracle 中可用，但 draft `T=1` 与 verification `T=K+1` 的舍入差异会把 K=1 acceptance 从 100% 降至 50%，并让 decode 吞吐退化；因此 MTP 下 `auto` 保守选择 math，显式 `flash` 只作实验。`lm_head + argmax` 的全词表量化 matmul 仍是第二阶段课题；当前没有为了“融合”而添加不成熟的自定义 Q4 kernel。
 
 ### 2.7 v3.71 fallback 生命周期与 plan 校验优化
 
@@ -303,7 +327,7 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
   --max-num-seqs 1
 ```
 
-可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。图优化 A/B 使用 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 的 A/B 则使用独立 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
+可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。图优化 A/B 使用 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`、`--native-mtp-verification-kv-fusion`；CUDA Graph 的 A/B 则使用独立 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
 
 ## 6. 当前边界与下一步
 
@@ -311,5 +335,5 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
 3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收。Vulkan 的 bucket reuse 仅有 v3.74 默认关闭的实验开关，需先通过 Mali oracle。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。v3.87 的 direct paged kernel 也保持显式、仅 T=1，直到 multi-token exact oracle 和端到端收益均通过；后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、split-K paged attention 和自适应 K 策略。
+5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。v3.87 的 direct paged kernel 也保持显式、仅 T=1；v3.88 verification-KV fusion 同样保持 opt-in，直到更多 context/K 值的 Vulkan oracle 和收益通过。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、split-K paged attention 和自适应 K 策略。
 6. v3.77 的 stage profile 是上述融合与自适应 K 的验收指标；Vulkan graph reuse 仍是默认关闭的 correctness 探针，当前 Mali 数据显示不应启用。

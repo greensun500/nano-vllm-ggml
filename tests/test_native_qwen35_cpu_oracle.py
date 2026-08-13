@@ -24,6 +24,7 @@ from nanovllm.backends.native.runner import NativeRunner
 
 MODEL_ENV = "NANOVLLM_TEST_QWEN35_GGUF"
 TOKENIZER_ENV = "NANOVLLM_TEST_QWEN35_TOKENIZER"
+BACKEND_ENV = "NANOVLLM_TEST_QWEN35_BACKEND"
 SEQUENCE_ID = 701
 BLOCK_SIZE = 256
 
@@ -79,6 +80,9 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
             raise AssertionError("NANOVLLM_TEST_CPU_THREADS must be an integer") from exc
         if cls.cpu_threads <= 0:
             raise AssertionError("NANOVLLM_TEST_CPU_THREADS must be positive")
+        cls.backend = os.environ.get(BACKEND_ENV, "cpu")
+        if cls.backend not in {"cpu", "vulkan"}:
+            raise AssertionError(f"{BACKEND_ENV} must be cpu or vulkan")
 
     def make_runner(
         self,
@@ -87,11 +91,12 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
         max_model_len: int = BLOCK_SIZE,
         native_batched_recurrent_snapshots: bool = False,
         native_mtp_prefill_fusion: bool = False,
+        native_mtp_verification_kv_fusion: bool = False,
     ) -> NativeRunner:
         config = SimpleNamespace(
             model=os.fspath(self.model_path),
             gguf_model=os.fspath(self.model_path),
-            backend="native_cpu",
+            backend=f"native_{self.backend}",
             device_config={"n_threads": self.cpu_threads, "device_index": 0},
             max_model_len=max_model_len,
             max_num_batched_tokens=16,
@@ -102,6 +107,7 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
             mtp_max_draft_tokens=3,
             native_batched_recurrent_snapshots=native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=native_mtp_prefill_fusion,
+            native_mtp_verification_kv_fusion=native_mtp_verification_kv_fusion,
         )
         return NativeRunner(config)
 
@@ -237,11 +243,18 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
     def test_opt_in_graph_optimizations_match_the_legacy_mtp_trace(self):
         prompt_ids = self.prompt_tokens("Once upon a time", [12162, 5028, 264, 854])
         traces = []
-        for optimized in (False, True):
+        variants = [(False, False, False), (False, False, True)]
+        # The pre-existing snapshot/prefill pair is CPU-only experimental: it
+        # has no Vulkan token oracle yet, so do not let that unrelated path
+        # hide the verification-KV fusion gate on Mali.
+        if self.backend == "cpu":
+            variants.extend(((True, True, False), (True, True, True)))
+        for batched_snapshots, prefill_fusion, verification_kv_fusion in variants:
             runner = self.make_runner(
                 enable_mtp=True,
-                native_batched_recurrent_snapshots=optimized,
-                native_mtp_prefill_fusion=optimized,
+                native_batched_recurrent_snapshots=batched_snapshots,
+                native_mtp_prefill_fusion=prefill_fusion,
+                native_mtp_verification_kv_fusion=verification_kv_fusion,
             )
             try:
                 pending, first, second = self.mtp_trace(runner, prompt_ids=prompt_ids)
@@ -249,7 +262,8 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
             finally:
                 runner.shutdown()
 
-        self.assertEqual(traces[1], traces[0])
+        for index, trace in enumerate(traces[1:], start=1):
+            self.assertEqual(trace, traces[0], f"MTP optimization variant {variants[index]} changed the trace")
 
     def test_mtp_near_context_boundary_falls_back_to_target_greedy(self):
         runner = self.make_runner(enable_mtp=True, max_model_len=2)

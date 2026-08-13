@@ -146,6 +146,7 @@ class NativeRunnerTests(unittest.TestCase):
                 "attention_impl": "auto",
                 "enable_batched_recurrent_snapshots": False,
                 "enable_mtp_prefill_fusion": False,
+                "enable_mtp_verification_kv_fusion": False,
             },
         )
         self.assertNotIn("library_path", kwargs)
@@ -161,6 +162,7 @@ class NativeRunnerTests(unittest.TestCase):
                 native_attention_impl="auto",
                 native_batched_recurrent_snapshots=True,
                 native_mtp_prefill_fusion=True,
+                native_mtp_verification_kv_fusion=True,
                 native_vulkan_graph_reuse=True,
             )
         )
@@ -168,6 +170,7 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertEqual(kwargs["attention_impl"], "auto")
         self.assertTrue(kwargs["enable_batched_recurrent_snapshots"])
         self.assertTrue(kwargs["enable_mtp_prefill_fusion"])
+        self.assertTrue(kwargs["enable_mtp_verification_kv_fusion"])
         self.assertTrue(kwargs["enable_vulkan_graph_reuse"])
 
     def test_greedy_run_flattens_and_converts_the_execution_plan(self):

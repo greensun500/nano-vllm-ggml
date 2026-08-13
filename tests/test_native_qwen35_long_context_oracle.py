@@ -43,6 +43,7 @@ def _run_probe(args: argparse.Namespace) -> None:
         mtp_max_draft_tokens=3,
         device_config={"n_threads": args.threads, "device_index": 0},
         native_attention_impl=args.attention_impl,
+        native_mtp_verification_kv_fusion=args.mtp_verification_kv_fusion,
     )
     try:
         output = llm.generate(
@@ -62,6 +63,7 @@ def _run_probe(args: argparse.Namespace) -> None:
                     "backend": args.backend,
                     "max_batch": args.max_batch,
                     "mtp": args.mtp,
+                    "mtp_verification_kv_fusion": args.mtp_verification_kv_fusion,
                     "token_ids": list(output["token_ids"]),
                     "mtp_stats": stats,
                 },
@@ -110,7 +112,13 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
             )
 
     @classmethod
-    def probe(cls, backend: str, max_batch: int, mtp: bool) -> dict:
+    def probe(
+        cls,
+        backend: str,
+        max_batch: int,
+        mtp: bool,
+        mtp_verification_kv_fusion: bool = False,
+    ) -> dict:
         command = [
             sys.executable,
             os.fspath(Path(__file__).resolve()),
@@ -130,6 +138,8 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
         ]
         if mtp:
             command.append("--mtp")
+        if mtp_verification_kv_fusion:
+            command.append("--mtp-verification-kv-fusion")
         completed = subprocess.run(
             command,
             check=True,
@@ -149,17 +159,21 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
         for backend in self.backends:
             with self.subTest(backend=backend):
                 results = {
-                    (max_batch, mtp): self.probe(backend, max_batch, mtp)
+                    (max_batch, mtp, fusion): self.probe(
+                        backend, max_batch, mtp, fusion
+                    )
                     for max_batch in (768, 64)
                     for mtp in (False, True)
+                    for fusion in ((False, True) if mtp else (False,))
                 }
-                expected = results[(768, False)]["token_ids"]
+                expected = results[(768, False, False)]["token_ids"]
                 self.assertEqual(len(expected), GENERATED_TOKENS)
                 for key, result in results.items():
                     self.assertEqual(
                         result["token_ids"],
                         expected,
-                        f"{backend} max_batch={key[0]} mtp={key[1]} changed the greedy trace",
+                        f"{backend} max_batch={key[0]} mtp={key[1]} "
+                        f"mtp_verification_kv_fusion={key[2]} changed the greedy trace",
                     )
                     if key[1]:
                         stats = result["mtp_stats"]
@@ -183,6 +197,7 @@ def _parse_probe_args() -> argparse.Namespace:
         "--attention-impl", choices=("auto", "math", "flash", "paged"), required=True
     )
     parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-verification-kv-fusion", action="store_true")
     return parser.parse_args()
 
 

@@ -37,6 +37,7 @@ class Config:
     native_attention_impl: str = "auto"
     native_batched_recurrent_snapshots: bool = False
     native_mtp_prefill_fusion: bool = False
+    native_mtp_verification_kv_fusion: bool = False
     enable_session_cache: bool = True
     max_retained_sessions: int = 1
     max_consecutive_prefill_rounds: int = 4
@@ -102,6 +103,15 @@ class Config:
         if self.native_mtp_prefill_fusion:
             _require(is_native, "native_mtp_prefill_fusion requires a native backend")
             _require(self.enable_mtp, "native_mtp_prefill_fusion requires enable_mtp=True")
+        if self.native_mtp_verification_kv_fusion:
+            _require(
+                is_native,
+                "native_mtp_verification_kv_fusion requires a native backend",
+            )
+            _require(
+                self.enable_mtp,
+                "native_mtp_verification_kv_fusion requires enable_mtp=True",
+            )
         if self.native_vulkan_graph_reuse:
             _require(
                 self.backend == "native_vulkan",

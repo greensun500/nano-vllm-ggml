@@ -68,6 +68,9 @@ class NativeRunner:
             enable_mtp_prefill_fusion=bool(
                 getattr(config, "native_mtp_prefill_fusion", False)
             ),
+            enable_mtp_verification_kv_fusion=bool(
+                getattr(config, "native_mtp_verification_kv_fusion", False)
+            ),
         )
 
     @staticmethod

@@ -33,6 +33,7 @@ struct Qwen35RuntimeOptions {
         Qwen35AttentionImplementation::Math;
     bool enable_batched_recurrent_snapshots = false;
     bool enable_mtp_prefill_fusion = false;
+    bool enable_mtp_verification_kv_fusion = false;
 };
 
 struct Qwen35GraphReuseStats {

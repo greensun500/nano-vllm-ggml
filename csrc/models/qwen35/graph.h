@@ -130,6 +130,15 @@ struct TargetChunkGraph {
     ggml_tensor * mtp_previous_hidden = nullptr; // F32 [2048, 1]
     ggml_tensor * mtp_last_hidden = nullptr;     // F32 [2048, 1]
 
+    // Optional MTP-verification fusion inputs.  A verification chunk already
+    // produces target hidden states for every candidate token.  These tensors
+    // describe its [1, T) token suffix so the graph can directly replace the
+    // draft-conditioned MTP K/V rows without first round-tripping hidden data
+    // through the host and launching a second maintenance graph.
+    ggml_tensor * mtp_verification_tokens = nullptr;      // I32 [T - 1]
+    ggml_tensor * mtp_verification_positions = nullptr;   // I32 [4 * (T - 1)]
+    ggml_tensor * mtp_verification_write_slots = nullptr; // I32 [T - 1]
+
     std::vector<ggml_tensor *> critical_compute_nodes;
 };
 
@@ -174,7 +183,8 @@ TargetChunkGraph build_target_chunk_graph(
     bool retain_hidden,
     bool force_causal_mask = false,
     AttentionImplementation attention_implementation = AttentionImplementation::Math,
-    const AttentionCacheView * mtp_prefill_cache = nullptr);
+    const AttentionCacheView * mtp_prefill_cache = nullptr,
+    const AttentionCacheView * mtp_verification_cache = nullptr);
 
 TokenGraph build_mtp_token_graph(
     ggml_context * ctx,

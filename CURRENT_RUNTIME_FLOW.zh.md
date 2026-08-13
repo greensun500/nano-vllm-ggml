@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.87
+# nano-vLLM 当前执行流程：v3.88
 
 ## 1. 架构边界
 
@@ -141,7 +141,9 @@ mtp_hidden[i] = target_hidden[i-1]
 
 它不执行 MTP attention、FFN、head 或 token readback。当前片最后一个 target hidden 成为下一片的 `pending_hidden`。因此 Mali 非最终片虽然使用 `None`，仍会保留 hidden 和 output norm，只跳过 tied vocab head/argmax。
 
-`native_mtp_prefill_fusion=True` 时，target graph 内部直接构造同一右移 hidden，继续执行 MTP merge/norm/KV projection/`SET_ROWS`。host 只读回最后一列 `[E,1]` 作为下一 chunk 的 `pending_hidden`，不再上传 `[E,T]` shifted hidden 或单独执行 prefill KV-only graph；为了保持 graph 语义简单，该路径当前不复用旧 persistent bucket。verification 的 accepted 数量必须由 host 先比较 draft/target token 才能确定，仍保留独立的 catch-up KV-only graph。
+`native_mtp_prefill_fusion=True` 时，target graph 内部直接构造同一右移 hidden，继续执行 MTP merge/norm/KV projection/`SET_ROWS`。host 只读回最后一列 `[E,1]` 作为下一 chunk 的 `pending_hidden`，不再上传 `[E,T]` shifted hidden 或单独执行 prefill KV-only graph；为了保持 graph 语义简单，该路径当前不复用旧 persistent bucket。
+
+v3.88 新增、默认关闭的 `native_mtp_verification_kv_fusion=True` 解决 verification 的另一份 KV-only 提交：verification 已知完整输入 `[x_p,d1,...,dK]`，所以 target graph 可同时为后缀 `[d1,...,dK]` 写入 MTP KV。host 随后仍按 prediction 决定 accepted `a`，但不再提交只覆盖 `1..a` 的 catch-up graph。未接受的 speculative 尾部只是提前写入；`next_position` 永不读取 committed prefix 之外的 slot，而下一轮 draft 会在读取前覆盖它们，因此语义等价。该选项不与 prefill fusion 组合进同一 target graph；两者分别用于不同调用路径。
 
 ## 8. MTP speculative decode
 
@@ -181,7 +183,7 @@ next_position        <- p+a+1
 
 target attention KV 的未提交尾部无需清零：下一轮只 gather committed context，未来写入会覆盖尾部。
 
-### 8.4 MTP KV catch-up
+### 8.4 MTP KV catch-up / verification 合图
 
 draft index 0 已写入真实 `x_p + h_{p-1}`。若 `a>0`，将 index `1..a` 一次补齐：
 
@@ -192,7 +194,9 @@ positions     = p+1 ... p+a
 write_slots   = committed slots
 ```
 
-`a=0` 时不执行 catch-up。该 graph 仍与 verification 分离，但单序列 CPU 时 `T=1..K` 的 KV-only graph 会进入 persistent cache。
+`a=0` 时不执行 catch-up。legacy 路径中该 graph 与 verification 分离，单序列 CPU 时 `T=1..K` 的 KV-only graph 会进入 persistent cache。
+
+启用 `native_mtp_verification_kv_fusion` 后，verification graph 直接接收后缀 token、position 和 write slot，并把 `target_hidden[0:K]` 与其配对写入 MTP PagedKV；无论最终 `a` 为何，都不再执行 catch-up。这样消除了一个 graph 构建/上传/提交边界，仍保留 K+1 prediction 与 target hidden 的 host readback（它们用于 acceptance、rollback 和下一轮 pending hidden）。
 
 ## 9. 图数、同步与 readback
 
@@ -201,7 +205,7 @@ K=3 常规轮次为：
 ```text
 3 × serial MTP draft graph
 1 × TargetChunkGraph(T=4, All)
-0/1 × MTP KV-only catch-up graph
+0/1 × MTP KV-only catch-up graph（仅 legacy；verification KV fusion 时为 0）
 ```
 
 readback 规则：
@@ -210,7 +214,7 @@ readback 规则：
 - legacy 非最终 MTP-on prefill 片：读取完整 hidden，执行 KV-only maintenance，不读 token；fusion 路径只读取最后一列 hidden；
 - 最终 prefill 片：读取一个 token；legacy MTP 还读取完整 hidden，fusion MTP 只读取最后一列；
 - MTP draft：读取 draft token，非末步还读取下一步 hidden；
-- verification：读取 K+1 predictions 与全部 target hidden；
+- verification：读取 K+1 predictions 与全部 target hidden；KV fusion 只改变 cache 写入位置，不减少这些用于 acceptance 的 readback；
 - MTP KV-only：无 host 输出。
 
 `GraphExecutor::compute()` 使用同步 GGML scheduler API。fallback 路径仍在 graph guard 退出时 reset transient allocation，并按轮重建 graph metadata。
@@ -219,7 +223,7 @@ v3.5 引入、v3.7 保留的 persistent graph 路径按 key 常驻独立 executo
 
 ```text
 graph_kind + T + n_kv_bucket + output_mode + snapshot_count
-  + sequence_slot + input_plane + retain_hidden
+  + sequence_slot + input_plane + retain_hidden + mtp_verification_kv_fusion
 ```
 
 entry 首次 miss 时构图、accelerator placement、scheduler allocation；命中时只更新 token、position、read/write slots、mask 和 hidden input，然后重复 `compute()`。bucket 只保存 graph metadata、scheduler allocation 和 transient activation buffer，不保存 KV cache、不复制权重。
@@ -236,7 +240,7 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 - v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
 - graph reuse 默认只保证 CPU 单序列 decode/MTP；CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建的 extension。Vulkan 的 persistent bucket 只在显式 `native_vulkan_graph_reuse=true` 时实验性启用，因历史 Mali padded-mask 风险必须先经 oracle 验证。
 - `NANOVLLM_NATIVE_CPU_REPACK` 默认关闭：Arm real-model MTP oracle 已发现当前 Q4_0 `q4_0_4x8` 重排会改变 partial rollback trace。实验 build 开启时，加载器仍只将满足 ISA/shape 条件、且不被 `GET_ROWS` 读取的二维 Q4_0/Q6_K 投影放入该 buffer；`token_embd.weight` 和可选 MTP embedding 始终保持 default buffer。Vulkan/CUDA 不走此路径。
-- MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。v3.77 bench 会将 native draft / target verification / KV catch-up 的累计 wall 与 setup time 分开导出；Mali K=1 实测为 `15.90 / 72.06 / 1.03s`，故 verification 而非图 setup（`1.74s`）是主导成本。186-token 的 T=2 verification kernel 内，Q6_K head + argmax 为 `15.15 + 3.95ms` / `79.11ms`，是 fused head 的第一目标；KV gather 仅 `0.25ms`。v3.82 将 Mali `ARGMAX` workgroup 从 16 lane 提升到 256 lane，保持低 index tie-break；真实 K=1 acceptance 保持 `100%`，短 profile 将 ARGMAX 降至约 `0.26ms`，统一 decode 为 `19.92 tok/s`（旧基线 `18.58`）。它减少独立 reduction 的串行扫描，但仍保留全量 logits，因此不是最终 fused head。4096-token math verification 中 GET_ROWS 增至 `5.25ms`，但 score/value matmul 仍约 `62.7 / 134.5ms`；因此 direct paged attention 必须做 page-table 直读和 online softmax/value accumulation，而非仅消除 gather。显式 Flash 单步把该 verification 从 `463.4` 降至 `333.5ms`，但 MTP auto 仍固定 math 以避免历史的 shape-dependent acceptance 回退。v3.80 把这一已验收的融合用于 non-MTP 默认值：同一 Mali 长 decode 的 auto 为 `21.24 tok/s`，显式 math 为 `20.81 tok/s`（+2.07%）；MTP 不共享这项默认变更。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。Mali K=1 的 experimental persistent-graph A/B 还显示高 cache hit 不能抵消 padded bucket 与动态输入开销，故默认继续 eager。
+- MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。v3.77 bench 会将 native draft / target verification / KV catch-up 的累计 wall 与 setup time 分开导出；Mali K=1 实测为 `15.90 / 72.06 / 1.03s`，故 verification 而非图 setup（`1.74s`）是主导成本。v3.88 把 verification 后的 KV-only graph 合入 verification graph；同一统一 K=1 基准中 KV catch-up 从 `0.784s` 降为 `0`，但 verification 增加约 `0.170s`，最终 decode `19.885 -> 20.057 tok/s`（+0.87%），说明它是正确的小边界优化而非 verification 主瓶颈的根治。186-token 的 T=2 verification kernel 内，Q6_K head + argmax 为 `15.15 + 3.95ms` / `79.11ms`，是 fused head 的第一目标；KV gather 仅 `0.25ms`。v3.82 将 Mali `ARGMAX` workgroup 从 16 lane 提升到 256 lane，保持低 index tie-break；真实 K=1 acceptance 保持 `100%`，短 profile 将 ARGMAX 降至约 `0.26ms`，统一 decode 为 `19.92 tok/s`（旧基线 `18.58`）。它减少独立 reduction 的串行扫描，但仍保留全量 logits，因此不是最终 fused head。4096-token math verification 中 GET_ROWS 增至 `5.25ms`，但 score/value matmul 仍约 `62.7 / 134.5ms`；因此 direct paged attention 必须做 page-table 直读和 online softmax/value accumulation，而非仅消除 gather。显式 Flash 单步把该 verification 从 `463.4` 降至 `333.5ms`，但 MTP auto 仍固定 math 以避免历史的 shape-dependent acceptance 回退。v3.80 把这一已验收的融合用于 non-MTP 默认值：同一 Mali 长 decode 的 auto 为 `21.24 tok/s`，显式 math 为 `20.81 tok/s`（+2.07%）；MTP 不共享这项默认变更。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。Mali K=1 的 experimental persistent-graph A/B 还显示高 cache hit 不能抵消 padded bucket 与动态输入开销，故默认继续 eager。
 - CUDA 已接入 build、backend discovery、placement audit、native runner 与 opt-in CUDA Graph，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。
 
 ## 12. 构建与基准命令结构
@@ -274,4 +278,4 @@ python3 -m nanovllm.cli.bench "$MODEL" ... \
   --prompt-len 521 --gen-len 129 --warmup 1 --repeat 3 --json
 ```
 
-MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。v3.7 图级 A/B 参数是 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；`paged` 只用于 `native_vulkan` 的 correctness 与长上下文对照，未进入默认。CUDA Graph 用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的单独构建做 A/B。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。
+MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。v3.7/v3.88 图级 A/B 参数是 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`、`--native-mtp-verification-kv-fusion`；最后一项仅对 native MTP verification 生效，默认关闭。`paged` 只用于 `native_vulkan` 的 correctness 与长上下文对照，未进入默认。CUDA Graph 用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的单独构建做 A/B。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。

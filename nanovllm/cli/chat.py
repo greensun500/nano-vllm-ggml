@@ -151,6 +151,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("NANOVLLM_NATIVE_MTP_PREFILL_FUSION", "0") == "1",
         help="Fuse native MTP prefill hidden-to-KV maintenance into the target graph.",
     )
+    parser.add_argument(
+        "--native-mtp-verification-kv-fusion",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_MTP_VERIFICATION_KV_FUSION", "0") == "1",
+        help="Fuse target-conditioned MTP KV maintenance into each verification graph.",
+    )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
     parser.add_argument(
@@ -207,6 +213,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             native_attention_impl=args.native_attention_impl,
             native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
+            native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,
