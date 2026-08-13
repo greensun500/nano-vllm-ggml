@@ -97,6 +97,10 @@ public:
     // Expands logical token positions through one sequence's block table.  A
     // block table may contain padded entries after the requested logical end;
     // required entries must be in range and unique within the sequence.
+    void validate_logical_range(
+        const std::vector<std::int32_t> & block_table,
+        std::size_t logical_start,
+        std::size_t token_count) const;
     std::vector<std::int32_t> physical_indices(
         const std::vector<std::int32_t> & block_table,
         std::size_t logical_start,

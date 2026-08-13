@@ -321,7 +321,7 @@ void PagedKvCache::validate_block_table_prefix(
     }
 }
 
-std::vector<std::int32_t> PagedKvCache::physical_indices(
+void PagedKvCache::validate_logical_range(
     const std::vector<std::int32_t> & block_table,
     std::size_t logical_start,
     std::size_t token_count) const {
@@ -335,6 +335,14 @@ std::vector<std::int32_t> PagedKvCache::physical_indices(
     const std::size_t required_blocks =
         logical_end == 0 ? 0 : 1 + (logical_end - 1) / block_size_;
     validate_block_table_prefix(block_table, required_blocks);
+}
+
+std::vector<std::int32_t> PagedKvCache::physical_indices(
+    const std::vector<std::int32_t> & block_table,
+    std::size_t logical_start,
+    std::size_t token_count) const {
+    validate_logical_range(block_table, logical_start, token_count);
+    const std::size_t logical_end = logical_start + token_count;
 
     std::vector<std::int32_t> result;
     result.reserve(token_count);

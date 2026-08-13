@@ -105,6 +105,12 @@ public:
     // buffers.  Tensors allocated by the previous graph must be discarded.
     void reset();
 
+    // `compute()` is synchronous in the GGML scheduler API.  Call this after
+    // a successful compute when the graph will be discarded immediately; it
+    // avoids issuing a second backend synchronization before the reset.  It
+    // must not be used after allocation/build failures or async backend work.
+    void reset_after_synchronous_compute();
+
     // Measures and reserves transient scheduler buffers.  The measure graph is
     // single-use according to the GGML scheduler contract.
     void reserve(ggml_cgraph * measure_graph);

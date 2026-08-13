@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.7 Native 图执行优化实验
+# nano-vLLM 当前版本修改说明：v3.71 Native fallback 生命周期优化
 
 ## 1. 版本定位
 
@@ -8,7 +8,8 @@
 - v3.6 功能提交：`12272ae Add native session scheduling and CUDA backend`
 - v3.6 正确性修复：`cd6ced0 Restore Qwen3.5 chunk attention gate`
 - v3.6 当前提交：`aabd733 v3.6: Add native MTP stage profiling`
-- v3.7 工作区：native attention/GDN/MTP/CUDA Graph 的 opt-in 图优化，待本次提交固化
+- v3.7：`044e92e v3.7: add native runtime optimization controls`
+- v3.71 工作区：同步生命周期与 execution-plan 校验分配优化，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -16,6 +17,8 @@
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
 
 v3.7 在此基础上只加入可独立 A/B 的图级优化，默认仍走 v3.6 math-attention 和逐 snapshot 写回路径：非 MTP 的 FlashAttention 用 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
+
+v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -81,6 +84,17 @@ Qwen3.5 attention 不只是标准 Q/K/V attention：query projection 还拆出 g
 | native tests | 增加精确 GQA FlashAttention layout/F16 causal-mask oracle、连续 GDN snapshot CPY plane-order 测试、Python 配置/ABI 传递测试，以及 opt-in real-model MTP trace oracle。 |
 
 关键边界：Flash 路径仍先 `SET_ROWS` 到 PagedKV、再 `GET_ROWS` gather，所以它不是新的 paged-attention kernel；只是在 gather 后把 QK、softmax、PV 的中间分数/概率留在 backend kernel 内。MTP verification 的 accepted 数量必须在 host 比较后才能知道，故其 catch-up 仍是独立 KV-only graph。Mali 实测显示 Flash 在正确性 oracle 中可用，但 draft `T=1` 与 verification `T=K+1` 的舍入差异会把 K=1 acceptance 从 100% 降至 50%，并让 decode 吞吐退化；因此 MTP 下 `auto` 保守选择 math，显式 `flash` 只作实验。`lm_head + argmax` 的全词表量化 matmul 仍是第二阶段课题；当前没有为了“融合”而添加不成熟的自定义 Q4 kernel。
+
+### 2.7 v3.71 fallback 生命周期与 plan 校验优化
+
+| 文件 | v3.71 改动 |
+| --- | --- |
+| `csrc/runtime/graph_executor.{h,cpp}` | 新增只用于“成功同步 compute 之后”的 reset；保留通用 `reset()` 的同步和异常路径保护。 |
+| `csrc/runtime/qwen35_runtime.cpp` | fallback target、MTP draft、MTP KV catch-up 的 RAII guard 仅在成功 compute 后走无重复同步的 reset；构图或执行异常仍走同步 reset。 |
+| `csrc/runtime/paged_kv.{h,cpp}` | 提供无分配 `validate_logical_range()`；`physical_indices()` 继续保持原有展开语义。 |
+| `tests/native/test_graph_executor.cpp` | 覆盖成功 compute 后 reset、立即重新 allocate/compute 的 scheduler 生命周期。 |
+
+GGML 当前 `ggml_backend_sched_graph_compute()` 已按同步语义完成 backend work，因此 fallback graph 在作用域退出时再次调用 `ggml_backend_sched_synchronize()` 是额外等待。v3.71 只在该同步成功返回后跳过第二次等待；若 allocate、上传或 compute 抛异常，guard 仍使用原始同步 reset，避免在未知 backend 状态下重用 scheduler。plan 校验仍验证 block table 的最大逻辑范围、block ID 合法性与同 sequence block 唯一性，只是不再物化本轮尚未参与计算的 context slot 列表。
 
 ## 3. 当前运行链路的新增部分
 

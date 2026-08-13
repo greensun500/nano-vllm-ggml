@@ -170,7 +170,11 @@ public:
     ~ExecutorResetGuard() {
         if (executor_ != nullptr) {
             try {
-                executor_->reset();
+                if (compute_completed_) {
+                    executor_->reset_after_synchronous_compute();
+                } else {
+                    executor_->reset();
+                }
             } catch (...) {
                 // Destructors cannot report a second error. The original
                 // execution exception remains the actionable failure.
@@ -179,9 +183,11 @@ public:
     }
     ExecutorResetGuard(const ExecutorResetGuard &) = delete;
     ExecutorResetGuard & operator=(const ExecutorResetGuard &) = delete;
+    void mark_synchronous_compute_complete() noexcept { compute_completed_ = true; }
 
 private:
     GraphExecutor * executor_;
+    bool compute_completed_ = false;
 };
 
 struct SequenceState {
@@ -718,8 +724,8 @@ struct Qwen35Runtime::Impl {
                      std::to_string(row));
             }
             // Also validates all blocks needed by the speculative tail.
-            (void) paged_kv->context_indices(
-                item.block_table, expected_start + count + future_tokens);
+            paged_kv->validate_logical_range(
+                item.block_table, 0, expected_start + count + future_tokens);
             prepared.push_back(std::move(item));
             token_offset += count;
         }
@@ -990,6 +996,7 @@ struct Qwen35Runtime::Impl {
         assert_compute_placement(*executor, token_graph.graph);
         upload_common_inputs(token_graph, token, position, write_slot, read_slots);
         executor->compute(token_graph.graph);
+        reset_guard.mark_synchronous_compute_complete();
 
         TokenResult result;
         if (read_hidden) {
@@ -1267,6 +1274,7 @@ struct Qwen35Runtime::Impl {
         //   - full-attention 层通过 ggml_set_rows 把 K/V 写入 PagedKV。
         //   - recurrent 层通过 ggml_cpy 写回 conv/delta state snapshot。
         executor->compute(graph.graph);
+        reset_guard.mark_synchronous_compute_complete();
 
         //执行采样
         TargetChunkResult result;
@@ -1400,6 +1408,7 @@ struct Qwen35Runtime::Impl {
             0,
             hidden_input.size() * sizeof(float));
         executor->compute(token_graph.graph);
+        reset_guard.mark_synchronous_compute_complete();
 
         TokenResult result;
         if (read_hidden) {
@@ -1504,6 +1513,7 @@ struct Qwen35Runtime::Impl {
             0,
             hidden_inputs.size() * sizeof(hidden_inputs.front()));
         executor->compute(graph.graph);
+        reset_guard.mark_synchronous_compute_complete();
     }
 
     std::vector<std::int32_t> run(const Qwen35ExecutionPlan & plan) {

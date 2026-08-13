@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.7
+# nano-vLLM 当前执行流程：v3.71
 
 ## 1. 架构边界
 
@@ -57,7 +57,9 @@ num_cached_tokens
 temperatures
 ```
 
-NativeRunner 将 Python sequence ID 映射到 native sequence slot。C++ 根据 block table 展开物理 read/write slots，并校验 Python slot mapping 与同图重复写入。
+NativeRunner 将 Python sequence ID 映射到 native sequence slot。C++ 根据 block table 展开物理 read/write slots，并校验 Python slot mapping 与同图重复写入。校验 speculative tail 时只检查所需逻辑范围及其 block-table 前缀，不再提前展开一个随后丢弃的完整 context slot 向量；实际执行时仍在对应 target/MTP graph 前展开 read slots。
+
+fallback graph 的生命周期为 `build -> allocate -> synchronous compute -> scheduler reset -> ggml metadata arena reset`。GGML 的 `graph_compute` 已完成同步，因此成功路径的 scheduler reset 不重复发起 synchronize；任何构图、上传或计算异常仍走带 synchronize 的通用 reset，防止未完成 backend work 被错误复用。
 
 v3.6 在 native chat 中增加长期 session。首轮完整 prompt 创建 `Sequence(WAITING)`，完成后 status 变为 `PARKED`；下一轮将格式化后的新 user turn 追加到同一 sequence，保留原 block table、native sequence slot、target/MTP PagedKV、recurrent state 和 `pending_hidden`，只 prefill 新增 token。`/reset`、`/system`、显式 `close()` 或 LRU 淘汰会走 `release_blocks()`，统一清理这些 native 持久状态。
 

@@ -393,7 +393,13 @@ void run_test() {
     // its externally owned threadpool across compute calls.
     executor.compute(graph);
     executor.compute(graph);
-    executor.synchronize();
+    // graph_compute is synchronous.  The runtime uses this lifecycle for its
+    // one-shot fallback graphs, so a reset must make the scheduler available
+    // for an immediate new allocation without a second explicit synchronize.
+    executor.reset_after_synchronous_compute();
+    require(!executor.has_allocation(), "synchronous reset retained graph allocation");
+    executor.allocate(graph);
+    executor.compute(graph);
 
     std::array<float, 4> actual_copy{};
     std::array<float, 8> actual_rows{};

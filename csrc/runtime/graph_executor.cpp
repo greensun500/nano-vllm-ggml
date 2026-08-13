@@ -166,6 +166,14 @@ void GraphExecutor::reset() {
     allocated_graph_ = nullptr;
 }
 
+void GraphExecutor::reset_after_synchronous_compute() {
+    if (scheduler_ == nullptr) {
+        throw GraphExecutorError("reset after synchronous compute: scheduler is null");
+    }
+    ggml_backend_sched_reset(scheduler_);
+    allocated_graph_ = nullptr;
+}
+
 void GraphExecutor::reserve(ggml_cgraph * measure_graph) {
     require_graph(measure_graph, "reserve");
     if (allocated_graph_ != nullptr) {
