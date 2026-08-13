@@ -151,6 +151,7 @@ TokenGraph build_target_token_graph(
     const TargetPersistentView & persistent,
     std::size_t n_kv,
     bool emit_greedy,
+    bool retain_hidden,
     bool use_causal_mask = false,
     AttentionImplementation attention_implementation = AttentionImplementation::Math);
 
@@ -173,6 +174,7 @@ TokenGraph build_mtp_token_graph(
     const AttentionCacheView & cache,
     std::size_t n_kv,
     bool emit_greedy,
+    bool retain_hidden,
     bool use_causal_mask = false,
     AttentionImplementation attention_implementation = AttentionImplementation::Math);
 

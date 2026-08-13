@@ -892,6 +892,7 @@ struct Qwen35Runtime::Impl {
     PersistentGraphEntry & mtp_draft_entry(
         std::size_t n_kv_bucket,
         bool emit_greedy,
+        bool retain_hidden,
         qwen35::AttentionImplementation attention_implementation) {
         PersistentGraphKey key;
         key.kind = PersistentGraphKind::MtpDraft;
@@ -900,6 +901,7 @@ struct Qwen35Runtime::Impl {
         key.attention_implementation =
             static_cast<std::uint8_t>(attention_implementation);
         key.emit_greedy = emit_greedy;
+        key.retain_hidden = retain_hidden;
 
         PersistentGraphEntry & entry = touch_or_create_entry(key);
         if (entry.token.graph == nullptr) {
@@ -911,6 +913,7 @@ struct Qwen35Runtime::Impl {
                 cache,
                 n_kv_bucket,
                 emit_greedy,
+                retain_hidden,
                 true,
                 attention_implementation);
             place_primary_compute_nodes(*entry.executor, entry.token.graph);
@@ -989,6 +992,7 @@ struct Qwen35Runtime::Impl {
             persistent,
             read_slots.size(),
             emit_greedy,
+            read_hidden,
             false,
             attention_implementation);
         place_primary_compute_nodes(*executor, token_graph.graph);
@@ -1349,7 +1353,7 @@ struct Qwen35Runtime::Impl {
             const qwen35::AttentionImplementation attention_implementation =
                 select_attention_implementation(1, n_kv_bucket, true);
             PersistentGraphEntry & entry = mtp_draft_entry(
-                n_kv_bucket, emit_greedy, attention_implementation);
+                n_kv_bucket, emit_greedy, read_hidden, attention_implementation);
             qwen35::TokenGraph & token_graph = entry.token;
             const std::vector<std::int32_t> padded_slots =
                 padded_read_slots(read_slots, n_kv_bucket);
@@ -1395,6 +1399,7 @@ struct Qwen35Runtime::Impl {
             cache,
             read_slots.size(),
             emit_greedy,
+            read_hidden,
             false,
             attention_implementation);
         place_primary_compute_nodes(*executor, token_graph.graph);

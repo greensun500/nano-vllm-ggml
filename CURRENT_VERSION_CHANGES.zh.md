@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.71 Native fallback 生命周期优化
+# nano-vLLM 当前版本修改说明：v3.72 MTP hidden 输出活跃区间优化
 
 ## 1. 版本定位
 
@@ -9,7 +9,8 @@
 - v3.6 正确性修复：`cd6ced0 Restore Qwen3.5 chunk attention gate`
 - v3.6 当前提交：`aabd733 v3.6: Add native MTP stage profiling`
 - v3.7：`044e92e v3.7: add native runtime optimization controls`
-- v3.71 工作区：同步生命周期与 execution-plan 校验分配优化，待本次提交固化
+- v3.71：`21474dd v3.71: remove fallback runtime overhead`
+- v3.72 工作区：MTP draft graph 的 hidden 输出活跃区间优化，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -19,6 +20,8 @@ v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接�
 v3.7 在此基础上只加入可独立 A/B 的图级优化，默认仍走 v3.6 math-attention 和逐 snapshot 写回路径：非 MTP 的 FlashAttention 用 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
 
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
+
+v3.72 保持 MTP draft 的计算和 host readback 内容不变，但让不需要 readback 的最后一张 draft graph 不再把 pre-LM-head hidden 声明为 GGML output，缩短 scheduler allocation 中该 activation 的不可复用生命周期。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -95,6 +98,15 @@ Qwen3.5 attention 不只是标准 Q/K/V attention：query projection 还拆出 g
 | `tests/native/test_graph_executor.cpp` | 覆盖成功 compute 后 reset、立即重新 allocate/compute 的 scheduler 生命周期。 |
 
 GGML 当前 `ggml_backend_sched_graph_compute()` 已按同步语义完成 backend work，因此 fallback graph 在作用域退出时再次调用 `ggml_backend_sched_synchronize()` 是额外等待。v3.71 只在该同步成功返回后跳过第二次等待；若 allocate、上传或 compute 抛异常，guard 仍使用原始同步 reset，避免在未知 backend 状态下重用 scheduler。plan 校验仍验证 block table 的最大逻辑范围、block ID 合法性与同 sequence block 唯一性，只是不再物化本轮尚未参与计算的 context slot 列表。
+
+### 2.8 v3.72 MTP hidden 输出活跃区间
+
+| 文件 | v3.72 改动 |
+| --- | --- |
+| `csrc/models/qwen35/graph.{h,cpp}` | `TokenGraph` 构建显式接收 `retain_hidden`；只有调用方读回 hidden 时才设置 GGML output flag。 |
+| `csrc/runtime/qwen35_runtime.cpp` | MTP persistent graph key 纳入 `retain_hidden`，前序 draft 与最后一轮 draft 分别缓存；fallback 路径传入相同语义。 |
+
+MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；最后一个 draft 仅需要 greedy token。此前两类图共享同一“hidden 输出”构造，导致最后一轮不必要地固定 2048 个 F32 activation。v3.72 仍以 greedy token 为 graph root，故 LM head/argmax 和 cache/state 副作用完全相同；只改变 allocator 是否将 hidden 视为 host-visible output。
 
 ## 3. 当前运行链路的新增部分
 

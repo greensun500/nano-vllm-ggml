@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.71 fallback 生命周期优化工作区（上一个版本提交 `044e92e v3.7: add native runtime optimization controls`）
+- 当前分支：`qwen35-native-runtime`，v3.72 MTP hidden 输出活跃区间优化工作区（上一个版本提交 `21474dd v3.71: remove fallback runtime overhead`）
 
 总体规模：
 
@@ -35,7 +35,8 @@
 | v3.6 fix | `cd6ced0` | 恢复 Qwen3.5 attention query gate |
 | v3.6 profile | `aabd733` | 暴露 draft/verification/KV catch-up 分段计时 |
 | v3.7 | `044e92e` | opt-in FlashAttention、连续 GDN snapshot 写回、MTP prefill 合图、opt-in CUDA Graph |
-| v3.71 working tree | 未提交 | 去除 fallback graph 的重复同步；plan speculative-tail 校验改为无 slot 向量分配的逻辑范围检查 |
+| v3.71 | `21474dd` | 去除 fallback graph 的重复同步；plan speculative-tail 校验改为无 slot 向量分配的逻辑范围检查 |
+| v3.72 working tree | 未提交 | 仅在 MTP draft 的调用方需要时将 hidden 声明为 GGML output；cache key 区分其活跃区间 |
 
 ## 2. 目录级总览
 
@@ -678,7 +679,7 @@ nanovllm._C.Qwen35Runtime
 
 它支撑两个路径：
 
-1. fallback path：每轮构图、placement、allocate、同步 compute、reset；v3.71 在 compute 成功后直接 reset scheduler，避免已同步 graph 再执行一次 backend synchronize；异常路径保留同步 reset；
+1. fallback path：每轮构图、placement、allocate、同步 compute、reset；v3.71 在 compute 成功后直接 reset scheduler，避免已同步 graph 再执行一次 backend synchronize；异常路径保留同步 reset；v3.72 仅在调用方需要 host readback 时将 TokenGraph hidden 标为 output；
 2. v3.5 persistent graph path：首次构图和 allocate，后续只更新输入 tensor 后 compute；v3.7 的 CUDA Graph 仅在显式开关时让 GGML capture/replay 稳定 CUDA graph。
 
 学习重点：

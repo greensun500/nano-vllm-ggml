@@ -1041,9 +1041,12 @@ void finalize_outputs(
     ggml_tensor * hidden,
     ggml_tensor * head,
     bool emit_greedy,
+    bool retain_hidden,
     const char * prefix) {
     result.hidden = hidden;
-    ggml_set_output(result.hidden);
+    if (retain_hidden) {
+        ggml_set_output(result.hidden);
+    }
     set_name(result.hidden, std::string(prefix) + ".hidden");
     if (emit_greedy) {
         ggml_tensor * logits = ops::linear(
@@ -1201,6 +1204,7 @@ TokenGraph build_target_token_graph(
     const TargetPersistentView & persistent,
     std::size_t n_kv,
     bool emit_greedy,
+    bool retain_hidden,
     bool use_causal_mask,
     AttentionImplementation attention_implementation) {
     const Config & config = weights.config();
@@ -1274,6 +1278,7 @@ TokenGraph build_target_token_graph(
         current,
         weights.global().output_head,
         emit_greedy,
+        retain_hidden,
         "qwen35.target");
     return result;
 }
@@ -1415,6 +1420,7 @@ TokenGraph build_mtp_token_graph(
     const AttentionCacheView & cache,
     std::size_t n_kv,
     bool emit_greedy,
+    bool retain_hidden,
     bool use_causal_mask,
     AttentionImplementation attention_implementation) {
     const Config & config = weights.config();
@@ -1471,6 +1477,7 @@ TokenGraph build_mtp_token_graph(
         current,
         layer.mtp_output_head,
         emit_greedy,
+        retain_hidden,
         "qwen35.mtp");
     return result;
 }
