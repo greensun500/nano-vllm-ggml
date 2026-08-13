@@ -19,6 +19,7 @@ from pathlib import Path
 MODEL_ENV = "NANOVLLM_TEST_QWEN35_GGUF"
 TOKENIZER_ENV = "NANOVLLM_TEST_QWEN35_TOKENIZER"
 BACKENDS_ENV = "NANOVLLM_TEST_QWEN35_LONG_BACKENDS"
+ATTENTION_IMPL_ENV = "NANOVLLM_TEST_QWEN35_ATTENTION_IMPL"
 RESULT_PREFIX = "NANOVLLM_LONG_PROBE_JSON="
 PROMPT = [9419, 1814] * 260 + [9419]
 GENERATED_TOKENS = 31
@@ -41,6 +42,7 @@ def _run_probe(args: argparse.Namespace) -> None:
         enable_mtp=args.mtp,
         mtp_max_draft_tokens=3,
         device_config={"n_threads": args.threads, "device_index": 0},
+        native_attention_impl=args.attention_impl,
     )
     try:
         output = llm.generate(
@@ -101,6 +103,11 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
             raise AssertionError("NANOVLLM_TEST_CPU_THREADS must be an integer") from exc
         if cls.threads <= 0:
             raise AssertionError("NANOVLLM_TEST_CPU_THREADS must be positive")
+        cls.attention_impl = os.environ.get(ATTENTION_IMPL_ENV, "auto")
+        if cls.attention_impl not in {"auto", "math", "flash", "paged"}:
+            raise AssertionError(
+                f"{ATTENTION_IMPL_ENV} must be auto, math, flash, or paged"
+            )
 
     @classmethod
     def probe(cls, backend: str, max_batch: int, mtp: bool) -> dict:
@@ -118,6 +125,8 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
             str(max_batch),
             "--threads",
             str(cls.threads),
+            "--attention-impl",
+            cls.attention_impl,
         ]
         if mtp:
             command.append("--mtp")
@@ -170,6 +179,9 @@ def _parse_probe_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("cpu", "vulkan"), required=True)
     parser.add_argument("--max-batch", choices=(64, 768), type=int, required=True)
     parser.add_argument("--threads", type=int, required=True)
+    parser.add_argument(
+        "--attention-impl", choices=("auto", "math", "flash", "paged"), required=True
+    )
     parser.add_argument("--mtp", action="store_true")
     return parser.parse_args()
 

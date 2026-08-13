@@ -86,6 +86,9 @@ struct TokenGraph {
     ggml_tensor * positions = nullptr;   // I32 [4], IMRoPE channels
     ggml_tensor * write_slot = nullptr;  // I32 [1]
     ggml_tensor * read_slots = nullptr;  // I32 [n_kv]
+    // I32 [1], present only for direct paged attention.  It keeps the real
+    // context length separate from a persistent graph's padded slot capacity.
+    ggml_tensor * context_len = nullptr;
     // F32 for math attention or F16 for GGML FlashAttention.
     ggml_tensor * causal_mask = nullptr; // [n_kv, 1], optional
     ggml_tensor * hidden_input = nullptr;  // MTP only: F32 [2048, 1]
@@ -109,6 +112,8 @@ struct TargetChunkGraph {
     ggml_tensor * positions = nullptr;    // I32 [4 * T], IMRoPE channels
     ggml_tensor * write_slots = nullptr;  // I32 [T]
     ggml_tensor * read_slots = nullptr;   // I32 [n_kv]
+    // I32 [1], present only for direct paged attention.
+    ggml_tensor * context_len = nullptr;
     // F32 for math attention or F16 for GGML FlashAttention.
     ggml_tensor * causal_mask = nullptr;  // [n_kv, T], null for T == 1
 

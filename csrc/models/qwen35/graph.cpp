@@ -87,6 +87,7 @@ struct GraphInputs {
     ggml_tensor * positions = nullptr;
     ggml_tensor * write_slot = nullptr;
     ggml_tensor * read_slots = nullptr;
+    ggml_tensor * context_len = nullptr;
     ggml_tensor * causal_mask = nullptr;
 };
 
@@ -103,7 +104,14 @@ GraphInputs make_inputs(
     inputs.write_slot = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     inputs.read_slots = ggml_new_tensor_1d(
         ctx, GGML_TYPE_I32, static_cast<std::int64_t>(n_kv));
-    if (use_causal_mask) {
+    if (attention_implementation == AttentionImplementation::Paged) {
+        inputs.context_len = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    }
+    // The direct paged kernel derives the causal prefix from [n_kv, n_tokens]
+    // and therefore deliberately has no mask operand.  Do not create an
+    // orphan graph input for it: GGML correctly leaves unused inputs
+    // unallocated, and a later upload would otherwise abort.
+    if (use_causal_mask && attention_implementation != AttentionImplementation::Paged) {
         inputs.causal_mask = ggml_new_tensor_2d(
             ctx,
             causal_mask_type(attention_implementation),
@@ -114,6 +122,9 @@ GraphInputs make_inputs(
     ggml_set_input(inputs.positions);
     ggml_set_input(inputs.write_slot);
     ggml_set_input(inputs.read_slots);
+    if (inputs.context_len != nullptr) {
+        ggml_set_input(inputs.context_len);
+    }
     if (inputs.causal_mask != nullptr) {
         ggml_set_input(inputs.causal_mask);
     }
@@ -121,6 +132,7 @@ GraphInputs make_inputs(
     set_name(inputs.positions, "qwen35.input.positions");
     set_name(inputs.write_slot, "qwen35.input.write_slot");
     set_name(inputs.read_slots, "qwen35.input.read_slots");
+    set_name(inputs.context_len, "qwen35.input.context_len");
     set_name(inputs.causal_mask, "qwen35.input.causal_mask");
     return inputs;
 }
@@ -130,6 +142,7 @@ struct ChunkGraphInputs {
     ggml_tensor * positions = nullptr;
     ggml_tensor * write_slots = nullptr;
     ggml_tensor * read_slots = nullptr;
+    ggml_tensor * context_len = nullptr;
     ggml_tensor * causal_mask = nullptr;
 };
 
@@ -150,7 +163,13 @@ ChunkGraphInputs make_chunk_inputs(
     inputs.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count * 4);
     inputs.write_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
     inputs.read_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_count);
-    if (n_tokens > 1 || force_causal_mask) {
+    if (attention_implementation == AttentionImplementation::Paged) {
+        inputs.context_len = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    }
+    // Paged attention implements causal visibility from token indices inside
+    // the kernel.  Other implementations consume this input explicitly.
+    if ((n_tokens > 1 || force_causal_mask) &&
+        attention_implementation != AttentionImplementation::Paged) {
         inputs.causal_mask = ggml_new_tensor_2d(
             ctx, causal_mask_type(attention_implementation), kv_count, token_count);
     }
@@ -159,6 +178,9 @@ ChunkGraphInputs make_chunk_inputs(
     ggml_set_input(inputs.positions);
     ggml_set_input(inputs.write_slots);
     ggml_set_input(inputs.read_slots);
+    if (inputs.context_len != nullptr) {
+        ggml_set_input(inputs.context_len);
+    }
     if (inputs.causal_mask != nullptr) {
         ggml_set_input(inputs.causal_mask);
     }
@@ -166,6 +188,7 @@ ChunkGraphInputs make_chunk_inputs(
     set_name(inputs.positions, "qwen35.target_chunk.positions");
     set_name(inputs.write_slots, "qwen35.target_chunk.write_slots");
     set_name(inputs.read_slots, "qwen35.target_chunk.read_slots");
+    set_name(inputs.context_len, "qwen35.target_chunk.context_len");
     set_name(inputs.causal_mask, "qwen35.target_chunk.causal_mask");
     return inputs;
 }
@@ -289,7 +312,8 @@ ggml_tensor * build_attention(
         // direct kernel sees this token's freshly written K/V row without a
         // materialized GET_ROWS gather.
         attended = ggml_paged_attn(
-            ctx, query_gate.query, stored.key, stored.value, inputs.read_slots, scale);
+            ctx, query_gate.query, stored.key, stored.value,
+            inputs.read_slots, inputs.context_len, scale);
         set_name(attended, prefix + ".paged_attention");
         add_critical(result, attended);
     } else {
@@ -423,7 +447,8 @@ ggml_tensor * build_chunk_attention(
     ggml_tensor * attended = nullptr;
     if (attention_implementation == AttentionImplementation::Paged) {
         attended = ggml_paged_attn(
-            ctx, query_gate.query, stored.key, stored.value, inputs.read_slots, scale);
+            ctx, query_gate.query, stored.key, stored.value,
+            inputs.read_slots, inputs.context_len, scale);
         set_name(attended, prefix + ".paged_attention");
         add_critical(result, attended);
     } else {
@@ -1241,6 +1266,7 @@ TokenGraph build_target_token_graph(
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
     result.read_slots = inputs.read_slots;
+    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
 
     ggml_tensor * current = ggml_get_rows(ctx, weights.global().token_embd, inputs.token);
@@ -1343,6 +1369,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     result.positions = inputs.positions;
     result.write_slots = inputs.write_slots;
     result.read_slots = inputs.read_slots;
+    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
 
     ggml_tensor * current = ggml_get_rows(
@@ -1453,6 +1480,7 @@ TokenGraph build_mtp_token_graph(
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
     result.read_slots = inputs.read_slots;
+    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
     result.hidden_input = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, config.embedding_length, 1);

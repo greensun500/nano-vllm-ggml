@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.86.1
+# nano-vLLM 当前执行流程：v3.87
 
 ## 1. 架构边界
 
@@ -82,7 +82,9 @@ tokens[T] + positions[4T]
 
 full-attention 层在 math/flash 路径先批量写 K/V，再按 `read_slots[C]` gather，chunk 使用 `[C,T]` causal mask 防止 query 看到未来 token。`native_attention_impl` 默认 `auto`：非 MTP 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把 QK -> softmax -> PV 留在 GGML backend kernel 内，失败则回退 math；显式 `flash` 在不支持时报告清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。
 
-显式 `paged` 是当前仅 Vulkan 的 direct-cache 实验：graph 将 `SET_ROWS` 的 persistent K/V view 和 I32 `read_slots` 直接输入 `PAGED_ATTN`，不创建 `GET_ROWS` K/V gather，也不创建 score/probability tensor。每个 256-lane workgroup 处理一个 `(token, query head)`，以 16-slot tile 形成 QK dot，维护 online softmax 的 `(max,sum)` 并累计 V；第 `t` 个 chunk query 只可见 `n_kv-n_tokens+t+1` 个 slot，保留原 causal 语义。它受限于 Qwen3.5 的 F32 KV、`head_dim=256` 和整数 GQA；runtime 对真实 shape 调用 `ggml_backend_supports_op`，不满足时显式报错而不静默回退。`paged` 不参加 `auto`，所以不会改变 CPU/CUDA、非 MTP 默认或 MTP acceptance 基线。
+显式 `paged` 是当前仅 Vulkan 的 direct-cache 实验：graph 将 `SET_ROWS` 的 persistent K/V view、I32 `read_slots` 和 I32 `context_len` 直接输入 `PAGED_ATTN`，不创建 `GET_ROWS` K/V gather，也不创建 score/probability tensor。`context_len` 将真实长度与 persistent graph 的 bucket capacity 分离，padding 的重复 slot 不会进入 softmax；同时 paged 图不创建未消费的 causal-mask input。每个 256-lane workgroup 处理一个 `(token, query head)`，以 16-slot tile 形成 QK dot，维护 online softmax 的 `(max,sum)` 并累计 V。
+
+v3.87 将这个 kernel 的生产性实验范围收紧为 T=1 decode：multi-token prefill 与 MTP verification 仍构建 math attention，以保证跨 chunk 和 speculative acceptance 的精确 greedy trace。原因是 T>1 direct kernel 在 long-context oracle 中改变了 token trace；该问题不能用 benchmark 掩盖。`paged` 不参加 `auto`，所以不会改变 CPU/CUDA、非 MTP 默认或 MTP acceptance 基线。
 
 attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
 

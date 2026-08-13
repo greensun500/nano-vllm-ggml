@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.86.1 Vulkan direct paged attention 实验
+# nano-vLLM 当前版本修改说明：v3.87 Vulkan direct paged attention correctness gate
 
 ## 1. 版本定位
 
@@ -29,6 +29,8 @@
   accumulation，默认策略不变
 - v3.86.1：恢复 v3.86 远程源码快照（只同步 source、不覆写 llama.cpp `.git`）
   的受审计 `5ed3338` revision 接受列表
+- v3.87：修复 direct paged graph 的孤立 mask/padded-slot 正确性问题；仅对
+  已通过 oracle 的 T=1 decode 启用，T>1 prefill/MTP verification 保持 math
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -270,6 +272,8 @@ v3.5 的 persistent graph bucket 仍保留：CPU 单 sequence 的 decode/MTP 高
 
 CPU 上 MTP K=3 在本模型/工作负载有约 17% decode 收益。Vulkan 固定高性能构建下，K=1/2/3 为 `18.51/20.62/20.66 tok/s`，均未超过 MTP off 的 `20.88 tok/s`；K=1 虽然接受率 100%，仍被大量小 verification、额外 MTP vocab head 和 host/backend 往返拖慢。Vulkan 长 decode 当前应默认关闭 MTP，或依据实测吞吐自适应启用，而不能仅根据 acceptance rate 固定 K。
 
+v3.87 在 Armv9.2 + Mali-G720（`taskset -c 0,5-11`、同一 GGUF/参数）重新完成 Vulkan build/CTest、短 chat、以及 521-token context 的跨 chunk/MTP oracle；paged T=1 的 token trace 和 acceptance 通过。统一 A/B 的 MTP-off math/paged 为 `prefill 69.76/69.75`、`decode 22.70/22.17`、`processed 27.44/26.87`、`generated 20.45/20.02 tok/s`，direct paged 当前约慢 `2.3%`。MTP K=1 math/paged 为 `decode 19.914/19.889 tok/s`，二者均为 `drafted/accepted/verification=810/810/810`、acceptance `100%`；paged 只改变 draft（`12.36 -> 12.51s`），而 T=2 verification 保持 math（`68.04 -> 68.00s`），没有端到端收益。结论是：保留正确性修复和显式实验开关，但不进入 `auto` 或默认策略；下一步应以 Mali profile 重新设计单-token kernel（例如 split-K/更多并行 workgroup），而不是简单扩大 tile。完整 build、oracle、失败的 T>1/tile-32 试验和四组 JSON 在远端 `v37-results/20260814-030521-v386-paged-attn/`。
+
 llama.cpp 参考数据的 decode 长度与 nano-vLLM 不同，适合作为量级对比，不作为 v3.5/v3.6 回归判断。v3.7 已在 Armv9.2 Cortex-A720/A520 + Mali-G720-Immortalis 远机完成真实 GGUF oracle 和统一长 benchmark；GCC 12 使用兼容拼写 `armv9-a+dotprod+i8mm`，Vulkan 日志确认 `int dot=1, matrix cores=KHR_coopmat`。相对 v3.6，v3.7 CPU MTP-off / K=3 decode 为 `27.75 / 32.93 tok/s`，Vulkan Flash MTP-off / math MTP K=1 为 `21.24 / 18.59 tok/s`。MTP 的 `auto` 固定 math 已避免 Mali Flash 的 shape-dependent rounding 将 K=1 acceptance 从 100% 降至 50%、decode 降至 `16.08 tok/s` 的回退。完整 benchmark、K sweep 和 profile 记录在开发笔记 `8-mtp升级.md`。
 
 v3.73 本地 x86 A/B（Qwen3.5-2B-Q4_0、CPU 8 threads、math、prompt 186、generate 128、warmup/repeat=1）在关闭/开启 `GGML_CPU_REPACK` 时，prefill 为 `165.9 / 394.3 tok/s`；decode 为 `24.25 / 24.21 tok/s`，后者在该平台不覆盖 Q6_K head，视为测量噪声范围。该结果只证明加载路径与 Q4_0 prefill 内核生效。Armv9.2 oracle 已证明当前 `q4_0_4x8` repack 不保持本项目 exact MTP trace，故 v3.76 默认关闭它，不可将这项 x86 数据外推为实际可用收益。
@@ -299,7 +303,7 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
   --max-num-seqs 1
 ```
 
-可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。图优化 A/B 使用 `--native-attention-impl {math,auto,flash}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 的 A/B 则使用独立 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
+可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。图优化 A/B 使用 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 的 A/B 则使用独立 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
 
 ## 6. 当前边界与下一步
 
@@ -307,5 +311,5 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
 3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收。Vulkan 的 bucket reuse 仅有 v3.74 默认关闭的实验开关，需先通过 Mali oracle。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。
+5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。v3.87 的 direct paged kernel 也保持显式、仅 T=1，直到 multi-token exact oracle 和端到端收益均通过；后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、split-K paged attention 和自适应 K 策略。
 6. v3.77 的 stage profile 是上述融合与自适应 K 的验收指标；Vulkan graph reuse 仍是默认关闭的 correctness 探针，当前 Mali 数据显示不应启用。

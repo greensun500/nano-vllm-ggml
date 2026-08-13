@@ -46,6 +46,21 @@ constexpr std::size_t kVulkanTargetPrefillChunk = 64;
     throw std::runtime_error("native Qwen3.5 runtime: " + detail);
 }
 
+// Keep graph-input allocation failures actionable.  ggml_backend_tensor_set()
+// otherwise aborts without identifying which input was omitted from the graph
+// allocator's dependency closure.
+void require_allocated_input(const ggml_tensor * tensor, const char * label) {
+    if (tensor == nullptr) {
+        fail(std::string("graph input '") + label + "' is null");
+    }
+    const ggml_backend_buffer_t buffer =
+        tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == nullptr || tensor->data == nullptr) {
+        fail(std::string("graph input '") + label +
+             "' was not allocated; graph construction must retain it as a dependency");
+    }
+}
+
 std::size_t checked_positive(std::size_t value, const char * label) {
     if (value == 0) {
         fail(std::string(label) + " must be positive");
@@ -465,12 +480,14 @@ struct Qwen35Runtime::Impl {
         ggml_tensor * value_cache = ggml_new_tensor_2d(
             probe, GGML_TYPE_F32, head_dim * kv_heads, kv_count);
         ggml_tensor * slots = ggml_new_tensor_1d(probe, GGML_TYPE_I32, kv_count);
+        ggml_tensor * context_len = ggml_new_tensor_1d(probe, GGML_TYPE_I32, 1);
         ggml_tensor * attention = ggml_paged_attn(
             probe,
             query,
             key_cache,
             value_cache,
             slots,
+            context_len,
             1.0f / std::sqrt(static_cast<float>(head_dim)));
         const bool supported = ggml_backend_supports_op(
             primary_backend->get(), attention);
@@ -493,6 +510,15 @@ struct Qwen35Runtime::Impl {
                 }
                 return qwen35::AttentionImplementation::Flash;
             case Qwen35AttentionImplementation::Paged:
+                // The direct kernel is currently validated for decode only.
+                // Keep multi-token prefill and MTP verification on the exact
+                // math path until the tiled T>1 kernel has a cross-chunk
+                // oracle.  This is intentional fallback, not a capability
+                // probe failure: explicit paged still accelerates the
+                // latency-critical T=1 decode steps.
+                if (n_tokens != 1) {
+                    return qwen35::AttentionImplementation::Math;
+                }
                 if (!paged_attention_supported(n_tokens, n_kv)) {
                     fail(
                         "attention_impl='paged' is supported only by the Vulkan "
@@ -995,13 +1021,26 @@ struct Qwen35Runtime::Impl {
         std::int32_t token,
         std::size_t position,
         std::int32_t write_slot,
-        const std::vector<std::int32_t> & read_slots) const {
+        const std::vector<std::int32_t> & read_slots,
+        std::size_t actual_context_len) const {
         if (position > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
             fail("position exceeds the I32 IMRoPE ABI");
         }
+        if (actual_context_len == 0 || actual_context_len > read_slots.size() ||
+            actual_context_len > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            fail("actual paged-attention context length is outside its slot input range");
+        }
         const std::int32_t position_i32 = static_cast<std::int32_t>(position);
+        const std::int32_t context_len_i32 = static_cast<std::int32_t>(actual_context_len);
         const std::array<std::int32_t, 4> positions{
             position_i32, position_i32, position_i32, 0};
+        require_allocated_input(token_graph.token, "token");
+        require_allocated_input(token_graph.positions, "positions");
+        require_allocated_input(token_graph.write_slot, "write_slot");
+        require_allocated_input(token_graph.read_slots, "read_slots");
+        if (token_graph.context_len != nullptr) {
+            require_allocated_input(token_graph.context_len, "context_len");
+        }
         ggml_backend_tensor_set(token_graph.token, &token, 0, sizeof(token));
         ggml_backend_tensor_set(
             token_graph.positions, positions.data(), 0, sizeof(positions));
@@ -1012,6 +1051,10 @@ struct Qwen35Runtime::Impl {
             read_slots.data(),
             0,
             read_slots.size() * sizeof(std::int32_t));
+        if (token_graph.context_len != nullptr) {
+            ggml_backend_tensor_set(
+                token_graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
+        }
     }
 
     TokenResult execute_target(
@@ -1047,7 +1090,8 @@ struct Qwen35Runtime::Impl {
         place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
-        upload_common_inputs(token_graph, token, position, write_slot, read_slots);
+        upload_common_inputs(
+            token_graph, token, position, write_slot, read_slots, read_slots.size());
         executor->compute(token_graph.graph);
         reset_guard.mark_synchronous_compute_complete();
 
@@ -1170,6 +1214,14 @@ struct Qwen35Runtime::Impl {
                 padded_read_slots(read_slots, n_kv_bucket);
             // 把本次执行的动态输入上传到已经分配好的 GGML input tensor。
             // graph 结构和临时 buffer 都会复用，只有 token/position/slot/mask 的值变化。
+            require_allocated_input(graph.tokens, "target_chunk.tokens");
+            require_allocated_input(graph.positions, "target_chunk.positions");
+            require_allocated_input(graph.write_slots, "target_chunk.write_slots");
+            require_allocated_input(graph.read_slots, "target_chunk.read_slots");
+            if (graph.context_len != nullptr) {
+                require_allocated_input(graph.context_len, "target_chunk.context_len");
+            }
+            const std::int32_t context_len_i32 = static_cast<std::int32_t>(read_slots.size());
             ggml_backend_tensor_set(
                 graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
             ggml_backend_tensor_set(
@@ -1187,15 +1239,21 @@ struct Qwen35Runtime::Impl {
                 padded_slots.data(),
                 0,
                 padded_slots.size() * sizeof(padded_slots.front()));
-            if (graph.causal_mask == nullptr) {
-                fail("persistent target chunk graph omitted its causal mask");
+            if (graph.context_len != nullptr) {
+                ggml_backend_tensor_set(
+                    graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
             }
-            // mask 的宽度是 n_kv_bucket。
-            // 它允许真实 prefix 和当前 token 可见的 causal 范围，
-            // 同时屏蔽 bucket padding 产生的无效位置和 chunk 内的未来位置。
-            const std::vector<float> mask =
-                make_chunk_mask(read_slots.size(), n_kv_bucket, tokens.size());
-            upload_causal_mask(graph.causal_mask, mask);
+            if (attention_implementation != qwen35::AttentionImplementation::Paged) {
+                if (graph.causal_mask == nullptr) {
+                    fail("persistent target chunk graph omitted its causal mask");
+                }
+                // mask 的宽度是 n_kv_bucket。
+                // 它允许真实 prefix 和当前 token 可见的 causal 范围，
+                // 同时屏蔽 bucket padding 产生的无效位置和 chunk 内的未来位置。
+                const std::vector<float> mask =
+                    make_chunk_mask(read_slots.size(), n_kv_bucket, tokens.size());
+                upload_causal_mask(graph.causal_mask, mask);
+            }
             // 执行已经构建好的 graph。
             // graph 内部 full-attention 层会用 write_slots 写 PagedKV，
             // 再用 read_slots 读取完整上下文；recurrent 层会从 input_plane
@@ -1286,6 +1344,14 @@ struct Qwen35Runtime::Impl {
                 elapsed_nanoseconds(graph_setup_started);
         }
         // 上传由 Python/native 调度层准备好的运行时输入。
+        require_allocated_input(graph.tokens, "target_chunk.tokens");
+        require_allocated_input(graph.positions, "target_chunk.positions");
+        require_allocated_input(graph.write_slots, "target_chunk.write_slots");
+        require_allocated_input(graph.read_slots, "target_chunk.read_slots");
+        if (graph.context_len != nullptr) {
+            require_allocated_input(graph.context_len, "target_chunk.context_len");
+        }
+        const std::int32_t context_len_i32 = static_cast<std::int32_t>(read_slots.size());
         ggml_backend_tensor_set(
             graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
         ggml_backend_tensor_set(
@@ -1303,6 +1369,10 @@ struct Qwen35Runtime::Impl {
             read_slots.data(),
             0,
             read_slots.size() * sizeof(read_slots.front()));
+        if (graph.context_len != nullptr) {
+            ggml_backend_tensor_set(
+                graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
+        }
         if (graph.causal_mask != nullptr) {
             // 多 token chunk 需要 causal mask，因为 read_slots 包含的是直到
             // chunk 最后一个 token 为止的完整上下文。
@@ -1406,13 +1476,16 @@ struct Qwen35Runtime::Impl {
             qwen35::TokenGraph & token_graph = entry.token;
             const std::vector<std::int32_t> padded_slots =
                 padded_read_slots(read_slots, n_kv_bucket);
-            upload_common_inputs(token_graph, token, position, write_slot, padded_slots);
-            if (token_graph.causal_mask == nullptr) {
-                fail("persistent MTP draft graph omitted its causal mask");
+            upload_common_inputs(
+                token_graph, token, position, write_slot, padded_slots, read_slots.size());
+            if (attention_implementation != qwen35::AttentionImplementation::Paged) {
+                if (token_graph.causal_mask == nullptr) {
+                    fail("persistent MTP draft graph omitted its causal mask");
+                }
+                const std::vector<float> mask =
+                    make_single_token_mask(read_slots.size(), n_kv_bucket);
+                upload_causal_mask(token_graph.causal_mask, mask);
             }
-            const std::vector<float> mask =
-                make_single_token_mask(read_slots.size(), n_kv_bucket);
-            upload_causal_mask(token_graph.causal_mask, mask);
             ggml_backend_tensor_set(
                 token_graph.hidden_input,
                 hidden_input.data(),
@@ -1455,7 +1528,8 @@ struct Qwen35Runtime::Impl {
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
         mtp_profile.draft_graph_setup_elapsed_ns += elapsed_nanoseconds(graph_setup_started);
-        upload_common_inputs(token_graph, token, position, write_slot, read_slots);
+        upload_common_inputs(
+            token_graph, token, position, write_slot, read_slots, read_slots.size());
         ggml_backend_tensor_set(
             token_graph.hidden_input,
             hidden_input.data(),
