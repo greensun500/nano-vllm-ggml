@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.84 Mali Q6_K lm_head + argmax 融合
+# nano-vLLM 当前版本修改说明：v3.85 Q6_K 融合审计与默认保护
 
 ## 1. 版本定位
 
@@ -22,7 +22,8 @@
 - v3.81：`bcb7405 v3.81: record Mali auto attention benchmark`
 - v3.82：`891692c v3.82: widen Mali Vulkan argmax`（vendored GGML `1bd647a`）
 - v3.83 工作区：记录 v3.82 Arm Vulkan build、correctness 与统一 MTP benchmark 结果
-- v3.84 工作区：在 Arm Vulkan 图执行器中融合 Q6_K 词表 head 与 greedy argmax；远机 correctness/性能验收待本阶段完成后补录
+- v3.84：在 Arm Vulkan 图执行器中实现实验性 Q6_K 词表 head 与 greedy argmax 融合
+- v3.85：远端 profile 审计 v3.84 后默认关闭该实验融合，保留显式开关
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -49,7 +50,7 @@ v3.80 将 Python/CLI 的 `native_attention_impl` 默认值从 `math` 改为 `aut
 
 v3.82 是 fused `lm_head + argmax` 前的独立、低风险归约阶段。Mali-G720 的 subgroup 为 16，而原 GGML `argmax.comp` 因此让每个 lane 扫描约 15500 个 Qwen3.5 vocab logits；Vulkan 后端现在仅对 Arm 设备创建 256-lane（受 `maxComputeWorkGroupInvocations` 限制）的同一 shader specialization。该 shader 仍以严格 `>` 比较、按低 index 优先处理相等值，语义与原 16-lane binary reduction 相同；非 Arm 保持上游 specialization。它不改变 Q6_K head 计算、输出 tensor 格式或 MTP acceptance。Armv9.2/Mali-G720 新建 `build/v382-vulkan` 已完成、CTest 通过、真实 Vulkan smoke 通过；统一 MTP K=1（math、186/541、repeat 3、warmup 1、`taskset -c 0,5-11`）的 drafted/accepted/verification 为 `810/810/810`、acceptance `100%`，decode 从 v3.76 baseline `18.58` 到 `19.92 tok/s`（`+7.24%`），verification `72.06 -> 68.05s`（`-5.57%`）。短 kernel profile 中 Q6_K head 仍为 T=1 `12.58ms`、T=2 `15.15ms`，而独立 `ARGMAX` 为约 `0.26ms`，相对 v3.77 profile 的 `3.95ms` 大幅缩短。完整 build/smoke/JSON/profile/build_info 位于远端 `v37-results/20260814-015954-v382/`。
 
-v3.84 继续处理同一段 MTP verification 的词表输出，但不把 `MUL_MAT` 和 `ARGMAX` 仅做 API 层串联。对 Arm Vulkan、连续 Q6_K 权重、连续 F32 hidden、`T<=4` 的唯一连续 `MUL_MAT -> ARGMAX` 图边，执行器可改为两张专用 shader：第一张每个 16-row Q6_K workgroup 保持原 Q6_K 的 16-lane dot-product/reduction 顺序，只写一个 `{max_logit, vocab_id}` 候选；第二张以 256 lanes 对候选做稳定归约并直接写 I32 token。Qwen3.5 的约 248k 词表因此从每 token 约 0.95 MiB F32 logits 写入，缩减为约 0.12 MiB 的 transient candidate buffer，且不再让 graph allocator 为 logits 安排存活区间，也不再独立扫描完整 logits。相等分数显式选更小 id，与旧 `argmax.comp` 语义一致。这里不能调用 GGML 通用的 `can_fuse(MUL_MAT, ARGMAX)`：该 helper 为逐元素算子要求相邻节点 shape 相同，会把合法的 `[vocab,T] -> [T]` 归约错误拒绝；v3.84.2 改为验证连续节点、唯一直接 producer edge 和全部量化/布局边界。真实 Mali profile 证明这个第一版的 16-row serial-per-subgroup 映射虽正确却使 T=2 head 从约 `15.17ms` 回归到 `26.36ms`，因此 v3.85 起只在 `GGML_VK_ENABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 时实验性启用，默认继续走已验证更快的 `MUL_MAT + ARGMAX`；`GGML_VK_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 仍可用于对照。该路径不改变 Python 请求/调度、MTP acceptance、CPU/CUDA 或非 Arm Vulkan；不满足条件的图也会走原路径。
+v3.84 继续处理同一段 MTP verification 的词表输出，但不把 `MUL_MAT` 和 `ARGMAX` 仅做 API 层串联。对 Arm Vulkan、连续 Q6_K 权重、连续 F32 hidden、`T<=4` 的唯一连续 `MUL_MAT -> ARGMAX` 图边，执行器可改为两张专用 shader：第一张每个 16-row Q6_K workgroup 保持原 Q6_K 的 16-lane dot-product/reduction 顺序，只写一个 `{max_logit, vocab_id}` 候选；第二张以 256 lanes 对候选做稳定归约并直接写 I32 token。Qwen3.5 的约 248k 词表因此从每 token 约 0.95 MiB F32 logits 写入，缩减为约 0.12 MiB 的 transient candidate buffer，且不再让 graph allocator 为 logits 安排存活区间，也不再独立扫描完整 logits。相等分数显式选更小 id，与旧 `argmax.comp` 语义一致。这里不能调用 GGML 通用的 `can_fuse(MUL_MAT, ARGMAX)`：该 helper 为逐元素算子要求相邻节点 shape 相同，会把合法的 `[vocab,T] -> [T]` 归约错误拒绝；v3.84.2 改为验证连续节点、唯一直接 producer edge 和全部量化/布局边界。远端 Armv9.2/Mali-G720 的新建目录 `v37-results/20260814-022314-v384-fused-head/` 已完成 v3.84.2 build、CTest、Vulkan smoke，融合开/关短生成 stdout 完全一致；full MTP K=1 统一 A/B 的 acceptance 都是 `810/810/810`。但首次 A/B 仅因融合条件未命中而得到噪声级 `19.925 -> 19.968 tok/s`；修正 eligibility 后 Vulkan profile 证实融合命中且 T=2 head 从原生约 `15.17ms` 回归到 `26.36ms`。原因是当前 first-pass 让一个 16-lane subgroup 串行处理 16 行，丢失 Mali 原 Q6_K matvec 的 row-level parallelism。故 v3.85 起只在 `GGML_VK_ENABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 时实验性启用，默认继续走已验证更快的 `MUL_MAT + ARGMAX`；`GGML_VK_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 仍可用于对照。v3.85 的远端增量 build/CTest/build_info 和默认短 profile 通过，且 profile 确认默认不再出现 `Q6_K_LM_HEAD_ARGMAX`。该路径不改变 Python 请求/调度、MTP acceptance、CPU/CUDA 或非 Arm Vulkan；不满足条件的图也会走原路径。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
