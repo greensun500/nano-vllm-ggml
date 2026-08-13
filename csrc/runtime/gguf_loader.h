@@ -14,8 +14,10 @@
 
 namespace nanovllm::native {
 
-// Owns GGUF metadata, tensor descriptors, and one persistent backend weight
-// buffer.  It intentionally has no dependency on llama_model or llama_context.
+// Owns GGUF metadata, tensor descriptors, and persistent backend weight
+// buffers.  CPU loading may use one additional repacked buffer for matrix
+// layouts supported by GGML's runtime-selected kernel.  It intentionally has
+// no dependency on llama_model or llama_context.
 class GgufWeights {
 public:
     explicit GgufWeights(std::string path);
@@ -26,8 +28,9 @@ public:
     GgufWeights(GgufWeights &&) = delete;
     GgufWeights & operator=(GgufWeights &&) = delete;
 
-    // Allocates every GGUF tensor in the backend's persistent default buffer
-    // and uploads the file in bounded chunks. Must be called exactly once.
+    // Allocates every GGUF tensor in persistent backend buffers and uploads
+    // the file in bounded chunks, except for CPU-repacked matrices whose GGML
+    // upload API requires one complete tensor write. Must be called once.
     void load(ggml_backend_t backend, size_t chunk_bytes = 16 * 1024 * 1024);
 
     ggml_tensor * require_tensor(std::string_view name) const;
@@ -49,6 +52,7 @@ private:
     gguf_context * gguf_ = nullptr;
     ggml_context * tensor_ctx_ = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
+    std::vector<ggml_backend_buffer_t> owned_buffers_;
     size_t file_tensor_bytes_ = 0;
     std::unordered_map<std::string, ggml_tensor *> tensors_;
 };

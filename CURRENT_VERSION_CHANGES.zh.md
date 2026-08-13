@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.72 MTP hidden 输出活跃区间优化
+# nano-vLLM 当前版本修改说明：v3.73 CPU 权重 repack 加载优化
 
 ## 1. 版本定位
 
@@ -10,7 +10,8 @@
 - v3.6 当前提交：`aabd733 v3.6: Add native MTP stage profiling`
 - v3.7：`044e92e v3.7: add native runtime optimization controls`
 - v3.71：`21474dd v3.71: remove fallback runtime overhead`
-- v3.72 工作区：MTP draft graph 的 hidden 输出活跃区间优化，待本次提交固化
+- v3.72：`b413650 v3.72: trim MTP draft hidden lifetime`
+- v3.73 工作区：CPU Q4_0/Q6_K 权重混合 buffer 与 GGML repack 加载优化，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -22,6 +23,8 @@ v3.7 在此基础上只加入可独立 A/B 的图级优化，默认仍走 v3.6 m
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 
 v3.72 保持 MTP draft 的计算和 host readback 内容不变，但让不需要 readback 的最后一张 draft graph 不再把 pre-LM-head hidden 声明为 GGML output，缩短 scheduler allocation 中该 activation 的不可复用生命周期。
+
+v3.73 不改模型图、量化格式或 token 语义。此前 CPU 路径把所有 GGUF tensor 放入 default buffer，即使本机 GGML 已启用 `CPU_REPACK`，Q4_0/Q6_K 的专用 matmul 内核也无法被选中。现在只对运行时 ISA、量化类型和矩阵行数均满足 GGML 原生条件的二维 Q4_0/Q6_K 权重分配 repack buffer，其余 tensor 仍留在 default buffer；因此不会把不支持的 norm、bias、embedding 或量化布局放入会在上传时解引用空 traits 的 buffer。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -108,6 +111,15 @@ GGML 当前 `ggml_backend_sched_graph_compute()` 已按同步语义完成 backen
 
 MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；最后一个 draft 仅需要 greedy token。此前两类图共享同一“hidden 输出”构造，导致最后一轮不必要地固定 2048 个 F32 activation。v3.72 仍以 greedy token 为 graph root，故 LM head/argmax 和 cache/state 副作用完全相同；只改变 allocator 是否将 hidden 视为 host-visible output。
 
+### 2.9 v3.73 CPU 混合权重 buffer / repack
+
+| 文件 | v3.73 改动 |
+| --- | --- |
+| `third_party/llama.cpp/ggml/include/ggml-cpu.h` | 将已存在的 `ggml_backend_cpu_repack_buffer_type()` 作为 CPU backend 公共能力声明，供嵌入式 runtime 安全选择 buffer type。 |
+| `csrc/runtime/gguf_loader.{h,cpp}` | 加载时检测 CPU backend 的 repack 支持；先在一个 `CPU_REPACK` buffer 中安置合格矩阵，再由 GGML 为剩余 descriptor 分配紧凑 default buffer；记录全部 buffer 的所有权与 resident bytes。 |
+
+候选选择与 GGML 当前原生实现一致的必要条件为：tensor 是二维；Q4_0 在 x86 AVX2 时行数为 8 的倍数、或 Arm NEON+dotprod/i8mm 时行数为 4 的倍数；Q6_K 仅在 Arm NEON+dotprod/i8mm 且行数为 8 的倍数时进入 repack。Qwen3.5-2B-Q4_0 的投影矩阵在 x86 本地验证实际进入 `q4_0_8x8`；Arm 还会覆盖 tied Q6_K vocab head。GGML 的 repack buffer 上传接口要求 `offset=0` 且完整 tensor，故只有这类矩阵在模型加载期临时整块读取；其他 tensor 保持原 16 MiB 有界分块上传。该峰值只发生一次，不进入 decode 热路径。
+
 ## 3. 当前运行链路的新增部分
 
 ```text
@@ -146,6 +158,8 @@ CPU 上 MTP K=3 在本模型/工作负载有约 17% decode 收益。Vulkan 固�
 
 llama.cpp 参考数据的 decode 长度与 nano-vLLM 不同，适合作为量级对比，不作为 v3.5/v3.6 回归判断。v3.7 已在 Armv9.2 Cortex-A720/A520 + Mali-G720-Immortalis 远机完成真实 GGUF oracle 和统一长 benchmark；GCC 12 使用兼容拼写 `armv9-a+dotprod+i8mm`，Vulkan 日志确认 `int dot=1, matrix cores=KHR_coopmat`。相对 v3.6，v3.7 CPU MTP-off / K=3 decode 为 `27.75 / 32.93 tok/s`，Vulkan Flash MTP-off / math MTP K=1 为 `21.24 / 18.59 tok/s`。MTP 的 `auto` 固定 math 已避免 Mali Flash 的 shape-dependent rounding 将 K=1 acceptance 从 100% 降至 50%、decode 降至 `16.08 tok/s` 的回退。完整 benchmark、K sweep 和 profile 记录在开发笔记 `8-mtp升级.md`。
 
+v3.73 本地 x86 A/B（Qwen3.5-2B-Q4_0、CPU 8 threads、math、prompt 186、generate 128、warmup/repeat=1）在关闭/开启 `GGML_CPU_REPACK` 时，prefill 为 `165.9 / 394.3 tok/s`；decode 为 `24.25 / 24.21 tok/s`，后者在该平台不覆盖 Q6_K head，视为测量噪声范围。该结果只证明加载路径与 Q4_0 prefill 内核生效；Armv9.2 的 Q6_K decode 收益必须在远机完整统一 benchmark 中验收，不能由 x86 外推。
+
 ## 5. 构建与使用
 
 ```bash
@@ -179,4 +193,4 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
 3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收，Vulkan 仍按轮构图。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. v3.7 已减少 prefill hidden 往返和 recurrent snapshot copy；Vulkan MTP 仍需目标设备实测。后续高风险第二阶段是 Q4_0 LM head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。
+5. v3.73 已让 CPU 用到 GGML 现有的量化 repack 内核；其 Arm decode 收益仍需目标设备实测。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。
