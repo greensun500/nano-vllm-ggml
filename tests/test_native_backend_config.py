@@ -70,6 +70,36 @@ class NativeBackendConfigTests(unittest.TestCase):
                     max_num_batched_tokens=7,
                 )
 
+    def test_native_execution_optimization_options_are_explicit_and_validated(self):
+        with self.make_model() as model, tempfile.TemporaryDirectory() as tokenizer:
+            config = Config(
+                model=model.name,
+                backend="native_cpu",
+                tokenizer=tokenizer,
+                enable_mtp=True,
+                native_attention_impl="auto",
+                native_batched_recurrent_snapshots=True,
+                native_mtp_prefill_fusion=True,
+            )
+            self.assertEqual(config.native_attention_impl, "auto")
+            self.assertTrue(config.native_batched_recurrent_snapshots)
+            self.assertTrue(config.native_mtp_prefill_fusion)
+
+            with self.assertRaisesRegex(ValueError, "native_attention_impl"):
+                Config(
+                    model=model.name,
+                    backend="native_cpu",
+                    tokenizer=tokenizer,
+                    native_attention_impl="invalid",
+                )
+            with self.assertRaisesRegex(ValueError, "requires enable_mtp=True"):
+                Config(
+                    model=model.name,
+                    backend="native_cpu",
+                    tokenizer=tokenizer,
+                    native_mtp_prefill_fusion=True,
+                )
+
     def test_explicit_physical_blocks_do_not_change_per_sequence_context(self):
         with self.make_model() as model, tempfile.TemporaryDirectory() as tokenizer:
             config = Config(

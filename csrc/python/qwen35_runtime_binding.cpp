@@ -20,6 +20,7 @@ namespace nanovllm::python {
 namespace {
 
 using nanovllm::native::Qwen35ExecutionPlan;
+using nanovllm::native::Qwen35AttentionImplementation;
 using nanovllm::native::Qwen35GraphReuseStats;
 using nanovllm::native::Qwen35MemoryStats;
 using nanovllm::native::Qwen35MtpProfileStats;
@@ -147,6 +148,37 @@ bool parse_bool(PyObject * value, const char * label, bool & result) {
     }
     result = value == Py_True;
     return true;
+}
+
+bool parse_attention_implementation(
+    PyObject * value,
+    Qwen35AttentionImplementation & result) {
+    if (!PyUnicode_Check(value)) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "Qwen35Runtime argument 'attention_impl' must be str");
+        return false;
+    }
+    const char * implementation = PyUnicode_AsUTF8(value);
+    if (implementation == nullptr) {
+        return false;
+    }
+    if (std::strcmp(implementation, "math") == 0) {
+        result = Qwen35AttentionImplementation::Math;
+        return true;
+    }
+    if (std::strcmp(implementation, "auto") == 0) {
+        result = Qwen35AttentionImplementation::Auto;
+        return true;
+    }
+    if (std::strcmp(implementation, "flash") == 0) {
+        result = Qwen35AttentionImplementation::Flash;
+        return true;
+    }
+    PyErr_SetString(
+        PyExc_ValueError,
+        "Qwen35Runtime argument 'attention_impl' must be 'math', 'auto', or 'flash'");
+    return false;
 }
 
 bool parse_size(PyObject * value, const char * label, std::size_t & result) {
@@ -329,6 +361,9 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     PyObject * enable_mtp_object = nullptr;
     PyObject * mtp_max_draft_tokens_object = nullptr;
     PyObject * enable_graph_reuse_object = Py_True;
+    PyObject * attention_impl_object = nullptr;
+    PyObject * enable_batched_recurrent_snapshots_object = Py_False;
+    PyObject * enable_mtp_prefill_fusion_object = Py_False;
     static const char * keywords[] = {
         "model_path",
         "backend",
@@ -342,12 +377,15 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         "enable_mtp",
         "mtp_max_draft_tokens",
         "enable_graph_reuse",
+        "attention_impl",
+        "enable_batched_recurrent_snapshots",
+        "enable_mtp_prefill_fusion",
         nullptr,
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|O:Qwen35Runtime",
+            "OOOOOOOOOOO|OOOO:Qwen35Runtime",
             const_cast<char **>(keywords),
             &model_path_object,
             &backend_object,
@@ -360,7 +398,10 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             &device_index_object,
             &enable_mtp_object,
             &mtp_max_draft_tokens_object,
-            &enable_graph_reuse_object)) {
+            &enable_graph_reuse_object,
+            &attention_impl_object,
+            &enable_batched_recurrent_snapshots_object,
+            &enable_mtp_prefill_fusion_object)) {
         return -1;
     }
     if (self->runtime != nullptr) {
@@ -417,7 +458,21 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         !parse_bool(
             enable_graph_reuse_object,
             "enable_graph_reuse",
-            options.enable_graph_reuse)) {
+            options.enable_graph_reuse) ||
+        !parse_bool(
+            enable_batched_recurrent_snapshots_object,
+            "enable_batched_recurrent_snapshots",
+            options.enable_batched_recurrent_snapshots) ||
+        !parse_bool(
+            enable_mtp_prefill_fusion_object,
+            "enable_mtp_prefill_fusion",
+            options.enable_mtp_prefill_fusion)) {
+        return -1;
+    }
+    if (attention_impl_object != nullptr &&
+        !parse_attention_implementation(
+            attention_impl_object,
+            options.attention_implementation)) {
         return -1;
     }
 

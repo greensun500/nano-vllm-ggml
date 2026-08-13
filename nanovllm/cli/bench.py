@@ -29,12 +29,17 @@ class BenchResult:
     mtp_verification_steps: int
     mtp_acceptance_rate: float
     enable_graph_reuse: bool
+    native_attention_impl: str
+    native_batched_recurrent_snapshots: bool
+    native_mtp_prefill_fusion: bool
     graph_cache_hits: int
     graph_cache_misses: int
     graph_cache_evictions: int
     graph_cache_active_entries: int
     ggml_commit: str
     vulkan_compiled: bool
+    cuda_compiled: bool
+    cuda_graphs_compiled: bool
     load_s: float
     load_rss_mib: float
     total_s: float
@@ -124,6 +129,24 @@ def parse_args() -> argparse.Namespace:
         help="Disable native persistent graph bucket reuse for A/B measurements.",
     )
     parser.add_argument(
+        "--native-attention-impl",
+        choices=("math", "auto", "flash"),
+        default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "math"),
+        help="Native attention implementation. 'auto' probes FlashAttention for non-MTP runs and keeps math for MTP.",
+    )
+    parser.add_argument(
+        "--native-batched-recurrent-snapshots",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_BATCHED_RECURRENT_SNAPSHOTS", "0") == "1",
+        help="Write contiguous recurrent delta snapshots with one GGML copy.",
+    )
+    parser.add_argument(
+        "--native-mtp-prefill-fusion",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_MTP_PREFILL_FUSION", "0") == "1",
+        help="Fuse native MTP prefill hidden-to-KV maintenance into the target graph.",
+    )
+    parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
         help="Reuse identical prompts across runs to benchmark prefix-cache behavior.",
@@ -166,6 +189,9 @@ def build_llm(args: argparse.Namespace) -> LLM:
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             enable_graph_reuse=not args.no_graph_reuse,
+            native_attention_impl=args.native_attention_impl,
+            native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
+            native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,
@@ -355,12 +381,16 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     actual_model = os.fspath(llm.config.gguf_model or llm.config.model)
     ggml_commit = ""
     vulkan_compiled = False
+    cuda_compiled = False
+    cuda_graphs_compiled = False
     if args.backend.startswith("native"):
         from nanovllm.backends.native import build_info
 
         native_info = build_info()
         ggml_commit = str(native_info["ggml_commit"])
         vulkan_compiled = bool(native_info["vulkan"])
+        cuda_compiled = bool(native_info["cuda"])
+        cuda_graphs_compiled = bool(native_info["cuda_graphs"])
     get_mtp_stats = getattr(llm.model_runner, "mtp_stats", None)
     get_graph_stats = getattr(llm.model_runner, "graph_reuse_stats", None)
     try:
@@ -422,12 +452,17 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         ),
         mtp_acceptance_rate=acceptance_rate,
         enable_graph_reuse=not args.no_graph_reuse,
+        native_attention_impl=args.native_attention_impl,
+        native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
+        native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
         graph_cache_hits=int(graph_stats["hits"]),
         graph_cache_misses=int(graph_stats["misses"]),
         graph_cache_evictions=int(graph_stats["evictions"]),
         graph_cache_active_entries=int(graph_stats["active_entries"]),
         ggml_commit=ggml_commit,
         vulkan_compiled=vulkan_compiled,
+        cuda_compiled=cuda_compiled,
+        cuda_graphs_compiled=cuda_graphs_compiled,
         load_s=load_s,
         load_rss_mib=load_rss_mib,
         total_s=totals["total_s"],
@@ -459,9 +494,14 @@ def print_result(result: BenchResult) -> None:
     print(f"KV blocks:          {result.num_kvcache_blocks}")
     print(f"MTP:                {result.enable_mtp} (K={result.mtp_max_draft_tokens})")
     print(f"graph reuse:        {result.enable_graph_reuse}")
+    print(f"attention impl:     {result.native_attention_impl}")
+    print(f"batched snapshots:  {result.native_batched_recurrent_snapshots}")
+    print(f"MTP prefill fusion: {result.native_mtp_prefill_fusion}")
     if result.ggml_commit:
         print(f"GGML commit:        {result.ggml_commit}")
         print(f"Vulkan compiled:    {result.vulkan_compiled}")
+        print(f"CUDA compiled:      {result.cuda_compiled}")
+        print(f"CUDA Graphs:        {result.cuda_graphs_compiled}")
     print(f"load time:          {result.load_s:.3f} s")
     if result.load_rss_mib > 0:
         print(f"load RSS:           {result.load_rss_mib:.2f} MiB")

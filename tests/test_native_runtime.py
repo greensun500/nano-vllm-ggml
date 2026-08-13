@@ -22,6 +22,7 @@ class TestNativeRuntime(unittest.TestCase):
             info["ggml_base_commit"], "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb"
         )
         self.assertTrue(info["cpu"])
+        self.assertFalse(info["cuda_graphs"])
         self.assertTrue(info["persistent_cpu_threadpool"])
         self.assertFalse(info["uses_llama_context"])
 

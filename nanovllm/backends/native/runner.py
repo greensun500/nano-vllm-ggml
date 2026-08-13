@@ -58,6 +58,13 @@ class NativeRunner:
             enable_mtp=bool(config.enable_mtp),
             mtp_max_draft_tokens=int(config.mtp_max_draft_tokens),
             enable_graph_reuse=bool(getattr(config, "enable_graph_reuse", True)),
+            attention_impl=str(getattr(config, "native_attention_impl", "math")),
+            enable_batched_recurrent_snapshots=bool(
+                getattr(config, "native_batched_recurrent_snapshots", False)
+            ),
+            enable_mtp_prefill_fusion=bool(
+                getattr(config, "native_mtp_prefill_fusion", False)
+            ),
         )
 
     @staticmethod

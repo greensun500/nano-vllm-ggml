@@ -125,6 +125,37 @@ python -m nanovllm.cli.chat /path/to/Qwen3.5.gguf \
   --tokenizer /path/to/Qwen3.5-tokenizer
 ```
 
+## Native graph optimization experiments
+
+The default native graph remains the established math-attention path. The
+following switches are explicit A/B options, so an unsupported accelerator or
+an unfinished kernel path cannot silently change baseline behavior:
+
+```bash
+# Probe GGML FLASH_ATTN_EXT for a non-MTP accelerator run; auto falls back to math.
+--native-attention-impl auto
+
+# Store the GDN delta snapshot tail with one contiguous writeback.
+--native-batched-recurrent-snapshots
+
+# Keep MTP prefill hidden-to-KV maintenance in the target graph.
+--enable-mtp --native-mtp-prefill-fusion
+
+# Build a CUDA Graph-enabled native CUDA variant. This is intentionally a
+# separate build-time A/B choice because GGML captures graphs at backend scope.
+NANOVLLM_NATIVE_CUDA=ON NANOVLLM_NATIVE_CUDA_GRAPHS=ON \
+  ./scripts/build_native_runtime.sh
+```
+
+`auto` intentionally keeps math attention while MTP is enabled: proposal and
+verification graphs have different token shapes, and shape-dependent Flash
+rounding can lower greedy acceptance even when final target output is correct.
+`--native-attention-impl flash` remains an explicit A/B option, requires backend
+support, and fails clearly when the exact Qwen3.5 shape is unsupported. CUDA Graph support is off in the
+default CUDA build and must be enabled with `NANOVLLM_NATIVE_CUDA_GRAPHS=ON`.
+Benchmark each combination independently; the Vulkan/CUDA paths need
+target-device validation.
+
 The earlier `llamacpp_cpu`/`llamacpp_vulkan` external-library path remains only
 as a migration oracle. It is not used by either native backend. The current
 runtime flow is documented in

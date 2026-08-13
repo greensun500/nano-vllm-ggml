@@ -30,6 +30,9 @@ class Config:
     enable_mtp: bool = False
     mtp_max_draft_tokens: int = 3
     enable_graph_reuse: bool = True
+    native_attention_impl: str = "math"
+    native_batched_recurrent_snapshots: bool = False
+    native_mtp_prefill_fusion: bool = False
     enable_session_cache: bool = True
     max_retained_sessions: int = 1
     max_consecutive_prefill_rounds: int = 4
@@ -88,6 +91,13 @@ class Config:
             self.max_num_batched_tokens >= self.max_num_seqs,
             "max_num_batched_tokens must be at least max_num_seqs",
         )
+        _require(
+            self.native_attention_impl in ("math", "auto", "flash"),
+            "native_attention_impl must be 'math', 'auto', or 'flash'",
+        )
+        if self.native_mtp_prefill_fusion:
+            _require(is_native, "native_mtp_prefill_fusion requires a native backend")
+            _require(self.enable_mtp, "native_mtp_prefill_fusion requires enable_mtp=True")
         _require(
             1 <= self.tensor_parallel_size <= 8,
             "tensor_parallel_size must be between 1 and 8",

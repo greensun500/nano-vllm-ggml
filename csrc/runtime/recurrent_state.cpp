@@ -489,6 +489,42 @@ ggml_tensor * RecurrentStateCache::view_delta(
     return result;
 }
 
+ggml_tensor * RecurrentStateCache::view_delta_snapshots(
+    ggml_context * graph_context,
+    std::uint32_t model_layer,
+    std::size_t sequence_slot,
+    std::size_t first_snapshot_plane,
+    std::size_t plane_count) const {
+    require_context(graph_context, "view delta snapshots");
+    require_active_slot(sequence_slot);
+    require_plane(first_snapshot_plane);
+    if (plane_count == 0 || plane_count > snapshot_planes_ - first_snapshot_plane) {
+        throw RecurrentStateError("delta snapshot span is outside the configured plane range");
+    }
+
+    ggml_tensor * storage = delta_storage(model_layer);
+    const std::int32_t first_row = row_index(sequence_slot, first_snapshot_plane);
+    const std::size_t offset = static_cast<std::size_t>(first_row) * storage->nb[1];
+    const std::int64_t state_elements = static_cast<std::int64_t>(checked_multiply(
+        checked_multiply(delta_head_size_, delta_head_size_, "delta snapshot state width"),
+        delta_head_count_,
+        "delta snapshot state width"));
+    const std::size_t state_bytes = ggml_row_size(GGML_TYPE_F32, state_elements);
+    ggml_tensor * result = ggml_view_4d(
+        graph_context,
+        storage,
+        state_elements,
+        1,
+        static_cast<std::int64_t>(plane_count),
+        1,
+        state_bytes,
+        state_bytes,
+        checked_multiply(state_bytes, plane_count, "delta snapshot batch stride"),
+        offset);
+    ggml_set_name(result, "recurrent_delta_snapshots_view");
+    return result;
+}
+
 ggml_tensor * RecurrentStateCache::get_rows(
     ggml_context * graph_context,
     ggml_tensor * storage,

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENABLE_VULKAN="${NANOVLLM_NATIVE_VULKAN:-OFF}"
 ENABLE_CUDA="${NANOVLLM_NATIVE_CUDA:-OFF}"
+ENABLE_CUDA_GRAPHS="${NANOVLLM_NATIVE_CUDA_GRAPHS:-OFF}"
 BUILD_KIND="cpu"
 if [[ "${ENABLE_VULKAN}" == "ON" || "${ENABLE_VULKAN}" == "1" ]]; then
     ENABLE_VULKAN="ON"
@@ -20,6 +21,15 @@ if [[ "${ENABLE_CUDA}" == "ON" || "${ENABLE_CUDA}" == "1" ]]; then
     BUILD_KIND="cuda"
 else
     ENABLE_CUDA="OFF"
+fi
+if [[ "${ENABLE_CUDA_GRAPHS}" == "ON" || "${ENABLE_CUDA_GRAPHS}" == "1" ]]; then
+    ENABLE_CUDA_GRAPHS="ON"
+else
+    ENABLE_CUDA_GRAPHS="OFF"
+fi
+if [[ "${ENABLE_CUDA_GRAPHS}" == "ON" && "${ENABLE_CUDA}" != "ON" ]]; then
+    echo "nano-vLLM: NANOVLLM_NATIVE_CUDA_GRAPHS requires NANOVLLM_NATIVE_CUDA=ON" >&2
+    exit 2
 fi
 BUILD_DIR="${NANOVLLM_NATIVE_BUILD_DIR:-${ROOT_DIR}/build/native-${BUILD_KIND}}"
 RUN_TESTS="${NANOVLLM_NATIVE_RUN_TESTS:-ON}"
@@ -116,6 +126,7 @@ cmake \
     -DBUILD_TESTING="${RUN_TESTS}" \
     -DNANOVLLM_NATIVE_VULKAN="${ENABLE_VULKAN}" \
     -DNANOVLLM_NATIVE_CUDA="${ENABLE_CUDA}" \
+    -DNANOVLLM_NATIVE_CUDA_GRAPHS="${ENABLE_CUDA_GRAPHS}" \
     "${AUTO_CMAKE_ARGS[@]}" \
     "$@"
 cmake --build "${BUILD_DIR}" --target _C --parallel "${NANOVLLM_BUILD_JOBS:-$(nproc)}"

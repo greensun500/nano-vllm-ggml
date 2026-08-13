@@ -12,9 +12,14 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#ifndef NANOVLLM_NATIVE_HAS_CUDA_GRAPHS
+#define NANOVLLM_NATIVE_HAS_CUDA_GRAPHS 0
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -202,6 +207,7 @@ struct TokenResult {
 struct TargetChunkResult {
     std::vector<std::int32_t> predictions;
     std::vector<float> hidden;
+    std::vector<float> mtp_last_hidden;
 };
 
 enum class PersistentGraphKind : std::uint8_t {
@@ -218,6 +224,7 @@ struct PersistentGraphKey {
     std::size_t sequence_slot = 0;
     std::size_t input_plane = 0;
     std::uint8_t output_mode = 0;
+    std::uint8_t attention_implementation = 0;
     bool retain_hidden = false;
     bool emit_greedy = false;
 
@@ -229,6 +236,7 @@ struct PersistentGraphKey {
                sequence_slot == other.sequence_slot &&
                input_plane == other.input_plane &&
                output_mode == other.output_mode &&
+               attention_implementation == other.attention_implementation &&
                retain_hidden == other.retain_hidden &&
                emit_greedy == other.emit_greedy;
     }
@@ -245,6 +253,13 @@ struct PersistentGraphEntry {
     qwen35::TokenGraph token;
     qwen35::MtpKvUpdateGraph mtp_kv_update;
     std::uint64_t last_used = 0;
+};
+
+struct FlashAttentionProbeResult {
+    std::size_t n_tokens = 0;
+    std::size_t n_kv = 0;
+    bool use_causal_mask = false;
+    bool supported = false;
 };
 
 std::vector<std::int32_t> slice(
@@ -310,15 +325,142 @@ struct Qwen35Runtime::Impl {
     GraphContext graph_context;
     std::vector<SequenceState> sequences;
     std::vector<std::unique_ptr<PersistentGraphEntry>> graph_cache;
+    std::vector<FlashAttentionProbeResult> flash_attention_probe_cache;
     Qwen35GraphReuseStats graph_stats;
     Qwen35MtpProfileStats mtp_profile;
     std::uint64_t graph_use_clock = 0;
 
     bool graph_reuse_available() const noexcept {
-        return options.enable_graph_reuse &&
-               options.max_num_seqs == 1 &&
-               primary_backend != nullptr &&
-               primary_backend->kind() == BackendKind::Cpu;
+        if (!options.enable_graph_reuse ||
+            options.max_num_seqs != 1 ||
+            primary_backend == nullptr) {
+            return false;
+        }
+        if (primary_backend->kind() == BackendKind::Cpu) {
+            return true;
+        }
+        // GGML captures CUDA work only after the graph's tensor metadata and
+        // addresses are stable. Persistent entries provide that stability;
+        // all other backends retain their existing eager graph lifetime.
+        return primary_backend->kind() == BackendKind::Cuda &&
+               NANOVLLM_NATIVE_HAS_CUDA_GRAPHS != 0;
+    }
+
+    bool mtp_prefill_fusion_available() const noexcept {
+        return options.enable_mtp && options.enable_mtp_prefill_fusion &&
+               primary_backend != nullptr;
+    }
+
+    bool flash_attention_supported(
+        std::size_t n_tokens,
+        std::size_t n_kv,
+        bool use_causal_mask) {
+        if (primary_backend == nullptr) {
+            return false;
+        }
+        if (n_tokens == 0 || n_kv == 0) {
+            return false;
+        }
+        for (const FlashAttentionProbeResult & cached : flash_attention_probe_cache) {
+            if (cached.n_tokens == n_tokens && cached.n_kv == n_kv &&
+                cached.use_causal_mask == use_causal_mask) {
+                return cached.supported;
+            }
+        }
+
+        // Probe the exact [D, token, head] / [D, KV, KV-head] layout that
+        // the graph builder passes to FLASH_ATTN_EXT. This avoids guessing
+        // from backend kind alone: a driver may reject a shape, precision, or
+        // device feature even though it exposes the operation in general.
+        ggml_init_params params{};
+        params.mem_size = 32U * 1024U;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        ggml_context * probe = ggml_init(params);
+        if (probe == nullptr) {
+            return false;
+        }
+        const qwen35::Config & config = model->config();
+        const std::int64_t key_width =
+            static_cast<std::int64_t>(config.attention_key_length);
+        const std::int64_t value_width =
+            static_cast<std::int64_t>(config.attention_value_length);
+        const std::int64_t query_heads =
+            static_cast<std::int64_t>(config.attention_head_count);
+        const std::int64_t kv_heads =
+            static_cast<std::int64_t>(config.attention_head_count_kv);
+        const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+        const std::int64_t kv_count = static_cast<std::int64_t>(n_kv);
+
+        ggml_tensor * query = ggml_new_tensor_3d(
+            probe, GGML_TYPE_F32, key_width, query_heads, token_count);
+        ggml_tensor * key = ggml_new_tensor_3d(
+            probe, GGML_TYPE_F32, key_width, kv_heads, kv_count);
+        ggml_tensor * value = ggml_new_tensor_3d(
+            probe, GGML_TYPE_F32, value_width, kv_heads, kv_count);
+        query = ggml_permute(probe, query, 0, 2, 1, 3);
+        key = ggml_permute(probe, key, 0, 2, 1, 3);
+        value = ggml_permute(probe, value, 0, 2, 1, 3);
+        ggml_tensor * mask = use_causal_mask
+            ? ggml_new_tensor_2d(probe, GGML_TYPE_F16, kv_count, token_count)
+            : nullptr;
+        ggml_tensor * attention = ggml_flash_attn_ext(
+            probe,
+            query,
+            key,
+            value,
+            mask,
+            1.0f / std::sqrt(static_cast<float>(key_width)),
+            0.0f,
+            0.0f);
+        ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+        const bool supported = ggml_backend_supports_op(
+            primary_backend->get(), attention);
+        ggml_free(probe);
+        constexpr std::size_t kMaxFlashAttentionProbeEntries = 16;
+        if (flash_attention_probe_cache.size() == kMaxFlashAttentionProbeEntries) {
+            flash_attention_probe_cache.erase(flash_attention_probe_cache.begin());
+        }
+        flash_attention_probe_cache.push_back({
+            n_tokens,
+            n_kv,
+            use_causal_mask,
+            supported,
+        });
+        return supported;
+    }
+
+    qwen35::AttentionImplementation select_attention_implementation(
+        std::size_t n_tokens,
+        std::size_t n_kv,
+        bool use_causal_mask) {
+        switch (options.attention_implementation) {
+            case Qwen35AttentionImplementation::Math:
+                return qwen35::AttentionImplementation::Math;
+            case Qwen35AttentionImplementation::Flash:
+                if (!flash_attention_supported(n_tokens, n_kv, use_causal_mask)) {
+                    fail(
+                        "attention_impl='flash' is unsupported for the requested backend "
+                        "or attention shape");
+                }
+                return qwen35::AttentionImplementation::Flash;
+            case Qwen35AttentionImplementation::Auto:
+                // MTP compares greedy results from T=1 draft and T=K+1
+                // verification graphs.  Shape-dependent Flash rounding can
+                // lower acceptance without changing final target tokens.
+                // Keep auto numerically aligned; explicit flash remains A/B.
+                if (options.enable_mtp) {
+                    return qwen35::AttentionImplementation::Math;
+                }
+                if (primary_backend == nullptr ||
+                    primary_backend->kind() == BackendKind::Cpu) {
+                    return qwen35::AttentionImplementation::Math;
+                }
+                return flash_attention_supported(n_tokens, n_kv, use_causal_mask)
+                    ? qwen35::AttentionImplementation::Flash
+                    : qwen35::AttentionImplementation::Math;
+        }
+        return qwen35::AttentionImplementation::Math;
     }
 
     std::size_t kv_bucket_for(std::size_t actual_n_kv) const {
@@ -382,6 +524,34 @@ struct Qwen35Runtime::Impl {
         return mask;
     }
 
+    void upload_causal_mask(
+        ggml_tensor * mask_tensor,
+        const std::vector<float> & values) const {
+        if (mask_tensor == nullptr) {
+            fail("cannot upload a null causal mask tensor");
+        }
+        if (ggml_nelements(mask_tensor) != static_cast<std::int64_t>(values.size())) {
+            fail("causal mask payload does not match its graph input shape");
+        }
+        if (mask_tensor->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(
+                mask_tensor, values.data(), 0, values.size() * sizeof(values.front()));
+            return;
+        }
+        if (mask_tensor->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> converted(values.size());
+            ggml_fp32_to_fp16_row(
+                values.data(), converted.data(), static_cast<std::int64_t>(values.size()));
+            ggml_backend_tensor_set(
+                mask_tensor,
+                converted.data(),
+                0,
+                converted.size() * sizeof(converted.front()));
+            return;
+        }
+        fail("causal mask tensor must be F32 or F16");
+    }
+
     PersistentGraphEntry * find_graph_entry(const PersistentGraphKey & key) {
         for (const std::unique_ptr<PersistentGraphEntry> & entry : graph_cache) {
             if (entry->key == key) {
@@ -402,6 +572,7 @@ struct Qwen35Runtime::Impl {
                         entry->key.n_tokens != key.n_tokens ||
                         entry->key.snapshot_count != key.snapshot_count ||
                         entry->key.output_mode != key.output_mode ||
+                        entry->key.attention_implementation != key.attention_implementation ||
                         entry->key.retain_hidden != key.retain_hidden ||
                         entry->key.emit_greedy != key.emit_greedy ||
                         entry->key.n_kv_bucket >= key.n_kv_bucket) {
@@ -613,12 +784,19 @@ struct Qwen35Runtime::Impl {
                 ctx, layer, sequence_slot, input_plane);    //找到了ssm-conv的位置
             state.delta = recurrent->view_delta(ctx, layer, sequence_slot, input_plane);    //找到了ssm-delta的位置
             state.convolution_outputs.reserve(snapshot_count);
-            state.delta_outputs.reserve(snapshot_count);    //按照实际需要写回的palane数量来预留
+            if (options.enable_batched_recurrent_snapshots) {
+                state.delta_snapshots_output = recurrent->view_delta_snapshots(
+                    ctx, layer, sequence_slot, 0, snapshot_count);
+            } else {
+                state.delta_outputs.reserve(snapshot_count);    //按照实际需要写回的palane数量来预留
+            }
             for (std::size_t plane = 0; plane < snapshot_count; ++plane) {
                 state.convolution_outputs.push_back(recurrent->view_conv(
                     ctx, layer, sequence_slot, plane)); //怎么存储新state的位置
-                state.delta_outputs.push_back(recurrent->view_delta(
-                    ctx, layer, sequence_slot, plane));
+                if (!options.enable_batched_recurrent_snapshots) {
+                    state.delta_outputs.push_back(recurrent->view_delta(
+                        ctx, layer, sequence_slot, plane));
+                }
             }
             persistent.recurrent.push_back(std::move(state));
         }
@@ -669,7 +847,8 @@ struct Qwen35Runtime::Impl {
         std::size_t n_tokens,
         std::size_t n_kv_bucket,
         qwen35::TargetChunkOutputMode output_mode,
-        bool retain_hidden) {
+        bool retain_hidden,
+        qwen35::AttentionImplementation attention_implementation) {
         PersistentGraphKey key;
         key.kind = PersistentGraphKind::TargetChunk;
         key.n_tokens = n_tokens;
@@ -678,6 +857,8 @@ struct Qwen35Runtime::Impl {
         key.sequence_slot = sequence_slot;
         key.input_plane = input_plane;
         key.output_mode = static_cast<std::uint8_t>(output_mode);
+        key.attention_implementation =
+            static_cast<std::uint8_t>(attention_implementation);
         key.retain_hidden = retain_hidden;
 
         PersistentGraphEntry & entry = touch_or_create_entry(key);
@@ -693,7 +874,8 @@ struct Qwen35Runtime::Impl {
                 snapshot_count,
                 output_mode,
                 retain_hidden,
-                true);
+                true,
+                attention_implementation);
             place_primary_compute_nodes(*entry.executor, entry.target_chunk.graph);
             entry.executor->allocate(entry.target_chunk.graph);
             assert_compute_placement(*entry.executor, entry.target_chunk.graph);
@@ -703,11 +885,14 @@ struct Qwen35Runtime::Impl {
 
     PersistentGraphEntry & mtp_draft_entry(
         std::size_t n_kv_bucket,
-        bool emit_greedy) {
+        bool emit_greedy,
+        qwen35::AttentionImplementation attention_implementation) {
         PersistentGraphKey key;
         key.kind = PersistentGraphKind::MtpDraft;
         key.n_tokens = 1;
         key.n_kv_bucket = n_kv_bucket;
+        key.attention_implementation =
+            static_cast<std::uint8_t>(attention_implementation);
         key.emit_greedy = emit_greedy;
 
         PersistentGraphEntry & entry = touch_or_create_entry(key);
@@ -715,7 +900,13 @@ struct Qwen35Runtime::Impl {
             const PagedKvLayer & layer = paged_kv->mtp_layer();
             qwen35::AttentionCacheView cache{layer.key, layer.value};
             entry.token = qwen35::build_mtp_token_graph(
-                entry.context.get(), *model, cache, n_kv_bucket, emit_greedy, true);
+                entry.context.get(),
+                *model,
+                cache,
+                n_kv_bucket,
+                emit_greedy,
+                true,
+                attention_implementation);
             place_primary_compute_nodes(*entry.executor, entry.token.graph);
             entry.executor->allocate(entry.token.graph);
             assert_compute_placement(*entry.executor, entry.token.graph);
@@ -784,8 +975,16 @@ struct Qwen35Runtime::Impl {
         ExecutorResetGuard reset_guard(*executor);
         qwen35::TargetPersistentView persistent = make_target_persistent(
             graph_context.get(), sequence_slot, input_plane, output_plane);
+        const qwen35::AttentionImplementation attention_implementation =
+            select_attention_implementation(1, read_slots.size(), false);
         qwen35::TokenGraph token_graph = qwen35::build_target_token_graph(
-            graph_context.get(), *model, persistent, read_slots.size(), emit_greedy);
+            graph_context.get(),
+            *model,
+            persistent,
+            read_slots.size(),
+            emit_greedy,
+            false,
+            attention_implementation);
         place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
@@ -819,13 +1018,24 @@ struct Qwen35Runtime::Impl {
         qwen35::TargetChunkOutputMode output_mode,
         bool retain_hidden,
         bool allow_graph_reuse,
-        bool profile_mtp_verification) {
+        bool profile_mtp_verification,
+        const std::vector<float> * mtp_prefill_previous_hidden = nullptr) {
         // 这是 native target model 执行连续 token chunk 的主路径。
         // 上层调度器已经决定了本轮要计算哪些 token，以及这些 token 的 K/V
         // 应该写到哪些物理 slot；这里负责把这些执行计划转成 GGML graph 的输入，
         // 执行 graph，并按需把预测结果或 hidden 读回到 host。
         if (tokens.empty()) {
             fail("target chunk requires at least one token");
+        }
+        const bool fuse_mtp_prefill = mtp_prefill_previous_hidden != nullptr;
+        if (fuse_mtp_prefill) {
+            if (!options.enable_mtp || !paged_kv->has_mtp_layer()) {
+                fail("MTP prefill fusion was requested on an MTP-disabled runtime");
+            }
+            if (mtp_prefill_previous_hidden->size() !=
+                model->config().embedding_length) {
+                fail("MTP prefill fusion previous hidden has the wrong width");
+            }
         }
         // 当前 chunk 里的每个 token 都必须对应一个 PagedKV 物理写入位置。
         // graph 会为每个 token 产生一行 K 和一行 V。
@@ -881,9 +1091,11 @@ struct Qwen35Runtime::Impl {
         // 快路径：对于形状稳定的场景复用 persistent graph，主要服务 decode。
         // 缓存 graph 使用 KV bucket 固定形状，因此 read_slots 可能会被 padding，
         // 再通过 causal mask 屏蔽 padding 出来的无效位置或未来位置。
-        if (allow_graph_reuse && graph_reuse_available())   //使用graph reuse
+        if (allow_graph_reuse && !fuse_mtp_prefill && graph_reuse_available())   //使用graph reuse
         {
             const std::size_t n_kv_bucket = kv_bucket_for(read_slots.size());
+            const qwen35::AttentionImplementation attention_implementation =
+                select_attention_implementation(tokens.size(), n_kv_bucket, true);
             PersistentGraphEntry & entry = target_chunk_entry(
                 sequence_slot,
                 input_plane,
@@ -891,7 +1103,8 @@ struct Qwen35Runtime::Impl {
                 tokens.size(),
                 n_kv_bucket,
                 output_mode,
-                retain_hidden);
+                retain_hidden,
+                attention_implementation);
             qwen35::TargetChunkGraph & graph = entry.target_chunk;
             const std::vector<std::int32_t> padded_slots =
                 padded_read_slots(read_slots, n_kv_bucket);
@@ -922,11 +1135,7 @@ struct Qwen35Runtime::Impl {
             // 同时屏蔽 bucket padding 产生的无效位置和 chunk 内的未来位置。
             const std::vector<float> mask =
                 make_chunk_mask(read_slots.size(), n_kv_bucket, tokens.size());
-            ggml_backend_tensor_set(
-                graph.causal_mask,
-                mask.data(),
-                0,
-                mask.size() * sizeof(mask.front()));
+            upload_causal_mask(graph.causal_mask, mask);
             // 执行已经构建好的 graph。
             // graph 内部 full-attention 层会用 write_slots 写 PagedKV，
             // 再用 read_slots 读取完整上下文；recurrent 层会从 input_plane
@@ -981,6 +1190,16 @@ struct Qwen35Runtime::Impl {
         const auto graph_setup_started = std::chrono::steady_clock::now();
         qwen35::TargetChunkPersistentView persistent = make_target_chunk_persistent(
             graph_context.get(), sequence_slot, input_plane, snapshot_count);
+        const qwen35::AttentionImplementation attention_implementation =
+            select_attention_implementation(
+                tokens.size(), read_slots.size(), tokens.size() > 1);
+        qwen35::AttentionCacheView mtp_prefill_cache;
+        const qwen35::AttentionCacheView * mtp_prefill_cache_view = nullptr;
+        if (fuse_mtp_prefill) {
+            const PagedKvLayer & mtp_layer = paged_kv->mtp_layer();
+            mtp_prefill_cache = {mtp_layer.key, mtp_layer.value};
+            mtp_prefill_cache_view = &mtp_prefill_cache;
+        }
         // 手写构建 T 个 token 的 Qwen3.5 forward graph：
         // embedding -> 24 decoder layers -> optional output_norm/lm_head.
         qwen35::TargetChunkGraph graph = qwen35::build_target_chunk_graph(
@@ -991,7 +1210,10 @@ struct Qwen35Runtime::Impl {
             read_slots.size(),
             snapshot_count,
             output_mode,
-            retain_hidden);
+            retain_hidden,
+            false,
+            attention_implementation,
+            mtp_prefill_cache_view);
 
         //计算图建立完毕，开始进行实际执行
         // 让 GGML scheduler 为 graph 做节点放置和临时 tensor 分配。
@@ -1039,11 +1261,7 @@ struct Qwen35Runtime::Impl {
                 std::fill(row, row + context_length, masked);
                 std::fill(row, row + visible + 1, 0.0f);
             }
-            ggml_backend_tensor_set(
-                graph.causal_mask,
-                mask.data(),
-                0,
-                mask.size() * sizeof(mask.front()));
+            upload_causal_mask(graph.causal_mask, mask);
         }
         // 执行 graph。执行过程中会产生两个重要副作用：
         //   - full-attention 层通过 ggml_set_rows 把 K/V 写入 PagedKV。
@@ -1084,6 +1302,17 @@ struct Qwen35Runtime::Impl {
                 0,
                 result.hidden.size() * sizeof(result.hidden.front()));
         }
+        if (fuse_mtp_prefill) {
+            if (graph.mtp_last_hidden == nullptr) {
+                fail("target chunk omitted fused MTP last hidden output");
+            }
+            result.mtp_last_hidden.resize(model->config().embedding_length);
+            ggml_backend_tensor_get(
+                graph.mtp_last_hidden,
+                result.mtp_last_hidden.data(),
+                0,
+                result.mtp_last_hidden.size() * sizeof(result.mtp_last_hidden.front()));
+        }
         return result;
     }
 
@@ -1109,7 +1338,10 @@ struct Qwen35Runtime::Impl {
         }
         if (allow_graph_reuse && graph_reuse_available()) {
             const std::size_t n_kv_bucket = kv_bucket_for(read_slots.size());
-            PersistentGraphEntry & entry = mtp_draft_entry(n_kv_bucket, emit_greedy);
+            const qwen35::AttentionImplementation attention_implementation =
+                select_attention_implementation(1, n_kv_bucket, true);
+            PersistentGraphEntry & entry = mtp_draft_entry(
+                n_kv_bucket, emit_greedy, attention_implementation);
             qwen35::TokenGraph & token_graph = entry.token;
             const std::vector<std::int32_t> padded_slots =
                 padded_read_slots(read_slots, n_kv_bucket);
@@ -1119,11 +1351,7 @@ struct Qwen35Runtime::Impl {
             }
             const std::vector<float> mask =
                 make_single_token_mask(read_slots.size(), n_kv_bucket);
-            ggml_backend_tensor_set(
-                token_graph.causal_mask,
-                mask.data(),
-                0,
-                mask.size() * sizeof(mask.front()));
+            upload_causal_mask(token_graph.causal_mask, mask);
             ggml_backend_tensor_set(
                 token_graph.hidden_input,
                 hidden_input.data(),
@@ -1151,8 +1379,16 @@ struct Qwen35Runtime::Impl {
         const auto graph_setup_started = std::chrono::steady_clock::now();
         const PagedKvLayer & layer = paged_kv->mtp_layer();
         qwen35::AttentionCacheView cache{layer.key, layer.value};
+        const qwen35::AttentionImplementation attention_implementation =
+            select_attention_implementation(1, read_slots.size(), false);
         qwen35::TokenGraph token_graph = qwen35::build_mtp_token_graph(
-            graph_context.get(), *model, cache, read_slots.size(), emit_greedy);
+            graph_context.get(),
+            *model,
+            cache,
+            read_slots.size(),
+            emit_greedy,
+            false,
+            attention_implementation);
         place_primary_compute_nodes(*executor, token_graph.graph);
         executor->allocate(token_graph.graph);
         assert_compute_placement(*executor, token_graph.graph);
@@ -1351,6 +1587,8 @@ struct Qwen35Runtime::Impl {
     // 后续 execute_target_chunk 会从这个 plane 读取 conv_state / delta_state。
                 const std::size_t input_plane =
                     recurrent->active_snapshot_plane(item.sequence_slot);
+                const bool fuse_mtp_prefill =
+                    plan.is_prefill && mtp_prefill_fusion_available();
                 TargetChunkResult target = execute_target_chunk(            //普通prefill或者decode进入graph的如来
                     item.sequence_slot,
                     chunk_tokens,   //输入token
@@ -1361,9 +1599,10 @@ struct Qwen35Runtime::Impl {
                     1,
                     is_final ? qwen35::TargetChunkOutputMode::Last
                              : qwen35::TargetChunkOutputMode::None,
-                    options.enable_mtp,
+                    options.enable_mtp && !fuse_mtp_prefill,
                     !plan.is_prefill,
-                    false);
+                    false,
+                    fuse_mtp_prefill ? &sequence.pending_hidden : nullptr);
                 recurrent->select_latest(item.sequence_slot);
                 if (is_final) {
                     if (target.predictions.size() != 1 ||
@@ -1377,6 +1616,14 @@ struct Qwen35Runtime::Impl {
 
                 if (options.enable_mtp) {
                     const std::size_t embedding = model->config().embedding_length;
+                    if (fuse_mtp_prefill) {
+                        if (target.mtp_last_hidden.size() != embedding) {
+                            fail("target chunk returned the wrong fused MTP hidden shape");
+                        }
+                        sequence.pending_hidden = std::move(target.mtp_last_hidden);
+                        offset += chunk_count;
+                        continue;
+                    }
                     const std::size_t hidden_elements = checked_product(
                         chunk_count, embedding, "MTP prefill hidden input");
                     if (target.hidden.size() != hidden_elements) {
@@ -1390,7 +1637,7 @@ struct Qwen35Runtime::Impl {
                     std::vector<float> mtp_hidden_inputs;
                     mtp_hidden_inputs.reserve(hidden_elements);
                     mtp_hidden_inputs.insert(
-                        mtp_hidden_inputs.end(),
+                        mtp_hidden_inputs.end(),    //上一次的hidden输入
                         sequence.pending_hidden.begin(),
                         sequence.pending_hidden.end());
                     if (chunk_count > 1) {

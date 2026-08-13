@@ -8,6 +8,12 @@
 
 namespace nanovllm::native {
 
+enum class Qwen35AttentionImplementation : std::uint8_t {
+    Math,
+    Auto,
+    Flash,
+};
+
 struct Qwen35RuntimeOptions {
     std::string model_path;
     std::string backend = "cpu";
@@ -21,6 +27,10 @@ struct Qwen35RuntimeOptions {
     bool enable_mtp = false;
     std::size_t mtp_max_draft_tokens = 0;
     bool enable_graph_reuse = true;
+    Qwen35AttentionImplementation attention_implementation =
+        Qwen35AttentionImplementation::Math;
+    bool enable_batched_recurrent_snapshots = false;
+    bool enable_mtp_prefill_fusion = false;
 };
 
 struct Qwen35GraphReuseStats {

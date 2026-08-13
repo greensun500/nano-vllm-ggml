@@ -155,6 +155,16 @@ public:
         std::size_t sequence_slot,
         std::size_t snapshot_plane) const;
 
+    // Zero-copy view of adjacent snapshot planes for one sequence. The result
+    // is [state_elements, 1, plane_count, 1], matching the packed GDN snapshot
+    // tail and CUDA's optional direct-cache-write fusion contract.
+    ggml_tensor * view_delta_snapshots(
+        ggml_context * graph_context,
+        std::uint32_t model_layer,
+        std::size_t sequence_slot,
+        std::size_t first_snapshot_plane,
+        std::size_t plane_count) const;
+
     // Batched graph reads. row_indices is a 1D I32 tensor containing ids from
     // one of the helpers above.  Results are shaped for ggml_ssm_conv and
     // ggml_gated_delta_net respectively:

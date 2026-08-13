@@ -5,13 +5,13 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，版本提交 `aabd733 v3.6: Add native MTP stage profiling`
+- 当前分支：`qwen35-native-runtime`，v3.7 图优化工作区（上一个版本提交 `aabd733 v3.6: Add native MTP stage profiling`）
 
 总体规模：
 
 - 相对原始基线的具体规模会随文档、测试和子模块状态变化；学习时应以 `git diff origin/main...HEAD --stat` 重新计算。
 
-一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前 v3.6 在保留原 CUDA 路径的同时，形成了 in-tree Qwen3.5 native runtime，支持 GGUF 加载、GGML CPU/Vulkan/CUDA backend、PagedKV、hybrid recurrent state、内置 MTP、会话保留、公平调度、benchmark/chat CLI、CPU graph reuse 和 MTP/memory profiling。
+一句话总结：原始 nano-vLLM 是一个以 CUDA/PyTorch/Triton 为主的轻量 vLLM 实现；当前 v3.7 在保留原 CUDA 路径的同时，形成了 in-tree Qwen3.5 native runtime，支持 GGUF 加载、GGML CPU/Vulkan/CUDA backend、PagedKV、hybrid recurrent state、内置 MTP、会话保留、公平调度、benchmark/chat CLI、CPU graph reuse、可选 FlashAttention/GDN snapshot/MTP prefill fusion、可选 CUDA Graph 和 MTP/memory profiling。
 
 ## 1. 修改时间线
 
@@ -34,6 +34,7 @@
 | v3.6 | `12272ae` | native session cache、decode 饥饿保护、native CUDA、memory metrics |
 | v3.6 fix | `cd6ced0` | 恢复 Qwen3.5 attention query gate |
 | v3.6 profile | `aabd733` | 暴露 draft/verification/KV catch-up 分段计时 |
+| v3.7 working tree | 未提交 | opt-in FlashAttention、连续 GDN snapshot 写回、MTP prefill 合图、opt-in CUDA Graph |
 
 ## 2. 目录级总览
 
@@ -677,7 +678,7 @@ nanovllm._C.Qwen35Runtime
 它支撑两个路径：
 
 1. fallback path：每轮构图、placement、allocate、compute、reset；
-2. v3.5 persistent graph path：首次构图和 allocate，后续只更新输入 tensor 后 compute。
+2. v3.5 persistent graph path：首次构图和 allocate，后续只更新输入 tensor 后 compute；v3.7 的 CUDA Graph 仅在显式开关时让 GGML capture/replay 稳定 CUDA graph。
 
 学习重点：
 
@@ -1038,9 +1039,9 @@ prepare optional persistent graph cache
 - sequence slot mapping；
 - pending hidden。
 
-### 21.6 v3.5 persistent graph reuse
+### 21.6 v3.5/v3.7 persistent graph reuse
 
-v3.5 新增、v3.6 保留：
+v3.5 新增、v3.7 保留：
 
 - `Qwen35RuntimeOptions.enable_graph_reuse`
 - `Qwen35GraphReuseStats`
@@ -1048,6 +1049,8 @@ v3.5 新增、v3.6 保留：
 - `PersistentGraphKey`
 - `PersistentGraphEntry`
 - graph cache hits/misses/evictions/active entries
+
+v3.7 只有在 CUDA build 显式具备 `GGML_CUDA_GRAPHS` 时才将同一机制扩展到 native CUDA；默认 build 仍是 CPU reuse、CUDA eager graph。GGML 的 graph capture 是 backend scope 行为，故此处用独立 build variant 而不是 runtime toggle。
 
 固定图类型：
 
@@ -1064,7 +1067,8 @@ bucket：
 
 当前限制：
 
-- 只保证 CPU 单序列；
+- 默认 build 只启用 CPU 单序列 persistent graph reuse；native CUDA 只有在独立 CUDA Graph build 中才允许复用稳定图；
+- CUDA Graph build 必须同时显式传入 `NANOVLLM_NATIVE_CUDA=ON` 与 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON`；
 - Vulkan 由于 padded-mask bucket attention 行为不稳定，当前 fallback 到旧路径；
 - prefill/chunk 暂不强制缓存。
 
@@ -1074,9 +1078,9 @@ bucket：
 - bucket 保存 graph metadata、scheduler allocation、临时 activation buffer、输入/输出 tensor 指针；
 - 命中时只更新输入 tensor/mask/hidden，然后 `compute()`。
 
-## 22. Native graph reuse 与 v3.6 连带修改
+## 22. Native graph reuse 与 v3.6/v3.7 连带修改
 
-v3.5 graph reuse 与后续 v3.6 共涉及：
+v3.5 graph reuse 与后续 v3.6/v3.7 共涉及：
 
 - `csrc/models/qwen35/graph.h`
 - `csrc/models/qwen35/graph.cpp`
@@ -1231,8 +1235,8 @@ third_party/llama.cpp -> https://github.com/ggml-org/llama.cpp.git
 - README 增加 native Qwen3.5 CPU/Vulkan/CUDA runtime 说明；
 - `LEARNING_GUIDE.zh.md` 是原始 nano-vLLM 源码学习路线；
 - `run_pipeline.md` 记录早期 llama.cpp backend 执行流程；
-- `CURRENT_RUNTIME_FLOW.zh.md` 记录当前 v3.6 runtime、session 和 MTP 流程；
-- `CURRENT_VERSION_CHANGES.zh.md` 记录 v3.5 到 v3.6 的文件变更、测试和性能结果。
+- `CURRENT_RUNTIME_FLOW.zh.md` 记录当前 v3.7 runtime、session、MTP 和图优化流程；
+- `CURRENT_VERSION_CHANGES.zh.md` 记录 v3.5 到 v3.7 的文件变更、测试和性能结果。
 
 历史上曾有更多中间文档，例如 v1/v2/v3.0 专文，v3.1 后被合并整理到当前两个 `CURRENT_*` 文档中。
 
@@ -1531,7 +1535,7 @@ nanovllm/sampling_params.py
 pyproject.toml
 ```
 
-### 32.3 当前 v3.6 重点修改文件
+### 32.3 当前 v3.7 重点修改文件
 
 ```text
 CMakeLists.txt
@@ -1552,7 +1556,7 @@ tests/test_native_runner.py
 tests/test_qwen35_stages.py
 ```
 
-这些是已提交的 v3.5/v3.6 版本代码：v3.5 graph reuse，v3.6 session/fair scheduling/CUDA/memory+MTP profile，以及 attention gate 正确性修复。
+这些包含已提交的 v3.5/v3.6 代码，以及 v3.7 工作区图优化：v3.5 graph reuse，v3.6 session/fair scheduling/CUDA/memory+MTP profile 和 attention gate 正确性修复；v3.7 opt-in FlashAttention、连续 GDN snapshot 写回、MTP prefill 合图和 CUDA Graph build variant。
 
 ## 33. 最容易遗漏但很重要的小改动
 

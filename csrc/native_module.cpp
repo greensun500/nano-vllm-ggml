@@ -17,6 +17,9 @@
 #ifndef NANOVLLM_NATIVE_HAS_CUDA
 #define NANOVLLM_NATIVE_HAS_CUDA 0
 #endif
+#ifndef NANOVLLM_NATIVE_HAS_CUDA_GRAPHS
+#define NANOVLLM_NATIVE_HAS_CUDA_GRAPHS 0
+#endif
 
 #if NANOVLLM_NATIVE_HAS_VULKAN
 #include "ggml-vulkan.h"
@@ -127,6 +130,7 @@ PyObject * py_build_info(PyObject *, PyObject *) {
         dict_set_owned(info, "cpu", PyBool_FromLong(1)) &&
         dict_set_owned(info, "vulkan", PyBool_FromLong(NANOVLLM_NATIVE_HAS_VULKAN)) &&
         dict_set_owned(info, "cuda", PyBool_FromLong(NANOVLLM_NATIVE_HAS_CUDA)) &&
+        dict_set_owned(info, "cuda_graphs", PyBool_FromLong(NANOVLLM_NATIVE_HAS_CUDA_GRAPHS)) &&
         dict_set_owned(info, "persistent_cpu_threadpool", PyBool_FromLong(1)) &&
         dict_set_owned(info, "uses_llama_context", PyBool_FromLong(0));
     if (!ok) {

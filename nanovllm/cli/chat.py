@@ -127,6 +127,24 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("NANOVLLM_NO_GRAPH_REUSE", "0") == "1",
         help="Disable native persistent graph bucket reuse.",
     )
+    parser.add_argument(
+        "--native-attention-impl",
+        choices=("math", "auto", "flash"),
+        default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "math"),
+        help="Native attention implementation. 'auto' probes FlashAttention for non-MTP runs and keeps math for MTP.",
+    )
+    parser.add_argument(
+        "--native-batched-recurrent-snapshots",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_BATCHED_RECURRENT_SNAPSHOTS", "0") == "1",
+        help="Write contiguous recurrent delta snapshots with one GGML copy.",
+    )
+    parser.add_argument(
+        "--native-mtp-prefill-fusion",
+        action="store_true",
+        default=os.environ.get("NANOVLLM_NATIVE_MTP_PREFILL_FUSION", "0") == "1",
+        help="Fuse native MTP prefill hidden-to-KV maintenance into the target graph.",
+    )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
     parser.add_argument(
@@ -179,6 +197,9 @@ def build_llm(args: argparse.Namespace) -> LLM:
             enable_mtp=args.enable_mtp,
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             enable_graph_reuse=not args.no_graph_reuse,
+            native_attention_impl=args.native_attention_impl,
+            native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
+            native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,

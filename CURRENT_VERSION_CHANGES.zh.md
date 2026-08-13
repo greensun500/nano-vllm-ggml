@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.6 Native 会话、CUDA 与 MTP 可观测性
+# nano-vLLM 当前版本修改说明：v3.7 Native 图执行优化实验
 
 ## 1. 版本定位
 
@@ -8,13 +8,16 @@
 - v3.6 功能提交：`12272ae Add native session scheduling and CUDA backend`
 - v3.6 正确性修复：`cd6ced0 Restore Qwen3.5 chunk attention gate`
 - v3.6 当前提交：`aabd733 v3.6: Add native MTP stage profiling`
+- v3.7 工作区：native attention/GDN/MTP/CUDA Graph 的 opt-in 图优化，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
 
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
 
-## 2. 从 v3.5 到 v3.6 的文件与改动
+v3.7 在此基础上只加入可独立 A/B 的图级优化，默认仍走 v3.6 math-attention 和逐 snapshot 写回路径：非 MTP 的 FlashAttention 用 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
+
+## 2. 从 v3.5 到 v3.7 的文件与改动
 
 ### 2.1 Python 会话、调度与容量默认值
 
@@ -66,6 +69,19 @@ Qwen3.5 attention 不只是标准 Q/K/V attention：query projection 还拆出 g
 
 `tests/test_native_backend_config.py`、`tests/test_native_runner.py`、`tests/test_qwen35_stages.py` 扩展了 CUDA backend、session 生命周期、prefill/decode 公平性、native memory stats 和 query gate 的覆盖。README 增加 native CUDA build/example；`CURRENT_RUNTIME_FLOW.zh.md`、`CURRENT_CODE_DIFF_FROM_ORIGINAL.zh.md` 同步到 v3.6。
 
+### 2.6 v3.7 图级优化实验
+
+| 文件 | v3.7 改动 |
+| --- | --- |
+| `csrc/models/qwen35/graph.{h,cpp}` | 添加 `AttentionImplementation`；保留 math attention，同时可构建 `ggml_flash_attn_ext` 路径。MTP prefill 可把 target 的 normalized hidden 右移后直接做 MTP KV-only 部分；不再读回整块 `[E,T]` hidden。 |
+| `csrc/runtime/recurrent_state.{h,cpp}`、`csrc/runtime/qwen35_runtime.cpp` | 为相邻 delta snapshot plane 创建连续 `[D,1,K,1]` view；启用时一个 `ggml_cpy` 写回全部 snapshot，CUDA 后端可匹配 GGML 现有的 GDN-to-cache 融合。 |
+| `csrc/runtime/qwen35_runtime.{h,cpp}` | 增加 `math/auto/flash` 选择、按真实 shape/backend probe Flash 能力、F32/F16 mask 上传转换；MTP 的 `auto` 固定 math，避免 Flash 的 shape-dependent rounding 压低 greedy acceptance；MTP prefill fusion 禁止复用旧 bucket，避免图结构与输入/输出语义混淆。 |
+| `CMakeLists.txt`、`scripts/build_native_runtime.sh`、`csrc/native_module.cpp` | 增加默认关闭的 `NANOVLLM_NATIVE_CUDA_GRAPHS` 构建开关和 build info；CUDA Graph 是 GGML backend scope 行为，因此以独立 build variant 作为 A/B 边界；若未同时开启 CUDA，CMake 和脚本都会明确拒绝该配置。 |
+| `nanovllm/config.py`、native runner、chat/bench CLI | 暴露 `native_attention_impl`、`native_batched_recurrent_snapshots`、`native_mtp_prefill_fusion`；全部默认关闭，CLI/JSON 会记录运行时 A/B 配置。 |
+| native tests | 增加精确 GQA FlashAttention layout/F16 causal-mask oracle、连续 GDN snapshot CPY plane-order 测试、Python 配置/ABI 传递测试，以及 opt-in real-model MTP trace oracle。 |
+
+关键边界：Flash 路径仍先 `SET_ROWS` 到 PagedKV、再 `GET_ROWS` gather，所以它不是新的 paged-attention kernel；只是在 gather 后把 QK、softmax、PV 的中间分数/概率留在 backend kernel 内。MTP verification 的 accepted 数量必须在 host 比较后才能知道，故其 catch-up 仍是独立 KV-only graph。Mali 实测显示 Flash 在正确性 oracle 中可用，但 draft `T=1` 与 verification `T=K+1` 的舍入差异会把 K=1 acceptance 从 100% 降至 50%，并让 decode 吞吐退化；因此 MTP 下 `auto` 保守选择 math，显式 `flash` 只作实验。`lm_head + argmax` 的全词表量化 matmul 仍是第二阶段课题；当前没有为了“融合”而添加不成熟的自定义 Q4 kernel。
+
 ## 3. 当前运行链路的新增部分
 
 ```text
@@ -87,7 +103,7 @@ close / LRU eviction
 
 普通 `LLM.generate()` 的一次性请求语义不变。`enable_session_cache` 只影响显式 `start_session()` 创建的保留会话。
 
-v3.5 的 persistent graph bucket 仍保留：只在 CPU、单 sequence 的 decode/MTP 高频路径启用；Vulkan/CUDA、多 sequence 和 prefill/chunk 仍按轮构图。bucket 不复制模型权重、PagedKV 或 recurrent state，只缓存 graph metadata、scheduler allocation、输入/输出 tensor 和临时 activation buffer。
+v3.5 的 persistent graph bucket 仍保留：CPU 单 sequence 的 decode/MTP 高频路径默认启用；native CUDA 只有在独立 CUDA build 带 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 时才复用稳定 graph 并让 GGML 捕获/回放。Vulkan、多 sequence、prefill/chunk 仍按轮构图。bucket 不复制模型权重、PagedKV 或 recurrent state，只缓存 graph metadata、scheduler allocation、输入/输出 tensor 和临时 activation buffer。
 
 ## 4. 当前性能结论
 
@@ -102,7 +118,7 @@ v3.5 的 persistent graph bucket 仍保留：只在 CPU、单 sequence 的 decod
 
 CPU 上 MTP K=3 在本模型/工作负载有约 17% decode 收益。Vulkan 固定高性能构建下，K=1/2/3 为 `18.51/20.62/20.66 tok/s`，均未超过 MTP off 的 `20.88 tok/s`；K=1 虽然接受率 100%，仍被大量小 verification、额外 MTP vocab head 和 host/backend 往返拖慢。Vulkan 长 decode 当前应默认关闭 MTP，或依据实测吞吐自适应启用，而不能仅根据 acceptance rate 固定 K。
 
-llama.cpp 参考数据的 decode 长度与 nano-vLLM 不同，适合作为量级对比，不作为 v3.5/v3.6 回归判断。完整 benchmark、K sweep 和 profile 记录在开发笔记 `8-mtp升级.md`。
+llama.cpp 参考数据的 decode 长度与 nano-vLLM 不同，适合作为量级对比，不作为 v3.5/v3.6 回归判断。v3.7 已在 Armv9.2 Cortex-A720/A520 + Mali-G720-Immortalis 远机完成真实 GGUF oracle 和统一长 benchmark；GCC 12 使用兼容拼写 `armv9-a+dotprod+i8mm`，Vulkan 日志确认 `int dot=1, matrix cores=KHR_coopmat`。相对 v3.6，v3.7 CPU MTP-off / K=3 decode 为 `27.75 / 32.93 tok/s`，Vulkan Flash MTP-off / math MTP K=1 为 `21.24 / 18.59 tok/s`。MTP 的 `auto` 固定 math 已避免 Mali Flash 的 shape-dependent rounding 将 K=1 acceptance 从 100% 降至 50%、decode 降至 `16.08 tok/s` 的回退。完整 benchmark、K sweep 和 profile 记录在开发笔记 `8-mtp升级.md`。
 
 ## 5. 构建与使用
 
@@ -129,12 +145,12 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
   --max-num-seqs 1
 ```
 
-可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
+可通过 `enable_session_cache=False`、`max_retained_sessions` 和 `max_consecutive_prefill_rounds` 调整会话保留与公平策略。图优化 A/B 使用 `--native-attention-impl {math,auto,flash}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 的 A/B 则使用独立 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建。benchmark 继续使用 `--enable-mtp --mtp-max-draft-tokens K`；性能比较必须同时记录 GGML commit、shader compiler、Mali capability 日志、warmup/repeat 和模型上下文长度。
 
 ## 6. 当前边界与下一步
 
 1. Native 不支持跨请求 prefix cache；hybrid recurrent state 不能像纯 attention KV 一样廉价地共享。
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
-3. graph reuse 只覆盖 CPU 单 sequence 高频 decode/MTP，Vulkan/CUDA 尚无 persistent graph reuse。
+3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收，Vulkan 仍按轮构图。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. Vulkan MTP 的首要优化是减少小图/host 往返、融合 Q4_0 LM head + argmax，再决定自适应 K 策略。
+5. v3.7 已减少 prefill hidden 往返和 recurrent snapshot copy；Vulkan MTP 仍需目标设备实测。后续高风险第二阶段是 Q4_0 LM head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。

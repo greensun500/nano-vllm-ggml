@@ -141,6 +141,9 @@ class NativeRunnerTests(unittest.TestCase):
                 "enable_mtp": False,
                 "mtp_max_draft_tokens": 3,
                 "enable_graph_reuse": True,
+                "attention_impl": "math",
+                "enable_batched_recurrent_snapshots": False,
+                "enable_mtp_prefill_fusion": False,
             },
         )
         self.assertNotIn("library_path", kwargs)
@@ -148,6 +151,20 @@ class NativeRunnerTests(unittest.TestCase):
     def test_constructor_maps_native_cuda_to_the_ggml_cuda_runtime(self):
         runner = self.make_runner(make_config(backend="native_cuda"))
         self.assertEqual(runner.runtime.constructor_kwargs["backend"], "cuda")
+
+    def test_constructor_forwards_native_execution_optimization_toggles(self):
+        runner = self.make_runner(
+            make_config(
+                enable_mtp=True,
+                native_attention_impl="auto",
+                native_batched_recurrent_snapshots=True,
+                native_mtp_prefill_fusion=True,
+            )
+        )
+        kwargs = runner.runtime.constructor_kwargs
+        self.assertEqual(kwargs["attention_impl"], "auto")
+        self.assertTrue(kwargs["enable_batched_recurrent_snapshots"])
+        self.assertTrue(kwargs["enable_mtp_prefill_fusion"])
 
     def test_greedy_run_flattens_and_converts_the_execution_plan(self):
         runner = self.make_runner()

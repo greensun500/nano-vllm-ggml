@@ -5,11 +5,14 @@
 #include "ggml.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -73,6 +76,186 @@ void require_cpu(const nanovllm::native::BackendPlacement & placement, const cha
     require(
         placement.backend_kind == nanovllm::native::BackendKind::Cpu,
         std::string(label) + " is not on CPU");
+}
+
+void run_flash_attention_layout_test(nanovllm::native::BackendList & backends) {
+    using nanovllm::native::BackendKind;
+    using nanovllm::native::GraphExecutor;
+
+    ContextHandle context;
+    constexpr std::int64_t kHeadWidth = 2;
+    constexpr std::int64_t kTokens = 1;
+    constexpr std::int64_t kQueryHeads = 2;
+    constexpr std::int64_t kKvHeads = 1;
+    constexpr std::int64_t kKvTokens = 2;
+
+    // Match the production graph layout exactly: the source is [D, H, T] and
+    // FLASH_ATTN_EXT consumes the permuted [D, T, H] view.
+    ggml_tensor * query_source = ggml_new_tensor_3d(
+        context.get(), GGML_TYPE_F32, kHeadWidth, kQueryHeads, kTokens);
+    ggml_tensor * key_source = ggml_new_tensor_3d(
+        context.get(), GGML_TYPE_F32, kHeadWidth, kKvHeads, kKvTokens);
+    ggml_tensor * value_source = ggml_new_tensor_3d(
+        context.get(), GGML_TYPE_F32, kHeadWidth, kKvHeads, kKvTokens);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        context.get(), GGML_TYPE_F16, kKvTokens, kTokens);
+    ggml_set_input(query_source);
+    ggml_set_input(key_source);
+    ggml_set_input(value_source);
+    ggml_set_input(mask);
+
+    ggml_tensor * query = ggml_permute(context.get(), query_source, 0, 2, 1, 3);
+    ggml_tensor * key = ggml_permute(context.get(), key_source, 0, 2, 1, 3);
+    ggml_tensor * value = ggml_permute(context.get(), value_source, 0, 2, 1, 3);
+    ggml_tensor * attended = ggml_flash_attn_ext(
+        context.get(), query, key, value, mask, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
+    ggml_tensor * flattened = ggml_reshape_2d(
+        context.get(), attended, kHeadWidth * kQueryHeads, kTokens);
+    ggml_set_output(flattened);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(context.get(), 32, false);
+    ggml_build_forward_expand(graph, flattened);
+    GraphExecutor executor(backends, 32);
+    executor.set_all_compute_nodes_backend(graph, BackendKind::Cpu);
+    executor.allocate(graph);
+    executor.assert_all_compute_nodes_on_backend(graph, BackendKind::Cpu);
+
+    // Head 0 queries [1, 0]; head 1 queries [0, 1]. K rows are the two
+    // basis vectors, and V rows make the expected GQA outputs easy to check.
+    const std::array<float, 4> query_values{1.0f, 0.0f, 0.0f, 1.0f};
+    const std::array<float, 4> key_values{1.0f, 0.0f, 0.0f, 1.0f};
+    const std::array<float, 4> value_values{1.0f, 10.0f, 2.0f, 20.0f};
+    const std::array<float, 2> mask_values{0.0f, 0.0f};
+    std::array<ggml_fp16_t, 2> mask_values_f16{};
+    ggml_fp32_to_fp16_row(
+        mask_values.data(), mask_values_f16.data(), static_cast<std::int64_t>(mask_values.size()));
+    ggml_backend_tensor_set(
+        query_source, query_values.data(), 0, sizeof(query_values));
+    ggml_backend_tensor_set(key_source, key_values.data(), 0, sizeof(key_values));
+    ggml_backend_tensor_set(value_source, value_values.data(), 0, sizeof(value_values));
+    ggml_backend_tensor_set(mask, mask_values_f16.data(), 0, sizeof(mask_values_f16));
+    executor.compute(graph);
+
+    std::array<float, 4> actual{};
+    ggml_backend_tensor_get(flattened, actual.data(), 0, sizeof(actual));
+    const float p = std::exp(1.0f) / (std::exp(1.0f) + 1.0f);
+    const std::array<float, 4> expected{
+        p * 1.0f + (1.0f - p) * 2.0f,
+        p * 10.0f + (1.0f - p) * 20.0f,
+        (1.0f - p) * 1.0f + p * 2.0f,
+        (1.0f - p) * 10.0f + p * 20.0f,
+    };
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        require(
+            std::abs(actual[index] - expected[index]) < 1e-5f,
+            "FLASH_ATTN_EXT result or flattened layout is incorrect");
+    }
+
+    const std::array<float, 2> masked_values{
+        0.0f, -std::numeric_limits<float>::infinity()};
+    ggml_fp32_to_fp16_row(
+        masked_values.data(),
+        mask_values_f16.data(),
+        static_cast<std::int64_t>(masked_values.size()));
+    ggml_backend_tensor_set(mask, mask_values_f16.data(), 0, sizeof(mask_values_f16));
+    executor.compute(graph);
+    ggml_backend_tensor_get(flattened, actual.data(), 0, sizeof(actual));
+    const std::array<float, 4> masked_expected{1.0f, 10.0f, 1.0f, 10.0f};
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        require(
+            std::abs(actual[index] - masked_expected[index]) < 1e-5f,
+            "FLASH_ATTN_EXT did not honor its F16 causal mask");
+    }
+}
+
+void run_contiguous_snapshot_copy_test(nanovllm::native::BackendList & backends) {
+    using nanovllm::native::BackendKind;
+    using nanovllm::native::GraphExecutor;
+
+    constexpr std::int64_t kStateElements = 8;
+    constexpr std::int64_t kSnapshotCount = 3;
+    constexpr std::int64_t kOutputRowsBeforeSnapshots = 2;
+    constexpr std::int64_t kTotalRows = 6;
+    constexpr std::int64_t kAttentionOutputElements = 5;
+    const std::size_t state_bytes = ggml_row_size(GGML_TYPE_F32, kStateElements);
+
+    ContextHandle storage_context;
+    ggml_tensor * storage = ggml_new_tensor_2d(
+        storage_context.get(), GGML_TYPE_F32, kStateElements, kTotalRows);
+    BufferHandle storage_buffer(
+        ggml_backend_alloc_ctx_tensors(storage_context.get(), backends.at(0).get()));
+    std::vector<float> initial_storage(
+        static_cast<std::size_t>(kStateElements * kTotalRows), -1.0f);
+    ggml_backend_tensor_set(
+        storage, initial_storage.data(), 0, initial_storage.size() * sizeof(float));
+
+    ContextHandle graph_context;
+    const std::int64_t source_elements =
+        kAttentionOutputElements + kStateElements * kSnapshotCount;
+    ggml_tensor * gdn_output = ggml_new_tensor_1d(
+        graph_context.get(), GGML_TYPE_F32, source_elements);
+    ggml_set_input(gdn_output);
+    ggml_tensor * snapshot_source = ggml_view_4d(
+        graph_context.get(),
+        gdn_output,
+        kStateElements,
+        1,
+        kSnapshotCount,
+        1,
+        state_bytes,
+        state_bytes,
+        state_bytes * static_cast<std::size_t>(kSnapshotCount),
+        static_cast<std::size_t>(kAttentionOutputElements) * sizeof(float));
+    ggml_tensor * snapshot_destination = ggml_view_4d(
+        graph_context.get(),
+        storage,
+        kStateElements,
+        1,
+        kSnapshotCount,
+        1,
+        state_bytes,
+        state_bytes,
+        state_bytes * static_cast<std::size_t>(kSnapshotCount),
+        static_cast<std::size_t>(kOutputRowsBeforeSnapshots) * state_bytes);
+    require(ggml_is_contiguous(snapshot_source), "GDN snapshot source must be contiguous");
+    require(
+        ggml_is_contiguous(snapshot_destination),
+        "recurrent snapshot destination must be contiguous");
+
+    ggml_tensor * update = ggml_cpy(
+        graph_context.get(), snapshot_source, snapshot_destination);
+    ggml_cgraph * graph = ggml_new_graph_custom(graph_context.get(), 32, false);
+    ggml_build_forward_expand(graph, update);
+    GraphExecutor executor(backends, 32);
+    executor.set_all_compute_nodes_backend(graph, BackendKind::Cpu);
+    executor.allocate(graph);
+
+    std::vector<float> source(static_cast<std::size_t>(source_elements));
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<float>(index);
+    }
+    ggml_backend_tensor_set(
+        gdn_output, source.data(), 0, source.size() * sizeof(float));
+    executor.compute(graph);
+
+    std::vector<float> actual_storage(initial_storage.size());
+    ggml_backend_tensor_get(
+        storage,
+        actual_storage.data(),
+        0,
+        actual_storage.size() * sizeof(float));
+    for (std::int64_t plane = 0; plane < kSnapshotCount; ++plane) {
+        for (std::int64_t element = 0; element < kStateElements; ++element) {
+            const std::size_t source_index = static_cast<std::size_t>(
+                kAttentionOutputElements + plane * kStateElements + element);
+            const std::size_t destination_index = static_cast<std::size_t>(
+                (kOutputRowsBeforeSnapshots + plane) * kStateElements + element);
+            require(
+                actual_storage[destination_index] == source[source_index],
+                "batched snapshot copy changed plane ordering");
+        }
+    }
 }
 
 void run_test() {
@@ -196,6 +379,9 @@ void run_test() {
     require(audit.unassigned_compute_nodes == 0, "unassigned compute node");
     require(audit.pure_metadata_view_nodes == 2,
             "expected exactly two pure metadata view nodes");
+
+    run_flash_attention_layout_test(backends);
+    run_contiguous_snapshot_copy_test(backends);
 
     const std::array<float, 4> copy_data{1.0f, 2.0f, 3.0f, 4.0f};
     const std::array<float, 4> row_data{5.0f, 6.0f, 7.0f, 8.0f};

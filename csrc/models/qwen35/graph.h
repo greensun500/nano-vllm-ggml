@@ -42,6 +42,14 @@ enum class TargetChunkOutputMode {
     All,
 };
 
+// The math path materializes attention scores and probabilities. The Flash
+// path keeps that reduction inside GGML's backend kernel. Runtime code chooses
+// the latter only after a backend capability probe or an explicit request.
+enum class AttentionImplementation {
+    Math,
+    Flash,
+};
+
 // Persistent state used by one single-sequence, multi-token target graph.
 // Snapshot destinations are ordered newest first and must contain exactly the
 // number of planes requested from build_target_chunk_graph().
@@ -51,6 +59,11 @@ struct RecurrentChunkStateView {
 
     std::vector<ggml_tensor *> convolution_outputs;
     std::vector<ggml_tensor *> delta_outputs;
+
+    // Optional contiguous destination for all delta snapshot planes:
+    // [128 * 128 * 16, 1, snapshot_count, 1]. When present, graph builders
+    // emit one copy instead of one copy per plane.
+    ggml_tensor * delta_snapshots_output = nullptr;
 };
 
 struct TargetChunkPersistentView {
@@ -70,7 +83,8 @@ struct TokenGraph {
     ggml_tensor * positions = nullptr;   // I32 [4], IMRoPE channels
     ggml_tensor * write_slot = nullptr;  // I32 [1]
     ggml_tensor * read_slots = nullptr;  // I32 [n_kv]
-    ggml_tensor * causal_mask = nullptr; // F32 [n_kv, 1], optional
+    // F32 for math attention or F16 for GGML FlashAttention.
+    ggml_tensor * causal_mask = nullptr; // [n_kv, 1], optional
     ggml_tensor * hidden_input = nullptr;  // MTP only: F32 [2048, 1]
 
     ggml_tensor * hidden = nullptr;       // F32 [2048, 1], pre-LM-head
@@ -92,12 +106,21 @@ struct TargetChunkGraph {
     ggml_tensor * positions = nullptr;    // I32 [4 * T], IMRoPE channels
     ggml_tensor * write_slots = nullptr;  // I32 [T]
     ggml_tensor * read_slots = nullptr;   // I32 [n_kv]
-    ggml_tensor * causal_mask = nullptr;  // F32 [n_kv, T], null for T == 1
+    // F32 for math attention or F16 for GGML FlashAttention.
+    ggml_tensor * causal_mask = nullptr;  // [n_kv, T], null for T == 1
 
     // Hidden remains readable only when retain_hidden=true was requested.
     ggml_tensor * hidden = nullptr;        // F32 [2048, T]
     // Null for None, I32 [1] for Last, or I32 [T] for All.
     ggml_tensor * greedy_tokens = nullptr;
+
+    // Optional MTP-prefill fusion inputs/outputs. When the caller supplies an
+    // MTP cache to build_target_chunk_graph(), this input carries h_{p-1} and
+    // the graph writes target-conditioned MTP K/V rows without a host round
+    // trip. Only the final target hidden remains host-visible for the next
+    // chunk or decode step.
+    ggml_tensor * mtp_previous_hidden = nullptr; // F32 [2048, 1]
+    ggml_tensor * mtp_last_hidden = nullptr;     // F32 [2048, 1]
 
     std::vector<ggml_tensor *> critical_compute_nodes;
 };
@@ -128,7 +151,8 @@ TokenGraph build_target_token_graph(
     const TargetPersistentView & persistent,
     std::size_t n_kv,
     bool emit_greedy,
-    bool use_causal_mask = false);
+    bool use_causal_mask = false,
+    AttentionImplementation attention_implementation = AttentionImplementation::Math);
 
 TargetChunkGraph build_target_chunk_graph(
     ggml_context * ctx,
@@ -139,7 +163,9 @@ TargetChunkGraph build_target_chunk_graph(
     std::size_t snapshot_count,
     TargetChunkOutputMode output_mode,
     bool retain_hidden,
-    bool force_causal_mask = false);
+    bool force_causal_mask = false,
+    AttentionImplementation attention_implementation = AttentionImplementation::Math,
+    const AttentionCacheView * mtp_prefill_cache = nullptr);
 
 TokenGraph build_mtp_token_graph(
     ggml_context * ctx,
@@ -147,7 +173,8 @@ TokenGraph build_mtp_token_graph(
     const AttentionCacheView & cache,
     std::size_t n_kv,
     bool emit_greedy,
-    bool use_causal_mask = false);
+    bool use_causal_mask = false,
+    AttentionImplementation attention_implementation = AttentionImplementation::Math);
 
 MtpKvUpdateGraph build_mtp_kv_update_graph(
     ggml_context * ctx,

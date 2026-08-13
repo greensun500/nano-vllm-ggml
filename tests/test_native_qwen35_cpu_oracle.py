@@ -85,6 +85,8 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
         *,
         enable_mtp: bool,
         max_model_len: int = BLOCK_SIZE,
+        native_batched_recurrent_snapshots: bool = False,
+        native_mtp_prefill_fusion: bool = False,
     ) -> NativeRunner:
         config = SimpleNamespace(
             model=os.fspath(self.model_path),
@@ -98,6 +100,8 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
             num_kvcache_blocks=1,
             enable_mtp=enable_mtp,
             mtp_max_draft_tokens=3,
+            native_batched_recurrent_snapshots=native_batched_recurrent_snapshots,
+            native_mtp_prefill_fusion=native_mtp_prefill_fusion,
         )
         return NativeRunner(config)
 
@@ -229,6 +233,23 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
         runner.shutdown()
         with self.assertRaisesRegex(RuntimeError, "shut down"):
             runner.run(self.plan([11], start=0, mode="prefill"))
+
+    def test_opt_in_graph_optimizations_match_the_legacy_mtp_trace(self):
+        prompt_ids = self.prompt_tokens("Once upon a time", [12162, 5028, 264, 854])
+        traces = []
+        for optimized in (False, True):
+            runner = self.make_runner(
+                enable_mtp=True,
+                native_batched_recurrent_snapshots=optimized,
+                native_mtp_prefill_fusion=optimized,
+            )
+            try:
+                pending, first, second = self.mtp_trace(runner, prompt_ids=prompt_ids)
+                traces.append((pending, first, second, runner.mtp_stats()))
+            finally:
+                runner.shutdown()
+
+        self.assertEqual(traces[1], traces[0])
 
     def test_mtp_near_context_boundary_falls_back_to_target_greedy(self):
         runner = self.make_runner(enable_mtp=True, max_model_len=2)

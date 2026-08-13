@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.6
+# nano-vLLM 当前执行流程：v3.7
 
 ## 1. 架构边界
 
@@ -38,7 +38,7 @@ LLM(config)
   -> lazy persistent graph bucket cache
 ```
 
-accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。v3.6 默认开启 `enable_graph_reuse`，CPU 单序列 decode/MTP 会 lazy 创建 persistent graph bucket；多序列、Vulkan/CUDA 和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
+accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。默认 `enable_graph_reuse` 让 CPU 单序列 decode/MTP lazy 创建 persistent graph bucket；CUDA 只有 extension 由 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 编译时才允许 GGML CUDA Graph capture/replay。该能力是 GGML backend scope 行为，因此用独立 build variant 做 A/B，而不是同一进程中的 runtime toggle。多序列、Vulkan 和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
 
 ## 4. Python 执行计划
 
@@ -76,7 +76,7 @@ tokens[T] + positions[4T]
   -> 按输出模式决定 output norm/head/argmax
 ```
 
-full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。
+full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。默认 math 路径显式执行 QK -> softmax -> PV；非 MTP 的 `native_attention_impl=auto/flash` 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把这三步留在 GGML backend kernel 内，失败则 `auto` 回退 math、`flash` 报清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
 
 输出模式：
 
@@ -111,7 +111,7 @@ final chunk   -> TargetChunkGraph(Last) -> commit KV/recurrent -> one token
 
 ## 7. MTP prefill / fallback
 
-开启 MTP 时，每个 target chunk 都返回各列 normalized hidden。runtime 维护跨 chunk 的 `pending_hidden`，构造严格右移配对：
+开启 MTP 时，legacy 路径会把每个 target chunk 的 normalized hidden 读回。runtime 维护跨 chunk 的 `pending_hidden`，构造严格右移配对：
 
 ```text
 mtp_hidden[0] = old pending_hidden
@@ -128,6 +128,8 @@ mtp_hidden[i] = target_hidden[i-1]
 ```
 
 它不执行 MTP attention、FFN、head 或 token readback。当前片最后一个 target hidden 成为下一片的 `pending_hidden`。因此 Mali 非最终片虽然使用 `None`，仍会保留 hidden 和 output norm，只跳过 tied vocab head/argmax。
+
+`native_mtp_prefill_fusion=True` 时，target graph 内部直接构造同一右移 hidden，继续执行 MTP merge/norm/KV projection/`SET_ROWS`。host 只读回最后一列 `[E,1]` 作为下一 chunk 的 `pending_hidden`，不再上传 `[E,T]` shifted hidden 或单独执行 prefill KV-only graph；为了保持 graph 语义简单，该路径当前不复用旧 persistent bucket。verification 的 accepted 数量必须由 host 先比较 draft/target token 才能确定，仍保留独立的 catch-up KV-only graph。
 
 ## 8. MTP speculative decode
 
@@ -193,15 +195,15 @@ K=3 常规轮次为：
 readback 规则：
 
 - 非最终 MTP-off Mali prefill 片：无 token/hidden readback，无 output norm/head；
-- 非最终 MTP-on prefill 片：读取 hidden，执行 KV-only maintenance，不读 token；
-- 最终 prefill 片：读取一个 token；MTP-on 还读取 hidden；
+- legacy 非最终 MTP-on prefill 片：读取完整 hidden，执行 KV-only maintenance，不读 token；fusion 路径只读取最后一列 hidden；
+- 最终 prefill 片：读取一个 token；legacy MTP 还读取完整 hidden，fusion MTP 只读取最后一列；
 - MTP draft：读取 draft token，非末步还读取下一步 hidden；
 - verification：读取 K+1 predictions 与全部 target hidden；
 - MTP KV-only：无 host 输出。
 
 `GraphExecutor::compute()` 使用同步 GGML scheduler API。fallback 路径仍在 graph guard 退出时 reset transient allocation，并按轮重建 graph metadata。
 
-v3.5 引入、v3.6 保留的 CPU graph reuse 路径按 key 常驻独立 executor：
+v3.5 引入、v3.7 保留的 persistent graph 路径按 key 常驻独立 executor：
 
 ```text
 graph_kind + T + n_kv_bucket + output_mode + snapshot_count
@@ -220,10 +222,10 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
 - v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
-- v3.5 graph reuse 在 v3.6 仍只保证 CPU 单序列 decode/MTP；Vulkan/CUDA 当前 fallback 到每轮构图。
+- graph reuse 默认只保证 CPU 单序列 decode/MTP；CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建的 extension，Vulkan 当前仍 fallback 到每轮构图。
 - CPU 权重当前仍在 default buffer，尚未进入 CPU_REPACK。
 - MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。
-- CUDA 已接入 build、backend discovery、placement audit 与 native runner，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。
+- CUDA 已接入 build、backend discovery、placement audit、native runner 与 opt-in CUDA Graph，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。
 
 ## 12. 构建与基准命令结构
 
@@ -260,4 +262,4 @@ python3 -m nanovllm.cli.bench "$MODEL" ... \
   --prompt-len 521 --gen-len 129 --warmup 1 --repeat 3 --json
 ```
 
-MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。v3.6 native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。
+MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。v3.7 图级 A/B 参数是 `--native-attention-impl {math,auto,flash}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的单独构建做 A/B。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。

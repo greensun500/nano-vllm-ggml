@@ -62,6 +62,26 @@ void add_critical(MtpKvUpdateGraph & result, ggml_tensor * tensor) {
     result.critical_compute_nodes.push_back(tensor);
 }
 
+ggml_type causal_mask_type(AttentionImplementation implementation) {
+    return implementation == AttentionImplementation::Flash
+        ? GGML_TYPE_F16
+        : GGML_TYPE_F32;
+}
+
+void require_causal_mask(
+    const ggml_tensor * mask,
+    std::initializer_list<std::int64_t> shape,
+    AttentionImplementation implementation,
+    const std::string & prefix) {
+    if (mask == nullptr) {
+        return;
+    }
+    require_shape(mask, shape, (prefix + ".causal_mask").c_str());
+    require(
+        mask->type == causal_mask_type(implementation),
+        prefix + " causal mask type does not match the attention implementation");
+}
+
 struct GraphInputs {
     ggml_tensor * token = nullptr;
     ggml_tensor * positions = nullptr;
@@ -70,7 +90,11 @@ struct GraphInputs {
     ggml_tensor * causal_mask = nullptr;
 };
 
-GraphInputs make_inputs(ggml_context * ctx, std::size_t n_kv, bool use_causal_mask) {
+GraphInputs make_inputs(
+    ggml_context * ctx,
+    std::size_t n_kv,
+    bool use_causal_mask,
+    AttentionImplementation attention_implementation) {
     require(ctx != nullptr, "GGML context is null");
     require(n_kv > 0, "attention read length must be positive");
     GraphInputs inputs;
@@ -81,7 +105,10 @@ GraphInputs make_inputs(ggml_context * ctx, std::size_t n_kv, bool use_causal_ma
         ctx, GGML_TYPE_I32, static_cast<std::int64_t>(n_kv));
     if (use_causal_mask) {
         inputs.causal_mask = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, static_cast<std::int64_t>(n_kv), 1);
+            ctx,
+            causal_mask_type(attention_implementation),
+            static_cast<std::int64_t>(n_kv),
+            1);
     }
     ggml_set_input(inputs.token);
     ggml_set_input(inputs.positions);
@@ -110,7 +137,8 @@ ChunkGraphInputs make_chunk_inputs(
     ggml_context * ctx,
     std::size_t n_tokens,
     std::size_t n_kv,
-    bool force_causal_mask) {
+    bool force_causal_mask,
+    AttentionImplementation attention_implementation) {
     require(ctx != nullptr, "chunk GGML context is null");
     require(n_tokens > 0, "chunk token count must be positive");
     require(n_kv >= n_tokens, "chunk attention context is shorter than its token count");
@@ -124,7 +152,7 @@ ChunkGraphInputs make_chunk_inputs(
     inputs.read_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_count);
     if (n_tokens > 1 || force_causal_mask) {
         inputs.causal_mask = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, kv_count, token_count);
+            ctx, causal_mask_type(attention_implementation), kv_count, token_count);
     }
     //把tensor标记为graph input，说明其值不是内部计算的，是外部必须输入的
     ggml_set_input(inputs.tokens);
@@ -225,6 +253,7 @@ ggml_tensor * build_attention(
     const GraphInputs & inputs,
     const Config & config,
     std::size_t n_kv,
+    AttentionImplementation attention_implementation,
     const std::string & prefix) {
     require(layer.is_full_attention(), prefix + " is not a full-attention layer");
     ops::QueryGate query_gate =
@@ -272,35 +301,46 @@ ggml_tensor * build_attention(
     ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
     ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
 
-    ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    set_name(scores, prefix + ".scores");
-    add_critical(result, scores);
     const float scale = 1.0f /
         std::sqrt(static_cast<float>(config.attention_key_length));
-    if (inputs.causal_mask != nullptr) {
-        require_shape(
-            inputs.causal_mask,
-            {static_cast<std::int64_t>(n_kv), 1},
-            (prefix + ".causal_mask").c_str());
-        require(
-            inputs.causal_mask->type == GGML_TYPE_F32,
-            prefix + " causal mask must be F32");
-    }
-    scores = ggml_soft_max_ext(ctx, scores, inputs.causal_mask, scale, 0.0f);
-    set_name(scores, prefix + ".probabilities");
+    require_causal_mask(
+        inputs.causal_mask,
+        {static_cast<std::int64_t>(n_kv), 1},
+        attention_implementation,
+        prefix);
+    ggml_tensor * attended = nullptr;
+    if (attention_implementation == AttentionImplementation::Flash) {
+        attended = ggml_flash_attn_ext(
+            ctx, query, keys, values, inputs.causal_mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
+        set_name(attended, prefix + ".flash_attention");
+        add_critical(result, attended);
+        attended = ggml_reshape_2d(
+            ctx,
+            attended,
+            static_cast<std::int64_t>(
+                config.attention_value_length * config.attention_head_count),
+            1);
+    } else {
+        ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        set_name(scores, prefix + ".scores");
+        add_critical(result, scores);
+        scores = ggml_soft_max_ext(ctx, scores, inputs.causal_mask, scale, 0.0f);
+        set_name(scores, prefix + ".probabilities");
 
-    values = ggml_cont(ctx, ggml_transpose(ctx, values));
-    ggml_tensor * attended = ggml_mul_mat(ctx, values, scores);
-    set_name(attended, prefix + ".weighted_values");
-    add_critical(result, attended);
-    attended = ggml_permute(ctx, attended, 0, 2, 1, 3);
-    attended = ggml_cont_2d(
-        ctx,
-        attended,
-        static_cast<std::int64_t>(
-            config.attention_value_length * config.attention_head_count),
-        1);
+        values = ggml_cont(ctx, ggml_transpose(ctx, values));
+        attended = ggml_mul_mat(ctx, values, scores);
+        set_name(attended, prefix + ".weighted_values");
+        add_critical(result, attended);
+        attended = ggml_permute(ctx, attended, 0, 2, 1, 3);
+        attended = ggml_cont_2d(
+            ctx,
+            attended,
+            static_cast<std::int64_t>(
+                config.attention_value_length * config.attention_head_count),
+            1);
+    }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
         ctx, layer.attn_output, attended, (prefix + ".output").c_str());
@@ -325,6 +365,7 @@ ggml_tensor * build_chunk_attention(
     const Config & config,
     std::size_t n_tokens,
     std::size_t n_kv,
+    AttentionImplementation attention_implementation,
     const std::string & prefix) {
     require(layer.is_full_attention(), prefix + " is not a full-attention layer");
     require(n_tokens > 0, prefix + " token count must be positive");
@@ -335,15 +376,11 @@ ggml_tensor * build_chunk_attention(
         input,
         {static_cast<std::int64_t>(config.embedding_length), token_count},
         (prefix + ".input").c_str());
-    if (inputs.causal_mask != nullptr) {
-        require_shape(
-            inputs.causal_mask,
-            {kv_count, token_count},
-            (prefix + ".causal_mask").c_str());
-        require(
-            inputs.causal_mask->type == GGML_TYPE_F32,
-            prefix + " causal mask must be F32");
-    }
+    require_causal_mask(
+        inputs.causal_mask,
+        {kv_count, token_count},
+        attention_implementation,
+        prefix);
 
     ops::QueryGate query_gate = ops::project_query_and_gate(
         ctx, input, layer.attn_q, config, token_count);
@@ -390,33 +427,48 @@ ggml_tensor * build_chunk_attention(
     ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
     ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
 
-    ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    set_name(scores, prefix + ".scores");
-    add_critical(result, scores);
-    require_shape(
-        scores,
-        {kv_count,
-         token_count,
-         static_cast<std::int64_t>(config.attention_head_count)},
-        (prefix + ".scores").c_str());
     const float scale = 1.0f /
         std::sqrt(static_cast<float>(config.attention_key_length));
-    scores = ggml_soft_max_ext(
-        ctx, scores, inputs.causal_mask, scale, 0.0f);
-    set_name(scores, prefix + ".probabilities");
+    ggml_tensor * attended = nullptr;
+    if (attention_implementation == AttentionImplementation::Flash) {
+        attended = ggml_flash_attn_ext(
+            ctx, query, keys, values, inputs.causal_mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
+        set_name(attended, prefix + ".flash_attention");
+        add_critical(result, attended);
+        attended = ggml_reshape_2d(
+            ctx,
+            attended,
+            static_cast<std::int64_t>(
+                config.attention_value_length * config.attention_head_count),
+            token_count);
+    } else {
+        ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        set_name(scores, prefix + ".scores");
+        add_critical(result, scores);
+        require_shape(
+            scores,
+            {kv_count,
+             token_count,
+             static_cast<std::int64_t>(config.attention_head_count)},
+            (prefix + ".scores").c_str());
+        scores = ggml_soft_max_ext(
+            ctx, scores, inputs.causal_mask, scale, 0.0f);
+        set_name(scores, prefix + ".probabilities");
 
-    values = ggml_cont(ctx, ggml_transpose(ctx, values));
-    ggml_tensor * attended = ggml_mul_mat(ctx, values, scores);
-    set_name(attended, prefix + ".weighted_values");
-    add_critical(result, attended);
-    attended = ggml_permute(ctx, attended, 0, 2, 1, 3);
-    attended = ggml_cont_2d(
-        ctx,
-        attended,
-        static_cast<std::int64_t>(
-            config.attention_value_length * config.attention_head_count),
-        token_count);
+        values = ggml_cont(ctx, ggml_transpose(ctx, values));
+        attended = ggml_mul_mat(ctx, values, scores);
+        set_name(attended, prefix + ".weighted_values");
+        add_critical(result, attended);
+        attended = ggml_permute(ctx, attended, 0, 2, 1, 3);
+        attended = ggml_cont_2d(
+            ctx,
+            attended,
+            static_cast<std::int64_t>(
+                config.attention_value_length * config.attention_head_count),
+            token_count);
+    }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
         ctx, layer.attn_output, attended, (prefix + ".output").c_str());
@@ -634,9 +686,26 @@ ggml_tensor * build_chunk_recurrent(
     require(
         persistent.convolution_outputs.size() == snapshot_count,
         prefix + " convolution snapshot destination count differs from the graph request");
-    require(
-        persistent.delta_outputs.size() == snapshot_count,
-        prefix + " delta snapshot destination count differs from the graph request");
+    const bool batched_delta_snapshots = persistent.delta_snapshots_output != nullptr;
+    if (batched_delta_snapshots) {
+        require(
+            persistent.delta_outputs.empty(),
+            prefix + " cannot combine batched and per-plane delta destinations");
+        require_shape(
+            persistent.delta_snapshots_output,
+            {state_width * state_width * value_heads, 1, snapshots, 1},
+            (prefix + ".delta_snapshot_destination").c_str());
+        require(
+            persistent.delta_snapshots_output->type == GGML_TYPE_F32,
+            prefix + " delta snapshot destination must be F32");
+        require(
+            ggml_is_contiguous(persistent.delta_snapshots_output),
+            prefix + " delta snapshot destination must be contiguous");
+    } else {
+        require(
+            persistent.delta_outputs.size() == snapshot_count,
+            prefix + " delta snapshot destination count differs from the graph request");
+    }
     for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
         const std::string snapshot_prefix =
             prefix + ".snapshot." + std::to_string(snapshot);
@@ -644,16 +713,18 @@ ggml_tensor * build_chunk_recurrent(
             persistent.convolution_outputs[snapshot],
             {kernel - 1, qkv_width},
             (snapshot_prefix + ".convolution_destination").c_str());
-        require_shape(
-            persistent.delta_outputs[snapshot],
-            {state_width, state_width, value_heads, 1},
-            (snapshot_prefix + ".delta_destination").c_str());
         require(
             persistent.convolution_outputs[snapshot]->type == GGML_TYPE_F32,
             snapshot_prefix + " convolution destination must be F32");
-        require(
-            persistent.delta_outputs[snapshot]->type == GGML_TYPE_F32,
-            snapshot_prefix + " delta destination must be F32");
+        if (!batched_delta_snapshots) {
+            require_shape(
+                persistent.delta_outputs[snapshot],
+                {state_width, state_width, value_heads, 1},
+                (snapshot_prefix + ".delta_destination").c_str());
+            require(
+                persistent.delta_outputs[snapshot]->type == GGML_TYPE_F32,
+                snapshot_prefix + " delta destination must be F32");
+        }
     }
 //开始手写graph
 //按照线性注意力，第一步是把输入投影到qkv空间，形成一个qkv_like矩阵
@@ -774,26 +845,52 @@ ggml_tensor * build_chunk_recurrent(
         ggml_row_size(gdn->type, output_elements_per_token),
         ggml_row_size(gdn->type, attention_output_elements),
         0);
-    for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
-        const std::int64_t state_offset = attention_output_elements +
-            static_cast<std::int64_t>(snapshot) * state_elements;
-        ggml_tensor * new_delta = ggml_view_4d(
+    if (batched_delta_snapshots) {
+        // The GDN snapshot tail is newest-first and contiguous. Preserve that
+        // order in the state cache with one copy; CUDA additionally recognizes
+        // this exact GDN -> CPY layout and can write the cache directly.
+        ggml_tensor * new_deltas = ggml_view_4d(
             ctx,
             gdn,
-            state_width,
-            state_width,
-            value_heads,
+            state_elements,
             1,
-            ggml_row_size(gdn->type, state_width),
-            ggml_row_size(gdn->type, state_width * state_width),
+            snapshots,
+            1,
             ggml_row_size(gdn->type, state_elements),
-            static_cast<std::size_t>(state_offset) * ggml_element_size(gdn));
+            ggml_row_size(gdn->type, state_elements),
+            ggml_row_size(
+                gdn->type,
+                state_elements * static_cast<std::int64_t>(snapshot_count)),
+            static_cast<std::size_t>(attention_output_elements) * ggml_element_size(gdn));
+        require(
+            ggml_is_contiguous(new_deltas),
+            prefix + " GDN delta snapshot source must be contiguous");
         ggml_tensor * update = ggml_cpy(
-            ctx, new_delta, persistent.delta_outputs[snapshot]);
-        set_name(
-            update,
-            prefix + ".delta_state_update." + std::to_string(snapshot));
+            ctx, new_deltas, persistent.delta_snapshots_output);
+        set_name(update, prefix + ".delta_state_update_batched");
         ggml_build_forward_expand(graph, update);
+    } else {
+        for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
+            const std::int64_t state_offset = attention_output_elements +
+                static_cast<std::int64_t>(snapshot) * state_elements;
+            ggml_tensor * new_delta = ggml_view_4d(
+                ctx,
+                gdn,
+                state_width,
+                state_width,
+                value_heads,
+                1,
+                ggml_row_size(gdn->type, state_width),
+                ggml_row_size(gdn->type, state_width * state_width),
+                ggml_row_size(gdn->type, state_elements),
+                static_cast<std::size_t>(state_offset) * ggml_element_size(gdn));
+            ggml_tensor * update = ggml_cpy(
+                ctx, new_delta, persistent.delta_outputs[snapshot]);
+            set_name(
+                update,
+                prefix + ".delta_state_update." + std::to_string(snapshot));
+            ggml_build_forward_expand(graph, update);
+        }
     }
 
     z = ggml_reshape_4d(
@@ -823,6 +920,7 @@ ggml_tensor * decoder_block(
     const GraphInputs & inputs,
     const Config & config,
     std::size_t n_kv,
+    AttentionImplementation attention_implementation,
     const std::string & prefix) {
     ggml_tensor * normalized = ops::rms_norm(
         ctx,
@@ -840,7 +938,17 @@ ggml_tensor * decoder_block(
         require(attention != nullptr && recurrent == nullptr,
                 prefix + " persistent-cache kind mismatch");
         attention_output = build_attention(
-            ctx, graph, result, normalized, layer, *attention, inputs, config, n_kv, prefix);
+            ctx,
+            graph,
+            result,
+            normalized,
+            layer,
+            *attention,
+            inputs,
+            config,
+            n_kv,
+            attention_implementation,
+            prefix);
     }
     ggml_tensor * residual = ggml_add(ctx, attention_output, input);
     ggml_tensor * ffn_input = ops::rms_norm(
@@ -870,6 +978,7 @@ ggml_tensor * decoder_chunk_block(
     std::size_t n_tokens,
     std::size_t n_kv,
     std::size_t snapshot_count,
+    AttentionImplementation attention_implementation,
     const std::string & prefix) {
     ggml_tensor * normalized = ops::rms_norm(       //每一个decode block的输入都要经过rms_norm
         ctx,
@@ -908,6 +1017,7 @@ ggml_tensor * decoder_chunk_block(
             config,
             n_tokens,
             n_kv,
+            attention_implementation,
             prefix);
     }
     ggml_tensor * residual = ggml_add(ctx, attention_output, input);
@@ -999,6 +1109,90 @@ void finalize_chunk_outputs(
     ggml_build_forward_expand(result.graph, result.greedy_tokens);
 }
 
+void append_mtp_prefill_kv_update(
+    ggml_context * ctx,
+    const Qwen35Weights & weights,
+    TargetChunkGraph & result,
+    ggml_tensor * target_hidden,
+    const AttentionCacheView & cache,
+    const ChunkGraphInputs & inputs,
+    std::size_t n_tokens) {
+    const Config & config = weights.config();
+    require(config.nextn_predict_layers == 1, "MTP prefill fusion requires one MTP layer");
+    const LayerWeights & layer = weights.layer(config.main_layers);
+    require(layer.is_mtp(), "last Qwen3.5 layer is not the bundled MTP block");
+
+    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+    require_shape(
+        target_hidden,
+        {static_cast<std::int64_t>(config.embedding_length), token_count},
+        "MTP prefill fusion target hidden");
+    require(
+        ggml_is_contiguous(target_hidden),
+        "MTP prefill fusion target hidden must be contiguous");
+
+    result.mtp_previous_hidden = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, config.embedding_length, 1);
+    ggml_set_input(result.mtp_previous_hidden);
+    set_name(result.mtp_previous_hidden, "qwen35.target_chunk.mtp_previous_hidden");
+
+    ggml_tensor * mtp_hidden = result.mtp_previous_hidden;
+    if (n_tokens > 1) {
+        ggml_tensor * target_prefix = ggml_view_2d(
+            ctx,
+            target_hidden,
+            target_hidden->ne[0],
+            token_count - 1,
+            target_hidden->nb[1],
+            0);
+        set_name(target_prefix, "qwen35.target_chunk.mtp_hidden_prefix");
+        mtp_hidden = ggml_concat(ctx, result.mtp_previous_hidden, target_prefix, 1);
+        set_name(mtp_hidden, "qwen35.target_chunk.mtp_hidden_shifted");
+    }
+    result.mtp_last_hidden = ggml_view_2d(
+        ctx,
+        target_hidden,
+        target_hidden->ne[0],
+        1,
+        target_hidden->nb[1],
+        static_cast<std::size_t>(token_count - 1) * target_hidden->nb[1]);
+    ggml_set_output(result.mtp_last_hidden);
+    set_name(result.mtp_last_hidden, "qwen35.target_chunk.mtp_last_hidden");
+
+    ggml_tensor * token_embedding = ggml_get_rows(
+        ctx, layer.mtp_token_embd, inputs.tokens);
+    ggml_tensor * current = ops::mtp_merge_embedding_and_hidden(
+        ctx,
+        token_embedding,
+        mtp_hidden,
+        layer.nextn_enorm,
+        layer.nextn_hnorm,
+        layer.nextn_eh_proj,
+        config);
+    current = ops::rms_norm(
+        ctx,
+        current,
+        layer.attn_norm,
+        config.attention_layer_norm_rms_epsilon,
+        "qwen35.target_chunk.mtp_attention_norm");
+
+    const StoredKeyValue stored = store_attention_key_value(
+        ctx,
+        current,
+        layer,
+        cache,
+        inputs.positions,
+        inputs.write_slots,
+        config,
+        token_count,
+        "qwen35.target_chunk.mtp_kv_update");
+    add_critical(result, stored.key);
+    add_critical(result, stored.value);
+    ggml_build_forward_expand(result.graph, result.mtp_last_hidden);
+    ggml_build_forward_expand(result.graph, stored.key);
+    ggml_build_forward_expand(result.graph, stored.value);
+}
+
 }  // namespace
 
 TokenGraph build_target_token_graph(
@@ -1007,7 +1201,8 @@ TokenGraph build_target_token_graph(
     const TargetPersistentView & persistent,
     std::size_t n_kv,
     bool emit_greedy,
-    bool use_causal_mask) {
+    bool use_causal_mask,
+    AttentionImplementation attention_implementation) {
     const Config & config = weights.config();
     require(config.main_layers == 24, "target graph requires 24 decoder layers");
     require(
@@ -1019,7 +1214,8 @@ TokenGraph build_target_token_graph(
 
     TokenGraph result;
     result.graph = ggml_new_graph_custom(ctx, 4096, false);
-    const GraphInputs inputs = make_inputs(ctx, n_kv, use_causal_mask);
+    const GraphInputs inputs = make_inputs(
+        ctx, n_kv, use_causal_mask, attention_implementation);
     result.token = inputs.token;
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
@@ -1045,6 +1241,7 @@ TokenGraph build_target_token_graph(
                 inputs,
                 config,
                 n_kv,
+                attention_implementation,
                 prefix);
         } else {
             current = decoder_block(
@@ -1058,6 +1255,7 @@ TokenGraph build_target_token_graph(
                 inputs,
                 config,
                 n_kv,
+                attention_implementation,
                 prefix);
         }
     }
@@ -1089,7 +1287,9 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     std::size_t snapshot_count,
     TargetChunkOutputMode output_mode,
     bool retain_hidden,
-    bool force_causal_mask) {
+    bool force_causal_mask,
+    AttentionImplementation attention_implementation,
+    const AttentionCacheView * mtp_prefill_cache) {
 
     //执行校验，保证参数有效，随时准备抛出异常
     require(ctx != nullptr, "target chunk GGML context is null");
@@ -1116,7 +1316,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     TargetChunkGraph result;    //graph描述对象
     result.graph = ggml_new_graph_custom(ctx, 4096, false);//创建新的ggml计算图，挂载到本次ctx，设置为4096个节点，不进行梯度计算
     const ChunkGraphInputs inputs = make_chunk_inputs(      //此处是建图过程，这个input只是一个shape描述，实际的值在运行时才会传入
-        ctx, n_tokens, n_kv, force_causal_mask);
+        ctx, n_tokens, n_kv, force_causal_mask, attention_implementation);
     result.tokens = inputs.tokens;
     result.positions = inputs.positions;
     result.write_slots = inputs.write_slots;
@@ -1147,6 +1347,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
                 n_tokens,
                 n_kv,
                 snapshot_count,
+                attention_implementation,
                 prefix);
         } else {
             current = decoder_chunk_block(
@@ -1162,6 +1363,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
                 n_tokens,
                 n_kv,
                 snapshot_count,
+                attention_implementation,
                 prefix);
         }
     }
@@ -1175,21 +1377,34 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     // A non-final MTP-off prefill slice only needs its persistent KV/recurrent
     // side effects.  Its final hidden, output norm and 248K-row vocabulary head
     // have no consumer.  MTP maintenance still requests the normalized hidden.
-    if (output_mode != TargetChunkOutputMode::None || retain_hidden) {
+    if (output_mode != TargetChunkOutputMode::None || retain_hidden ||
+        mtp_prefill_cache != nullptr) {
         current = ops::rms_norm(
             ctx,
             current,
             weights.global().output_norm,
             config.attention_layer_norm_rms_epsilon,
             "qwen35.target_chunk.output_norm");
-        finalize_chunk_outputs(
-            ctx,
-            result,
-            current,
-            weights.global().output_head,
-            n_tokens,
-            output_mode,
-            retain_hidden);
+        if (output_mode != TargetChunkOutputMode::None || retain_hidden) {
+            finalize_chunk_outputs(
+                ctx,
+                result,
+                current,
+                weights.global().output_head,
+                n_tokens,
+                output_mode,
+                retain_hidden);
+        }
+        if (mtp_prefill_cache != nullptr) {
+            append_mtp_prefill_kv_update(
+                ctx,
+                weights,
+                result,
+                current,
+                *mtp_prefill_cache,
+                inputs,
+                n_tokens);
+        }
     }
     return result;
 }
@@ -1200,7 +1415,8 @@ TokenGraph build_mtp_token_graph(
     const AttentionCacheView & cache,
     std::size_t n_kv,
     bool emit_greedy,
-    bool use_causal_mask) {
+    bool use_causal_mask,
+    AttentionImplementation attention_implementation) {
     const Config & config = weights.config();
     require(config.nextn_predict_layers == 1, "MTP graph requires one bundled MTP layer");
     const LayerWeights & layer = weights.layer(config.main_layers);
@@ -1208,7 +1424,8 @@ TokenGraph build_mtp_token_graph(
 
     TokenGraph result;
     result.graph = ggml_new_graph_custom(ctx, 1024, false);
-    const GraphInputs inputs = make_inputs(ctx, n_kv, use_causal_mask);
+    const GraphInputs inputs = make_inputs(
+        ctx, n_kv, use_causal_mask, attention_implementation);
     result.token = inputs.token;
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
@@ -1240,6 +1457,7 @@ TokenGraph build_mtp_token_graph(
         inputs,
         config,
         n_kv,
+        attention_implementation,
         "qwen35.mtp.layer");
     current = ops::rms_norm(
         ctx,
