@@ -168,6 +168,8 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 
 远端结果目录还保留 `GGML_VK_PERF_LOGGER=1` 的短 MTP kernel log。它不是端到端吞吐结论：每次 backend graph 的计时各自输出；但同一张 target verification 内，Q6_K head + argmax 已占约四分之一 GPU kernel 时间，说明自定义 head epilogue 有合理收益空间。反之，186-token 时 `GET_ROWS` 极小；direct paged kernel 的设计应直接读物理 slot/page table、执行 online softmax，并在 1k/4k/8k 三个 context 证明避免 gather 的收益。
 
+4096-token 的独占 MTP K=1 profile 已完成这一验证：math draft/verification 为 `219.6 / 463.4ms`，其中 verification 的 13 次 `GET_ROWS` 为 `5.25ms`，但分离的 F32 attention score/value matmul 约 `62.7 / 134.5ms`；只消除 gather 不能成为完整方案。显式 Flash 的同一单步探针使 verification 降至 `333.5ms`、decode 从 `1.45` 到 `1.73 tok/s`，且该步 acceptance 为 100%。这证明 online attention 融合方向有效；但历史完整长 decode 已观察到 Flash 的 shape-dependent MTP acceptance 回退，所以 `auto` 在 MTP 下仍强制 math，Flash 保持显式实验路径，不能以单步样本改默认。
+
 ## 3. 当前运行链路的新增部分
 
 ```text
