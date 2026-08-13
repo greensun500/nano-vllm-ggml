@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.80 受保护的 non-MTP Flash 默认选择
+# nano-vLLM 当前版本修改说明：v3.82 Mali Vulkan argmax 并行度
 
 ## 1. 版本定位
 
@@ -18,7 +18,9 @@
 - v3.77：`5188da8 v3.77: profile native MTP stages`
 - v3.78：`abe6de3 v3.78: record Arm MTP kernel profile`
 - v3.79：`f24a212 v3.79: document long-context attention profile`
-- v3.80：默认 `native_attention_impl=auto`，只在 non-MTP 选择经 capability probe 支持的 FlashAttention
+- v3.80：`fc160da v3.80: default non-MTP attention to auto`
+- v3.81：`bcb7405 v3.81: record Mali auto attention benchmark`
+- v3.82 工作区：Mali Vulkan 的 F32 `ARGMAX` 改用最多 256 lane，而非单一 16-lane subgroup
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -42,6 +44,8 @@ v3.76 根据 Arm 真机 oracle 收回 v3.73 的默认启用：即使 embedding �
 v3.77 不改计算图和 token 语义。`bench --json` 读取 native runtime 已有的累计 MTP profile，并在排除 warmup 后导出 draft、target verification、MTP KV catch-up 三段的 wall time、建图时间和阶段 tok/s。远端 Mali-G720 K=1 A/B 已证明：打开 experimental Vulkan persistent graph reuse 后 cache hit 为 3227，但 decode 从 `18.58` 降至 `17.87 tok/s`；这与 profile 中 graph setup 仅占小部分的判断一致，开关保持默认关闭，后续优化聚焦 verification 的 target forward、词表 head 与 KV gather。新的完整 K=1 profile 为 draft `15.90s`、verification `72.06s`、KV catch-up `1.03s`，其中 verification setup 仅 `1.74s`；它占 decode wall 约 81%。同机 CPU K=3 试验性连续 snapshot + MTP prefill fusion 为 `32.62 tok/s`，相对 baseline `32.54 tok/s` 的差异在本轮重复测量噪声范围，故两个开关继续 opt-in。补充的 186-token Vulkan kernel log 显示一张 T=2 verification graph 为 `79.11ms`：Q6_K vocab `MUL_MAT_VEC` `15.15ms`、独立 `ARGMAX` `3.95ms`，而 13 次 `GET_ROWS` 合计 `0.25ms`。这给 fused head/argmax 明确的短上下文上限，也说明 direct paged attention 要以 8k 长上下文测量作为验收门槛。
 
 v3.80 将 Python/CLI 的 `native_attention_impl` 默认值从 `math` 改为 `auto`。这不是对 MTP 的算法改动：C++ 选择器在 MTP 仍无条件返回 math，因而 draft 与 verification 的数值路径、acceptance 和现有基线命令（它们显式传 `math`）保持不变。仅在 MTP-off 且 backend/shape probe 确认 `FLASH_ATTN_EXT` 可用时才选择 Flash；不支持时 `auto` 自动回退 math。这个默认值变更经过本地 31 项单测与真实 Qwen3.5 CPU oracle（MTP off/on）5/5 验证；Armv9.2/Mali-G720 的统一参数远端 A/B（Q4_0、prompt 186、generate 541、repeat 3、warmup 1、`taskset -c 0,5-11`）也完成：显式 math 的 prefill/decode/processed/generated 为 `69.62/20.81/25.36/18.90 tok/s`，v3.80 auto 为 `69.93/21.24/25.85/19.26 tok/s`，decode 提升 `2.07%`。完整 stdout/stderr/JSON、build info（GGML `5ed33380`）与参数位于远端 `v37-results/20260814-014951-v380-auto/`。
+
+v3.82 是 fused `lm_head + argmax` 前的独立、低风险归约阶段。Mali-G720 的 subgroup 为 16，而原 GGML `argmax.comp` 因此让每个 lane 扫描约 15500 个 Qwen3.5 vocab logits；Vulkan 后端现在仅对 Arm 设备创建 256-lane（受 `maxComputeWorkGroupInvocations` 限制）的同一 shader specialization。该 shader 仍以严格 `>` 比较、按低 index 优先处理相等值，语义与原 16-lane binary reduction 相同；非 Arm 保持上游 specialization。它不改变 Q6_K head 计算、输出 tensor 格式或 MTP acceptance。提交后必须经 Arm Vulkan rebuild、greedy/MTP oracle 和 kernel profile 验收；若没有净收益则回退该独立提交。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -183,6 +187,14 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 | `tests/test_native_runner.py` | 更新 ABI 传递测试，固定新默认值。 |
 
 `auto` 的语义是安全选择而不是强制 Flash：MTP 仍走 math；普通 target graph 只有 capability probe 通过才走 Flash，否则回退 math。因此用户要求的复现实验仍应显式设置 `NANOVLLM_NATIVE_ATTENTION_IMPL=math`，而默认 chat/bench 能在已验证 accelerator 上获得 non-MTP attention 融合收益。
+
+### 2.15 v3.82 Mali argmax workgroup
+
+| 文件 | v3.82 改动 |
+| --- | --- |
+| `third_party/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp` | Arm Vulkan 创建 `argmax_f32` pipeline 时把 local size specialization 从 `subgroup_size` 提升为 `min(256, maxComputeWorkGroupInvocations 的 2 次幂)`；其他 vendor 不变。 |
+
+这是一个单独的 `ARGMAX` 调度优化，不宣称已经完成 fused Q6_K head：后续融合仍需要令 matvec 直接产生局部 `(logit, token_id)`，再只归约局部候选，才能避免全量 logits 写回。这个阶段先验证更宽的精确归约不会造成 GPU/driver 或 greedy trace 回归。
 
 ## 3. 当前运行链路的新增部分
 
