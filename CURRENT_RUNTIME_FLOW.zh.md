@@ -88,7 +88,7 @@ full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,
 - `Last`：只计算最后一列 greedy token；
 - `All`：计算 T 列 prediction，供 MTP verification。
 
-在 Arm Vulkan 的 Qwen3.5 Q6_K vocabulary head 上，图执行器还会检查该 `MUL_MAT` 是否唯一地直接供给 `ARGMAX`，且 hidden 是连续 F32、`T<=4`。满足时不物化 `[vocab,T]` logits：Q6_K shader 以 16 行为一组输出 `{local max, id}`，256-lane reducer 再输出 greedy token。候选暂存使用 Vulkan backend 的 transient buffer，两个 pass 之间插入 backend memory barrier；任何非 Arm、非 Q6_K、额外 consumer、非连续或更大 token block 都保留原图节点。环境变量 `GGML_VK_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 可关闭该 Vulkan 专用融合以执行 A/B；CPU/CUDA 均不读取这一开关。
+在 Arm Vulkan 的 Qwen3.5 Q6_K vocabulary head 上，图执行器可检查该 `MUL_MAT` 是否唯一地直接供给 `ARGMAX`，且 hidden 是连续 F32、`T<=4`。满足时不物化 `[vocab,T]` logits：Q6_K shader 以 16 行为一组输出 `{local max, id}`，256-lane reducer 再输出 greedy token。候选暂存使用 Vulkan backend 的 transient buffer，两个 pass 之间插入 backend memory barrier；任何非 Arm、非 Q6_K、额外 consumer、非连续或更大 token block 都保留原图节点。Mali profile 显示当前 16-row 实现损失了原 Q6_K matvec 的 row-level parallelism，故只有 `GGML_VK_ENABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 才启用它，默认保持原图；`GGML_VK_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSION=1` 可强制关闭以执行 A/B。CPU/CUDA 均不读取这两个开关。
 
 readback 数分别为 0、1、T；hidden 只在 `retain_hidden=true` 时读取。
 
