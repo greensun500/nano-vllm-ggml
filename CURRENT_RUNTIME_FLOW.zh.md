@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.85
+# nano-vLLM 当前执行流程：v3.86
 
 ## 1. 架构边界
 
@@ -80,7 +80,11 @@ tokens[T] + positions[4T]
   -> 按输出模式决定 output norm/head/argmax
 ```
 
-full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。`native_attention_impl` 默认 `auto`：非 MTP 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把 QK -> softmax -> PV 留在 GGML backend kernel 内，失败则回退 math；显式 `flash` 在不支持时报告清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
+full-attention 层在 math/flash 路径先批量写 K/V，再按 `read_slots[C]` gather，chunk 使用 `[C,T]` causal mask 防止 query 看到未来 token。`native_attention_impl` 默认 `auto`：非 MTP 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把 QK -> softmax -> PV 留在 GGML backend kernel 内，失败则回退 math；显式 `flash` 在不支持时报告清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。
+
+显式 `paged` 是当前仅 Vulkan 的 direct-cache 实验：graph 将 `SET_ROWS` 的 persistent K/V view 和 I32 `read_slots` 直接输入 `PAGED_ATTN`，不创建 `GET_ROWS` K/V gather，也不创建 score/probability tensor。每个 256-lane workgroup 处理一个 `(token, query head)`，以 16-slot tile 形成 QK dot，维护 online softmax 的 `(max,sum)` 并累计 V；第 `t` 个 chunk query 只可见 `n_kv-n_tokens+t+1` 个 slot，保留原 causal 语义。它受限于 Qwen3.5 的 F32 KV、`head_dim=256` 和整数 GQA；runtime 对真实 shape 调用 `ggml_backend_supports_op`，不满足时显式报错而不静默回退。`paged` 不参加 `auto`，所以不会改变 CPU/CUDA、非 MTP 默认或 MTP acceptance 基线。
+
+attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
 
 输出模式：
 
@@ -268,4 +272,4 @@ python3 -m nanovllm.cli.bench "$MODEL" ... \
   --prompt-len 521 --gen-len 129 --warmup 1 --repeat 3 --json
 ```
 
-MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。v3.7 图级 A/B 参数是 `--native-attention-impl {math,auto,flash}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；CUDA Graph 用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的单独构建做 A/B。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。
+MTP 模式增加 `--enable-mtp --mtp-max-draft-tokens K`。graph reuse 默认开启；A/B 时增加 `--no-graph-reuse`。v3.7 图级 A/B 参数是 `--native-attention-impl {math,auto,flash,paged}`、`--native-batched-recurrent-snapshots`、`--native-mtp-prefill-fusion`；`paged` 只用于 `native_vulkan` 的 correctness 与长上下文对照，未进入默认。CUDA Graph 用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的单独构建做 A/B。pp 读取 `prefill_tok_s`，tg 读取 `decode_tok_s`，组合项读取 `processed_tok_s`，同时记录 `graph_cache_hits/misses/evictions/active_entries`。native runtime 还可读取 `memory_stats()` 和 `mtp_profile_stats()`：后者分开统计 draft、target verification、KV catch-up 及其 graph setup 时间。

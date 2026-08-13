@@ -27,11 +27,11 @@ set(
     "Pinned llama.cpp source tree; only its ggml subdirectory is compiled"
 )
 # The embedded GGML tree is the official b9986 revision plus nano-vLLM's
-# reviewed Mali shape-routing patch.  Pin the actual gitlink so a fresh build
+# reviewed Mali/runtime patches. Pin the actual gitlink so a fresh build
 # cannot silently compile a different tree, while reporting the official base
 # separately for upstream traceability.
 set(NANOVLLM_GGML_BASE_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
-set(NANOVLLM_GGML_COMMIT "5ed33380b4679533243ca45e172804d5ddfe59ec")
+set(NANOVLLM_GGML_COMMIT "0caa416ded34e746f308ef75ea1d9cb24e50f552")
 # This local, single-header compatibility patch exposes GGML_TYPE_CPU_REPACK
 # to the native loader. Keep the official base revision above as the primary
 # pin and accept only this explicitly reviewed derivative.

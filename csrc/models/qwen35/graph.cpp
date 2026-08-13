@@ -276,31 +276,6 @@ ggml_tensor * build_attention(
         1,
         prefix);
 
-    // SET_ROWS returns a view of the persistent destination and establishes an
-    // explicit dependency for the subsequent GET_ROWS. The current token is
-    // therefore visible to its own causal attention without relying on graph
-    // insertion order as an implicit memory barrier.
-    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
-    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
-    gathered_key = ggml_reshape_3d(
-        ctx,
-        gathered_key,
-        config.attention_key_length,
-        config.attention_head_count_kv,
-        static_cast<std::int64_t>(n_kv));
-    gathered_value = ggml_reshape_3d(
-        ctx,
-        gathered_value,
-        config.attention_value_length,
-        config.attention_head_count_kv,
-        static_cast<std::int64_t>(n_kv));
-
-    // Match llama.cpp's non-Flash MHA layout. GQA broadcasting is handled by
-    // GGML because 8 query heads are an integer multiple of 2 KV heads.
-    ggml_tensor * query = ggml_permute(ctx, query_gate.query, 0, 2, 1, 3);
-    ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
-    ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
-
     const float scale = 1.0f /
         std::sqrt(static_cast<float>(config.attention_key_length));
     require_causal_mask(
@@ -309,7 +284,41 @@ ggml_tensor * build_attention(
         attention_implementation,
         prefix);
     ggml_tensor * attended = nullptr;
-    if (attention_implementation == AttentionImplementation::Flash) {
+    if (attention_implementation == AttentionImplementation::Paged) {
+        // Keep SET_ROWS as the producer of both persistent cache inputs: the
+        // direct kernel sees this token's freshly written K/V row without a
+        // materialized GET_ROWS gather.
+        attended = ggml_paged_attn(
+            ctx, query_gate.query, stored.key, stored.value, inputs.read_slots, scale);
+        set_name(attended, prefix + ".paged_attention");
+        add_critical(result, attended);
+    } else {
+        // SET_ROWS returns a view of the persistent destination and establishes an
+        // explicit dependency for the subsequent GET_ROWS. The current token is
+        // therefore visible to its own causal attention without relying on graph
+        // insertion order as an implicit memory barrier.
+        ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+        ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
+        gathered_key = ggml_reshape_3d(
+            ctx,
+            gathered_key,
+            config.attention_key_length,
+            config.attention_head_count_kv,
+            static_cast<std::int64_t>(n_kv));
+        gathered_value = ggml_reshape_3d(
+            ctx,
+            gathered_value,
+            config.attention_value_length,
+            config.attention_head_count_kv,
+            static_cast<std::int64_t>(n_kv));
+
+        // Match llama.cpp's non-Flash MHA layout. GQA broadcasting is handled by
+        // GGML because 8 query heads are an integer multiple of 2 KV heads.
+        ggml_tensor * query = ggml_permute(ctx, query_gate.query, 0, 2, 1, 3);
+        ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
+        ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
+
+        if (attention_implementation == AttentionImplementation::Flash) {
         attended = ggml_flash_attn_ext(
             ctx, query, keys, values, inputs.causal_mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
@@ -321,7 +330,7 @@ ggml_tensor * build_attention(
             static_cast<std::int64_t>(
                 config.attention_value_length * config.attention_head_count),
             1);
-    } else {
+        } else {
         ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
         set_name(scores, prefix + ".scores");
@@ -340,6 +349,7 @@ ggml_tensor * build_attention(
             static_cast<std::int64_t>(
                 config.attention_value_length * config.attention_head_count),
             1);
+        }
     }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
@@ -408,29 +418,35 @@ ggml_tensor * build_chunk_attention(
         token_count,
         prefix);
 
-    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
-    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
-    gathered_key = ggml_reshape_3d(
-        ctx,
-        gathered_key,
-        config.attention_key_length,
-        config.attention_head_count_kv,
-        kv_count);
-    gathered_value = ggml_reshape_3d(
-        ctx,
-        gathered_value,
-        config.attention_value_length,
-        config.attention_head_count_kv,
-        kv_count);
-
-    ggml_tensor * query = ggml_permute(ctx, query_gate.query, 0, 2, 1, 3);
-    ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
-    ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
-
     const float scale = 1.0f /
         std::sqrt(static_cast<float>(config.attention_key_length));
     ggml_tensor * attended = nullptr;
-    if (attention_implementation == AttentionImplementation::Flash) {
+    if (attention_implementation == AttentionImplementation::Paged) {
+        attended = ggml_paged_attn(
+            ctx, query_gate.query, stored.key, stored.value, inputs.read_slots, scale);
+        set_name(attended, prefix + ".paged_attention");
+        add_critical(result, attended);
+    } else {
+        ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+        ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
+        gathered_key = ggml_reshape_3d(
+            ctx,
+            gathered_key,
+            config.attention_key_length,
+            config.attention_head_count_kv,
+            kv_count);
+        gathered_value = ggml_reshape_3d(
+            ctx,
+            gathered_value,
+            config.attention_value_length,
+            config.attention_head_count_kv,
+            kv_count);
+
+        ggml_tensor * query = ggml_permute(ctx, query_gate.query, 0, 2, 1, 3);
+        ggml_tensor * keys = ggml_permute(ctx, gathered_key, 0, 2, 1, 3);
+        ggml_tensor * values = ggml_permute(ctx, gathered_value, 0, 2, 1, 3);
+
+        if (attention_implementation == AttentionImplementation::Flash) {
         attended = ggml_flash_attn_ext(
             ctx, query, keys, values, inputs.causal_mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
@@ -442,7 +458,7 @@ ggml_tensor * build_chunk_attention(
             static_cast<std::int64_t>(
                 config.attention_value_length * config.attention_head_count),
             token_count);
-    } else {
+        } else {
         ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
         set_name(scores, prefix + ".scores");
@@ -468,6 +484,7 @@ ggml_tensor * build_chunk_attention(
             static_cast<std::int64_t>(
                 config.attention_value_length * config.attention_head_count),
             token_count);
+        }
     }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(

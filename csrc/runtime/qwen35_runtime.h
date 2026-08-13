@@ -12,6 +12,7 @@ enum class Qwen35AttentionImplementation : std::uint8_t {
     Math,
     Auto,
     Flash,
+    Paged,
 };
 
 struct Qwen35RuntimeOptions {

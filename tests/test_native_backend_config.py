@@ -85,6 +85,14 @@ class NativeBackendConfigTests(unittest.TestCase):
             self.assertTrue(config.native_batched_recurrent_snapshots)
             self.assertTrue(config.native_mtp_prefill_fusion)
 
+            paged = Config(
+                model=model.name,
+                backend="native_vulkan",
+                tokenizer=tokenizer,
+                native_attention_impl="paged",
+            )
+            self.assertEqual(paged.native_attention_impl, "paged")
+
             with self.assertRaisesRegex(ValueError, "native_vulkan_graph_reuse"):
                 Config(
                     model=model.name,

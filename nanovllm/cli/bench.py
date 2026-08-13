@@ -146,9 +146,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--native-attention-impl",
-        choices=("math", "auto", "flash"),
+        choices=("math", "auto", "flash", "paged"),
         default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "auto"),
-        help="Native attention implementation. 'auto' probes FlashAttention for non-MTP runs and keeps math for MTP.",
+        help="Native attention implementation. 'paged' is an explicit Vulkan direct-KV experiment; auto remains unchanged.",
     )
     parser.add_argument(
         "--native-batched-recurrent-snapshots",

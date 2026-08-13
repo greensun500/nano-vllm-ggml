@@ -48,6 +48,9 @@ enum class TargetChunkOutputMode {
 enum class AttentionImplementation {
     Math,
     Flash,
+    // Direct, online-softmax attention over persistent KV rows addressed by
+    // read_slots. This is currently a narrow Vulkan-only experimental path.
+    Paged,
 };
 
 // Persistent state used by one single-sequence, multi-token target graph.

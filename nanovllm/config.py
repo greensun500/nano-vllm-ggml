@@ -96,8 +96,8 @@ class Config:
             "max_num_batched_tokens must be at least max_num_seqs",
         )
         _require(
-            self.native_attention_impl in ("math", "auto", "flash"),
-            "native_attention_impl must be 'math', 'auto', or 'flash'",
+            self.native_attention_impl in ("math", "auto", "flash", "paged"),
+            "native_attention_impl must be 'math', 'auto', 'flash', or 'paged'",
         )
         if self.native_mtp_prefill_fusion:
             _require(is_native, "native_mtp_prefill_fusion requires a native backend")

@@ -438,6 +438,46 @@ struct Qwen35Runtime::Impl {
         return supported;
     }
 
+    bool paged_attention_supported(std::size_t n_tokens, std::size_t n_kv) {
+        if (primary_backend == nullptr ||
+            primary_backend->kind() != BackendKind::Vulkan ||
+            n_tokens == 0 || n_kv < n_tokens) {
+            return false;
+        }
+        ggml_init_params params{};
+        params.mem_size = 16U * 1024U;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        ggml_context * probe = ggml_init(params);
+        if (probe == nullptr) {
+            return false;
+        }
+        const qwen35::Config & config = model->config();
+        const std::int64_t head_dim = config.attention_key_length;
+        const std::int64_t query_heads = config.attention_head_count;
+        const std::int64_t kv_heads = config.attention_head_count_kv;
+        const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
+        const std::int64_t kv_count = static_cast<std::int64_t>(n_kv);
+        ggml_tensor * query = ggml_new_tensor_3d(
+            probe, GGML_TYPE_F32, head_dim, query_heads, token_count);
+        ggml_tensor * key_cache = ggml_new_tensor_2d(
+            probe, GGML_TYPE_F32, head_dim * kv_heads, kv_count);
+        ggml_tensor * value_cache = ggml_new_tensor_2d(
+            probe, GGML_TYPE_F32, head_dim * kv_heads, kv_count);
+        ggml_tensor * slots = ggml_new_tensor_1d(probe, GGML_TYPE_I32, kv_count);
+        ggml_tensor * attention = ggml_paged_attn(
+            probe,
+            query,
+            key_cache,
+            value_cache,
+            slots,
+            1.0f / std::sqrt(static_cast<float>(head_dim)));
+        const bool supported = ggml_backend_supports_op(
+            primary_backend->get(), attention);
+        ggml_free(probe);
+        return supported;
+    }
+
     qwen35::AttentionImplementation select_attention_implementation(
         std::size_t n_tokens,
         std::size_t n_kv,
@@ -452,6 +492,13 @@ struct Qwen35Runtime::Impl {
                         "or attention shape");
                 }
                 return qwen35::AttentionImplementation::Flash;
+            case Qwen35AttentionImplementation::Paged:
+                if (!paged_attention_supported(n_tokens, n_kv)) {
+                    fail(
+                        "attention_impl='paged' is supported only by the Vulkan "
+                        "direct-cache kernel for the requested Qwen3.5 attention shape");
+                }
+                return qwen35::AttentionImplementation::Paged;
             case Qwen35AttentionImplementation::Auto:
                 // MTP compares greedy results from T=1 draft and T=K+1
                 // verification graphs.  Shape-dependent Flash rounding can

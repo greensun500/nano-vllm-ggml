@@ -175,9 +175,13 @@ bool parse_attention_implementation(
         result = Qwen35AttentionImplementation::Flash;
         return true;
     }
+    if (std::strcmp(implementation, "paged") == 0) {
+        result = Qwen35AttentionImplementation::Paged;
+        return true;
+    }
     PyErr_SetString(
         PyExc_ValueError,
-        "Qwen35Runtime argument 'attention_impl' must be 'math', 'auto', or 'flash'");
+        "Qwen35Runtime argument 'attention_impl' must be 'math', 'auto', 'flash', or 'paged'");
     return false;
 }
 
