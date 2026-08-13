@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.75 修复 Arm CPU_REPACK embedding 布局
+# nano-vLLM 当前版本修改说明：v3.76 禁用未通过 Arm oracle 的 CPU_REPACK
 
 ## 1. 版本定位
 
@@ -13,9 +13,10 @@
 - v3.72：`b413650 v3.72: trim MTP draft hidden lifetime`
 - v3.73：`d18b3d2 v3.73: enable CPU weight repacking`
 - v3.74：`904c7d5 v3.74: probe Vulkan graph reuse safely`
-- v3.75 工作区：修复 Arm CPU_REPACK 错用于 embedding 的布局错误，待本次提交固化
+- v3.75：`2e68c2a v3.75: keep embeddings out of CPU repack`
+- v3.76 工作区：默认禁用未通过 Arm greedy oracle 的 CPU_REPACK，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
-- GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
+- GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
 
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
@@ -31,6 +32,8 @@ v3.73 不改模型图、量化格式或 token 语义。此前 CPU 路径把所�
 v3.74 新增一个默认关闭的 Vulkan persistent graph reuse 安全探针。v3.5 曾记录 Mali 在 padded-mask bucket attention 下的不稳定行为，因此本版本不会改变 `native_vulkan` 默认执行链；只有显式 `--native-vulkan-graph-reuse` 或 `NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE=1` 才让单序列 decode/MTP 复用 CPU 已验证的同一 bucket 机制。该开关用于远机 correctness oracle 和与 `--no-graph-reuse` 的交替 A/B，bench JSON 会记录它；多序列、prefill 和 MTP prefill fusion 保持 eager graph。
 
 v3.75 修复 v3.73 的 Arm-only correctness bug。`token_embd.weight` 在该 GGUF 中是 Q6_K：它既是 tied output head 的 `MUL_MAT` 权重，也是 target/MTP embedding 的 `GET_ROWS` source。CPU_REPACK 只改变矩阵乘所需的物理 layout，`GET_ROWS` 不识别该 layout；Arm 远机在第一步 embedding 后 abort。加载器现在按 tensor 名称排除 `token_embd.weight` 和可选 `*.nextn.embed_tokens.weight`，令它们保持 default buffer；其余满足条件的 Q4_0 projection 和只作 lm_head 的 Q6_K 权重仍可 repack。
+
+v3.76 根据 Arm 真机 oracle 收回 v3.73 的默认启用：即使 embedding 保持原始布局，Q4_0 `q4_0_4x8` repack 仍会改变 MTP partial-rollback trace（5 个 oracle 中 4 个通过，1 个生成序列少一个 token）。因此项目新增 `NANOVLLM_NATIVE_CPU_REPACK=OFF`（默认）；构建脚本同名环境变量可显式开启实验 build，但它不得用于正确性基线或性能结论。保留 loader 的混合 buffer 代码和 v3.75 embedding 排除，是为了后续比对上游修复后的 repack traits；默认运行时重新使用原始 GGUF layout，优先保证 exact greedy token。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -144,6 +147,14 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 
 本地 x86 真实 GGUF oracle（5/5）继续通过，但该问题的触发与验证都以 Arm 的 Q6_K token embedding 为准。远端结果目录保留了修复前的 abort 日志；修复后必须重新 clean build 并通过 Arm CPU oracle 才能进行性能基准。
 
+### 2.12 v3.76 CPU_REPACK 默认关闭
+
+| 文件 | v3.76 改动 |
+| --- | --- |
+| `CMakeLists.txt`、`scripts/build_native_runtime.sh` | 新增 `NANOVLLM_NATIVE_CPU_REPACK`，默认 `OFF` 并传给 GGML 的 `GGML_CPU_REPACK`；仅显式环境变量/`-D` 可开启实验重排。CMake 同时把唯一的本地 `CPU_REPACK` header 兼容提交列为允许 revision，避免固定版本校验与子模块指针脱节。 |
+
+远机验证结果说明，v3.75 只修复了 embedding abort，不能证明所有 Q4_0 projection 的 Arm repack 数值等价。v3.76 的判断是正确性优先的止损，不把 x86 prefill A/B 当作 Arm/MTP 可用性证据。后续若升级 GGML repack 实现，必须至少重跑 CPU oracle 的 full-accept、partial-accept/rollback、release/shutdown 三类路径，才可讨论默认打开。
+
 ## 3. 当前运行链路的新增部分
 
 ```text
@@ -182,7 +193,7 @@ CPU 上 MTP K=3 在本模型/工作负载有约 17% decode 收益。Vulkan 固�
 
 llama.cpp 参考数据的 decode 长度与 nano-vLLM 不同，适合作为量级对比，不作为 v3.5/v3.6 回归判断。v3.7 已在 Armv9.2 Cortex-A720/A520 + Mali-G720-Immortalis 远机完成真实 GGUF oracle 和统一长 benchmark；GCC 12 使用兼容拼写 `armv9-a+dotprod+i8mm`，Vulkan 日志确认 `int dot=1, matrix cores=KHR_coopmat`。相对 v3.6，v3.7 CPU MTP-off / K=3 decode 为 `27.75 / 32.93 tok/s`，Vulkan Flash MTP-off / math MTP K=1 为 `21.24 / 18.59 tok/s`。MTP 的 `auto` 固定 math 已避免 Mali Flash 的 shape-dependent rounding 将 K=1 acceptance 从 100% 降至 50%、decode 降至 `16.08 tok/s` 的回退。完整 benchmark、K sweep 和 profile 记录在开发笔记 `8-mtp升级.md`。
 
-v3.73 本地 x86 A/B（Qwen3.5-2B-Q4_0、CPU 8 threads、math、prompt 186、generate 128、warmup/repeat=1）在关闭/开启 `GGML_CPU_REPACK` 时，prefill 为 `165.9 / 394.3 tok/s`；decode 为 `24.25 / 24.21 tok/s`，后者在该平台不覆盖 Q6_K head，视为测量噪声范围。该结果只证明加载路径与 Q4_0 prefill 内核生效；Armv9.2 的 Q6_K decode 收益必须在远机完整统一 benchmark 中验收，不能由 x86 外推。
+v3.73 本地 x86 A/B（Qwen3.5-2B-Q4_0、CPU 8 threads、math、prompt 186、generate 128、warmup/repeat=1）在关闭/开启 `GGML_CPU_REPACK` 时，prefill 为 `165.9 / 394.3 tok/s`；decode 为 `24.25 / 24.21 tok/s`，后者在该平台不覆盖 Q6_K head，视为测量噪声范围。该结果只证明加载路径与 Q4_0 prefill 内核生效。Armv9.2 oracle 已证明当前 `q4_0_4x8` repack 不保持本项目 exact MTP trace，故 v3.76 默认关闭它，不可将这项 x86 数据外推为实际可用收益。
 
 ## 5. 构建与使用
 
@@ -217,4 +228,4 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
 3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收。Vulkan 的 bucket reuse 仅有 v3.74 默认关闭的实验开关，需先通过 Mali oracle。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. v3.73 已让 CPU 用到 GGML 现有的量化 repack 内核；其 Arm decode 收益仍需目标设备实测。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。
+5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、真正 paged FlashAttention 和自适应 K 策略。

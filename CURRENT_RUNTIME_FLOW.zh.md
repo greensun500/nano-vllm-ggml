@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.75
+# nano-vLLM 当前执行流程：v3.76
 
 ## 1. 架构边界
 
@@ -31,7 +31,7 @@ LLM(config)
   -> nanovllm._C.Qwen35Runtime
   -> validate Qwen3.5/Q4_0/MTP GGUF contract
   -> create [CPU]、[Vulkan, CPU] or [CUDA, CPU] backends
-  -> load model tensors（CPU：仅 MUL_MAT consumer 的合格 Q4_0/Q6_K 矩阵进入 CPU_REPACK；token embedding 等 GET_ROWS source 保持 default buffer）
+  -> load model tensors（默认全部使用 GGUF 原始 layout；仅实验 CPU_REPACK build 才将合格 MUL_MAT 权重进入重排 buffer）
   -> allocate target/MTP PagedKV
   -> allocate recurrent canonical/snapshot planes
   -> create fallback GGML graph scheduler
@@ -227,7 +227,7 @@ request release 会校验 sequence ID，清理 target/MTP KV block、recurrent p
 - Mali 的 64-token 值来自当前 Qwen3.5-2B/Mali-G720 实测，不应直接泛化到其他模型或 GPU。
 - v3.4 起默认将 Mali/int-dot/Q4_0 的 T=1 路由到 DMMV，T=2～8 继续使用 MMVQ。显式 FORCE/DISABLE 环境变量仍可覆盖默认策略；其他 vendor、量化类型和无 int-dot 设备保持上游逻辑。
 - graph reuse 默认只保证 CPU 单序列 decode/MTP；CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 构建的 extension。Vulkan 的 persistent bucket 只在显式 `native_vulkan_graph_reuse=true` 时实验性启用，因历史 Mali padded-mask 风险必须先经 oracle 验证。
-- CPU backend 在 GGML 报告支持 `CPU_REPACK` 时，加载器只将满足当前 ISA/shape 条件、且不被 `GET_ROWS` 读取的二维 Q4_0/Q6_K 投影放入该 buffer；`token_embd.weight` 和可选 MTP embedding 保持 default buffer。Vulkan/CUDA 不走此路径。
+- `NANOVLLM_NATIVE_CPU_REPACK` 默认关闭：Arm real-model MTP oracle 已发现当前 Q4_0 `q4_0_4x8` 重排会改变 partial rollback trace。实验 build 开启时，加载器仍只将满足 ISA/shape 条件、且不被 `GET_ROWS` 读取的二维 Q4_0/Q6_K 投影放入该 buffer；`token_embd.weight` 和可选 MTP embedding 始终保持 default buffer。Vulkan/CUDA 不走此路径。
 - MTP 的串行 draft、tied vocab head 扫描、host acceptance/readback 和多份 GDN snapshot 仍是主要成本。固定 high-performance Vulkan build 的长 decode 中，K=1/2/3 都没有超过 MTP-off；K=1 的小 verification 窗口最慢。
 - CUDA 已接入 build、backend discovery、placement audit、native runner 与 opt-in CUDA Graph，但尚未在 NVIDIA 实机完成 Qwen3.5 模型正确性/性能验收。
 

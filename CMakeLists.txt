@@ -7,6 +7,11 @@ include(CTest)
 option(NANOVLLM_NATIVE_VULKAN "Build the native runtime with the GGML Vulkan backend" OFF)
 option(NANOVLLM_NATIVE_CUDA "Build the native runtime with the GGML CUDA backend" OFF)
 option(
+    NANOVLLM_NATIVE_CPU_REPACK
+    "Experimental: enable GGML CPU-repacked Q4_0/Q6_K weight buffers"
+    OFF
+)
+option(
     NANOVLLM_NATIVE_CUDA_GRAPHS
     "Enable GGML CUDA Graph capture/replay for stable native CUDA graphs"
     OFF
@@ -27,6 +32,10 @@ set(
 # separately for upstream traceability.
 set(NANOVLLM_GGML_BASE_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
 set(NANOVLLM_GGML_COMMIT "5ed33380b4679533243ca45e172804d5ddfe59ec")
+# This local, single-header compatibility patch exposes GGML_TYPE_CPU_REPACK
+# to the native loader. Keep the official base revision above as the primary
+# pin and accept only this explicitly reviewed derivative.
+set(NANOVLLM_GGML_COMPAT_PATCH_COMMIT "62d87d7e76b584ffdec4763919dfd6833a8a2f3e")
 
 if(NOT EXISTS "${NANOVLLM_LLAMA_CPP_DIR}/ggml/CMakeLists.txt")
     message(FATAL_ERROR
@@ -47,9 +56,11 @@ if(NOT NANOVLLM_GGML_GIT_RESULT EQUAL 0)
         "Cannot determine the llama.cpp revision at ${NANOVLLM_LLAMA_CPP_DIR}; "
         "the native runtime requires the pinned official source checkout")
 endif()
-if(NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMMIT}")
+if(NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMMIT}"
+   AND NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}")
     message(FATAL_ERROR
-        "llama.cpp revision mismatch: expected ${NANOVLLM_GGML_COMMIT}, "
+        "llama.cpp revision mismatch: expected ${NANOVLLM_GGML_COMMIT} or "
+        "${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}, "
         "found ${NANOVLLM_GGML_ACTUAL_COMMIT}")
 endif()
 
@@ -62,6 +73,9 @@ set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_CPU ON CACHE BOOL "" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
+# CPU_REPACK changes the physical tensor layout.  Keep it opt-in until every
+# target ISA/quantization combination passes the native greedy oracle.
+set(GGML_CPU_REPACK ${NANOVLLM_NATIVE_CPU_REPACK} CACHE BOOL "" FORCE)
 set(GGML_CUDA ${NANOVLLM_NATIVE_CUDA} CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${NANOVLLM_NATIVE_VULKAN} CACHE BOOL "" FORCE)
 set(NANOVLLM_NATIVE_CUDA_GRAPHS_EFFECTIVE OFF)
