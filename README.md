@@ -127,9 +127,11 @@ python -m nanovllm.cli.chat /path/to/Qwen3.5.gguf \
 
 ## Native graph optimization experiments
 
-The default native graph remains the established math-attention path. The
-following switches are explicit A/B options, so an unsupported accelerator or
-an unfinished kernel path cannot silently change baseline behavior:
+The default native graph uses `auto` attention: ordinary non-MTP graphs use
+GGML FlashAttention only after an exact runtime capability probe, otherwise
+they fall back to math. MTP deliberately remains math under `auto`, so its
+draft and verification shapes stay numerically aligned. The following switches
+remain useful explicit A/B controls:
 
 ```bash
 # Probe GGML FLASH_ATTN_EXT for a non-MTP accelerator run; auto falls back to math.

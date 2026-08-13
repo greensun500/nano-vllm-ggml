@@ -31,7 +31,10 @@ class Config:
     mtp_max_draft_tokens: int = 3
     enable_graph_reuse: bool = True
     native_vulkan_graph_reuse: bool = False
-    native_attention_impl: str = "math"
+    # Probe FlashAttention for ordinary native target execution. The runtime
+    # deliberately retains math attention for MTP because draft/verification
+    # shapes must stay numerically aligned for acceptance.
+    native_attention_impl: str = "auto"
     native_batched_recurrent_snapshots: bool = False
     native_mtp_prefill_fusion: bool = False
     enable_session_cache: bool = True

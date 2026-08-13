@@ -143,7 +143,7 @@ class NativeRunnerTests(unittest.TestCase):
                 "mtp_max_draft_tokens": 3,
                 "enable_graph_reuse": True,
                 "enable_vulkan_graph_reuse": False,
-                "attention_impl": "math",
+                "attention_impl": "auto",
                 "enable_batched_recurrent_snapshots": False,
                 "enable_mtp_prefill_fusion": False,
             },

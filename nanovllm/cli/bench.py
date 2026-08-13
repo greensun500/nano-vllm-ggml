@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--native-attention-impl",
         choices=("math", "auto", "flash"),
-        default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "math"),
+        default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "auto"),
         help="Native attention implementation. 'auto' probes FlashAttention for non-MTP runs and keeps math for MTP.",
     )
     parser.add_argument(

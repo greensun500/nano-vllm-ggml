@@ -1,4 +1,4 @@
-# nano-vLLM 当前执行流程：v3.77
+# nano-vLLM 当前执行流程：v3.80
 
 ## 1. 架构边界
 
@@ -80,7 +80,7 @@ tokens[T] + positions[4T]
   -> 按输出模式决定 output norm/head/argmax
 ```
 
-full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。默认 math 路径显式执行 QK -> softmax -> PV；非 MTP 的 `native_attention_impl=auto/flash` 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把这三步留在 GGML backend kernel 内，失败则 `auto` 回退 math、`flash` 报清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
+full-attention 层先批量写 K/V，再按 `read_slots[C]` gather，使用 `[C,T]` causal mask防止 query 看到未来 token。`native_attention_impl` 默认 `auto`：非 MTP 会按真实 shape probe `FLASH_ATTN_EXT`，成功后把 QK -> softmax -> PV 留在 GGML backend kernel 内，失败则回退 math；显式 `flash` 在不支持时报告清晰错误。MTP 的 `auto` 固定 math：draft 的 `T=1` 与 verification 的 `T=K+1` 图可能因 Flash 的 shape-dependent rounding 降低 greedy acceptance，显式 `flash` 仍保留用于 A/B。attention 的 weighted value 在 `attn_output` 前还必须乘 `sigmoid(query_gate)`；这是 Qwen3.5 query gate，v3.6 已恢复。GDN 层在 graph 内逐 token 更新 convolution/delta state；普通路径只提交最新 state，MTP verification 同时生成 newest-first K+1 snapshot planes。`native_batched_recurrent_snapshots=True` 时 delta 的 K 个连续 plane 用一次 copy 写回，CUDA 可进一步匹配上游 GDN cache-write fusion。
 
 输出模式：
 

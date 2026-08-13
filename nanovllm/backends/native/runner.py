@@ -61,7 +61,7 @@ class NativeRunner:
             enable_vulkan_graph_reuse=bool(
                 getattr(config, "native_vulkan_graph_reuse", False)
             ),
-            attention_impl=str(getattr(config, "native_attention_impl", "math")),
+            attention_impl=str(getattr(config, "native_attention_impl", "auto")),
             enable_batched_recurrent_snapshots=bool(
                 getattr(config, "native_batched_recurrent_snapshots", False)
             ),

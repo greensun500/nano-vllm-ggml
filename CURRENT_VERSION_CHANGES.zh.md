@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.77 MTP 分阶段 profile
+# nano-vLLM 当前版本修改说明：v3.80 受保护的 non-MTP Flash 默认选择
 
 ## 1. 版本定位
 
@@ -15,14 +15,17 @@
 - v3.74：`904c7d5 v3.74: probe Vulkan graph reuse safely`
 - v3.75：`2e68c2a v3.75: keep embeddings out of CPU repack`
 - v3.76：`ad52eff v3.76: disable unverified CPU repacking`
-- v3.77 工作区：benchmark 导出 native MTP draft/verification/KV catch-up 的分阶段耗时与建图耗时
+- v3.77：`5188da8 v3.77: profile native MTP stages`
+- v3.78：`abe6de3 v3.78: record Arm MTP kernel profile`
+- v3.79：`f24a212 v3.79: document long-context attention profile`
+- v3.80：默认 `native_attention_impl=auto`，只在 non-MTP 选择经 capability probe 支持的 FlashAttention
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
 
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
 
-v3.7 在此基础上只加入可独立 A/B 的图级优化，默认仍走 v3.6 math-attention 和逐 snapshot 写回路径：非 MTP 的 FlashAttention 用 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
+v3.7 在此基础上加入可独立 A/B 的图级优化：非 MTP 的 FlashAttention 由 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
 
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 
@@ -37,6 +40,8 @@ v3.75 修复 v3.73 的 Arm-only correctness bug。`token_embd.weight` 在该 GGU
 v3.76 根据 Arm 真机 oracle 收回 v3.73 的默认启用：即使 embedding 保持原始布局，Q4_0 `q4_0_4x8` repack 仍会改变 MTP partial-rollback trace（5 个 oracle 中 4 个通过，1 个生成序列少一个 token）。因此项目新增 `NANOVLLM_NATIVE_CPU_REPACK=OFF`（默认）；构建脚本同名环境变量可显式开启实验 build，但它不得用于正确性基线或性能结论。保留 loader 的混合 buffer 代码和 v3.75 embedding 排除，是为了后续比对上游修复后的 repack traits；默认运行时重新使用原始 GGUF layout，优先保证 exact greedy token。
 
 v3.77 不改计算图和 token 语义。`bench --json` 读取 native runtime 已有的累计 MTP profile，并在排除 warmup 后导出 draft、target verification、MTP KV catch-up 三段的 wall time、建图时间和阶段 tok/s。远端 Mali-G720 K=1 A/B 已证明：打开 experimental Vulkan persistent graph reuse 后 cache hit 为 3227，但 decode 从 `18.58` 降至 `17.87 tok/s`；这与 profile 中 graph setup 仅占小部分的判断一致，开关保持默认关闭，后续优化聚焦 verification 的 target forward、词表 head 与 KV gather。新的完整 K=1 profile 为 draft `15.90s`、verification `72.06s`、KV catch-up `1.03s`，其中 verification setup 仅 `1.74s`；它占 decode wall 约 81%。同机 CPU K=3 试验性连续 snapshot + MTP prefill fusion 为 `32.62 tok/s`，相对 baseline `32.54 tok/s` 的差异在本轮重复测量噪声范围，故两个开关继续 opt-in。补充的 186-token Vulkan kernel log 显示一张 T=2 verification graph 为 `79.11ms`：Q6_K vocab `MUL_MAT_VEC` `15.15ms`、独立 `ARGMAX` `3.95ms`，而 13 次 `GET_ROWS` 合计 `0.25ms`。这给 fused head/argmax 明确的短上下文上限，也说明 direct paged attention 要以 8k 长上下文测量作为验收门槛。
+
+v3.80 将 Python/CLI 的 `native_attention_impl` 默认值从 `math` 改为 `auto`。这不是对 MTP 的算法改动：C++ 选择器在 MTP 仍无条件返回 math，因而 draft 与 verification 的数值路径、acceptance 和现有基线命令（它们显式传 `math`）保持不变。仅在 MTP-off 且 backend/shape probe 确认 `FLASH_ATTN_EXT` 可用时才选择 Flash；不支持时 `auto` 自动回退 math。这个默认值变更经过本地 31 项单测与真实 Qwen3.5 CPU oracle（MTP off/on）5/5 验证；Mali 的统一参数 A/B 是其发布门槛。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -98,7 +103,7 @@ Qwen3.5 attention 不只是标准 Q/K/V attention：query projection 还拆出 g
 | `csrc/runtime/recurrent_state.{h,cpp}`、`csrc/runtime/qwen35_runtime.cpp` | 为相邻 delta snapshot plane 创建连续 `[D,1,K,1]` view；启用时一个 `ggml_cpy` 写回全部 snapshot，CUDA 后端可匹配 GGML 现有的 GDN-to-cache 融合。 |
 | `csrc/runtime/qwen35_runtime.{h,cpp}` | 增加 `math/auto/flash` 选择、按真实 shape/backend probe Flash 能力、F32/F16 mask 上传转换；MTP 的 `auto` 固定 math，避免 Flash 的 shape-dependent rounding 压低 greedy acceptance；MTP prefill fusion 禁止复用旧 bucket，避免图结构与输入/输出语义混淆。 |
 | `CMakeLists.txt`、`scripts/build_native_runtime.sh`、`csrc/native_module.cpp` | 增加默认关闭的 `NANOVLLM_NATIVE_CUDA_GRAPHS` 构建开关和 build info；CUDA Graph 是 GGML backend scope 行为，因此以独立 build variant 作为 A/B 边界；若未同时开启 CUDA，CMake 和脚本都会明确拒绝该配置。 |
-| `nanovllm/config.py`、native runner、chat/bench CLI | 暴露 `native_attention_impl`、`native_batched_recurrent_snapshots`、`native_mtp_prefill_fusion`；全部默认关闭，CLI/JSON 会记录运行时 A/B 配置。 |
+| `nanovllm/config.py`、native runner、chat/bench CLI | 暴露 `native_attention_impl`、`native_batched_recurrent_snapshots`、`native_mtp_prefill_fusion`；v3.80 起 attention 默认为受 capability probe 保护的 `auto`，其余默认关闭，CLI/JSON 会记录运行时 A/B 配置。 |
 | native tests | 增加精确 GQA FlashAttention layout/F16 causal-mask oracle、连续 GDN snapshot CPY plane-order 测试、Python 配置/ABI 传递测试，以及 opt-in real-model MTP trace oracle。 |
 
 关键边界：Flash 路径仍先 `SET_ROWS` 到 PagedKV、再 `GET_ROWS` gather，所以它不是新的 paged-attention kernel；只是在 gather 后把 QK、softmax、PV 的中间分数/概率留在 backend kernel 内。MTP verification 的 accepted 数量必须在 host 比较后才能知道，故其 catch-up 仍是独立 KV-only graph。Mali 实测显示 Flash 在正确性 oracle 中可用，但 draft `T=1` 与 verification `T=K+1` 的舍入差异会把 K=1 acceptance 从 100% 降至 50%，并让 decode 吞吐退化；因此 MTP 下 `auto` 保守选择 math，显式 `flash` 只作实验。`lm_head + argmax` 的全词表量化 matmul 仍是第二阶段课题；当前没有为了“融合”而添加不成熟的自定义 Q4 kernel。
@@ -169,6 +174,15 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 远端结果目录还保留 `GGML_VK_PERF_LOGGER=1` 的短 MTP kernel log。它不是端到端吞吐结论：每次 backend graph 的计时各自输出；但同一张 target verification 内，Q6_K head + argmax 已占约四分之一 GPU kernel 时间，说明自定义 head epilogue 有合理收益空间。反之，186-token 时 `GET_ROWS` 极小；direct paged kernel 的设计应直接读物理 slot/page table、执行 online softmax，并在 1k/4k/8k 三个 context 证明避免 gather 的收益。
 
 4096-token 的独占 MTP K=1 profile 已完成这一验证：math draft/verification 为 `219.6 / 463.4ms`，其中 verification 的 13 次 `GET_ROWS` 为 `5.25ms`，但分离的 F32 attention score/value matmul 约 `62.7 / 134.5ms`；只消除 gather 不能成为完整方案。显式 Flash 的同一单步探针使 verification 降至 `333.5ms`、decode 从 `1.45` 到 `1.73 tok/s`，且该步 acceptance 为 100%。这证明 online attention 融合方向有效；但历史完整长 decode 已观察到 Flash 的 shape-dependent MTP acceptance 回退，所以 `auto` 在 MTP 下仍强制 math，Flash 保持显式实验路径，不能以单步样本改默认。
+
+### 2.14 v3.80 non-MTP attention 默认值
+
+| 文件 | v3.80 改动 |
+| --- | --- |
+| `nanovllm/config.py`、`nanovllm/backends/native/runner.py`、`nanovllm/cli/bench.py` | 默认 attention implementation 改为 `auto`；旧配置缺字段时也按 `auto` 处理。 |
+| `tests/test_native_runner.py` | 更新 ABI 传递测试，固定新默认值。 |
+
+`auto` 的语义是安全选择而不是强制 Flash：MTP 仍走 math；普通 target graph 只有 capability probe 通过才走 Flash，否则回退 math。因此用户要求的复现实验仍应显式设置 `NANOVLLM_NATIVE_ATTENTION_IMPL=math`，而默认 chat/bench 能在已验证 accelerator 上获得 non-MTP attention 融合收益。
 
 ## 3. 当前运行链路的新增部分
 
