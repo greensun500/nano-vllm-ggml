@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.86 Vulkan direct paged attention 实验
+# nano-vLLM 当前版本修改说明：v3.86.1 Vulkan direct paged attention 实验
 
 ## 1. 版本定位
 
@@ -27,8 +27,10 @@
 - v3.86：新增显式 `paged` 的 Vulkan direct paged-attention 图路径；以
   `read_slots` 直读持久 KV，并在一个 kernel 内执行 online softmax/value
   accumulation，默认策略不变
+- v3.86.1：恢复 v3.86 远程源码快照（只同步 source、不覆写 llama.cpp `.git`）
+  的受审计 `5ed3338` revision 接受列表
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
-- GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`；当前子模块额外携带仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`，CMake 仅接受这两个精确 revision。
+- GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
 
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
@@ -76,6 +78,12 @@ MTP acceptance 和长上下文 kernel/wall-time 均不回退；否则保持实�
 调优 tile、workgroup 或 split-K。本机 CPU build、CTest 和 32 项 Python
 配置/runner/stage 测试已经通过，只证明默认路径与 ABI 未被新增 GGML op 破坏，
 不能替代 Mali Vulkan 验证。
+
+v3.86.1 只修复 fresh remote build 的 revision gate：v3.86 子模块在本地的
+gitlink 为 `0caa416`，但受操作约束，远程同步不能写入子模块 `.git`，其
+metadata 仍报告已受审计的 `5ed3338`。CMake 现在同时接受新的 v3.86 gitlink、
+`5ed3338` 的远程 source snapshot 和既有 CPU_REPACK compatibility revision；
+这不会放宽到任意 revision，也不会改变 shader、图或默认运行路径。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 

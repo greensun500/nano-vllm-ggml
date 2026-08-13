@@ -32,6 +32,11 @@ set(
 # separately for upstream traceability.
 set(NANOVLLM_GGML_BASE_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
 set(NANOVLLM_GGML_COMMIT "0caa416ded34e746f308ef75ea1d9cb24e50f552")
+# Remote source snapshots intentionally synchronize source files without
+# touching the embedded llama.cpp .git metadata.  Keep the reviewed Mali
+# source revision accepted so a fresh remote build can validate the synced
+# working tree without a submodule checkout or metadata rewrite.
+set(NANOVLLM_GGML_MALI_PATCH_COMMIT "5ed33380b4679533243ca45e172804d5ddfe59ec")
 # This local, single-header compatibility patch exposes GGML_TYPE_CPU_REPACK
 # to the native loader. Keep the official base revision above as the primary
 # pin and accept only this explicitly reviewed derivative.
@@ -57,10 +62,11 @@ if(NOT NANOVLLM_GGML_GIT_RESULT EQUAL 0)
         "the native runtime requires the pinned official source checkout")
 endif()
 if(NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMMIT}"
+   AND NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_MALI_PATCH_COMMIT}"
    AND NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}")
     message(FATAL_ERROR
-        "llama.cpp revision mismatch: expected ${NANOVLLM_GGML_COMMIT} or "
-        "${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}, "
+        "llama.cpp revision mismatch: expected ${NANOVLLM_GGML_COMMIT}, "
+        "${NANOVLLM_GGML_MALI_PATCH_COMMIT}, or ${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}, "
         "found ${NANOVLLM_GGML_ACTUAL_COMMIT}")
 endif()
 
