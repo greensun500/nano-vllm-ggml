@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.76 CPU_REPACK 默认关闭工作区（上一个版本提交 `2e68c2a v3.75: keep embeddings out of CPU repack`）
+- 当前分支：`qwen35-native-runtime`，v3.77 MTP 分阶段 profile 工作区（上一个版本提交 `ad52eff v3.76: disable unverified CPU repacking`）
 
 总体规模：
 
@@ -40,7 +40,8 @@
 | v3.73 | `d18b3d2` | CPU loader 将符合 GGML 原生 ISA/shape 条件的 Q4_0/Q6_K 二维矩阵放入 CPU_REPACK，其余 tensor 保持 default buffer |
 | v3.74 | `904c7d5` | 默认关闭的 Vulkan 单序列 graph-reuse 探针；用于验证历史 padded-mask bucket 问题是否仍存在 |
 | v3.75 | `2e68c2a` | 修复 CPU_REPACK 不应改变 `GET_ROWS` embedding 权重物理布局的问题 |
-| v3.76 working tree | 未提交 | 将未通过 Arm MTP oracle 的 GGML CPU_REPACK 改为默认关闭的实验构建选项；CMake 显式接受唯一的 `CPU_REPACK` header 兼容子模块 revision |
+| v3.76 | `ad52eff` | 将未通过 Arm MTP oracle 的 GGML CPU_REPACK 改为默认关闭的实验构建选项；CMake 显式接受唯一的 `CPU_REPACK` header 兼容子模块 revision |
+| v3.77 working tree | 未提交 | benchmark 导出 native MTP draft/target verification/KV catch-up 的累计 wall/setup/tok-s，供定量定位 Mali verification 回归 |
 
 ## 2. 目录级总览
 

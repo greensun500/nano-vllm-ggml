@@ -28,6 +28,15 @@ class BenchResult:
     mtp_accepted_tokens: int
     mtp_verification_steps: int
     mtp_acceptance_rate: float
+    mtp_draft_s: float
+    mtp_verification_s: float
+    mtp_kv_update_s: float
+    mtp_draft_graph_setup_s: float
+    mtp_verification_graph_setup_s: float
+    mtp_kv_update_graph_setup_s: float
+    mtp_draft_tok_s: float
+    mtp_verification_tok_s: float
+    mtp_kv_update_tok_s: float
     enable_graph_reuse: bool
     native_vulkan_graph_reuse: bool
     native_attention_impl: str
@@ -384,6 +393,12 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         "accepted_tokens": 0,
         "verification_steps": 0,
     }
+    # Native runtime timing is the only breakdown which includes synchronous
+    # backend execution, graph setup and host/device transfers. Keep it next
+    # to the end-to-end counters so a high MTP acceptance rate cannot hide an
+    # expensive verification path (especially on Vulkan).
+    mtp_profile_baseline: dict[str, int] = {}
+    mtp_profile: dict[str, int] = {}
     graph_stats = {"hits": 0, "misses": 0, "evictions": 0, "active_entries": 0}
     actual_num_kvcache_blocks = int(llm.config.num_kvcache_blocks)
     actual_model = os.fspath(llm.config.gguf_model or llm.config.model)
@@ -400,6 +415,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         cuda_compiled = bool(native_info["cuda"])
         cuda_graphs_compiled = bool(native_info["cuda_graphs"])
     get_mtp_stats = getattr(llm.model_runner, "mtp_stats", None)
+    get_mtp_profile = getattr(llm.model_runner, "mtp_profile_stats", None)
     get_graph_stats = getattr(llm.model_runner, "graph_reuse_stats", None)
     try:
         run_index = 0
@@ -409,6 +425,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
             run_index += 1
         if callable(get_mtp_stats):
             mtp_baseline.update(get_mtp_stats())
+        if callable(get_mtp_profile):
+            mtp_profile_baseline.update(get_mtp_profile())
 
         totals = {
             "total_s": 0.0,
@@ -427,6 +445,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     finally:
         if callable(get_mtp_stats):
             mtp_stats.update(get_mtp_stats())
+        if callable(get_mtp_profile):
+            mtp_profile.update(get_mtp_profile())
         if callable(get_graph_stats):
             graph_stats.update(get_graph_stats())
         llm.exit()
@@ -439,6 +459,15 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     drafted_tokens = int(mtp_stats["drafted_tokens"] - mtp_baseline["drafted_tokens"])
     accepted_tokens = int(mtp_stats["accepted_tokens"] - mtp_baseline["accepted_tokens"])
     acceptance_rate = accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
+    def profile_delta(key: str) -> int:
+        return int(mtp_profile.get(key, 0) - mtp_profile_baseline.get(key, 0))
+
+    draft_tokens = profile_delta("draft_tokens")
+    verification_tokens = profile_delta("verification_tokens")
+    kv_update_tokens = profile_delta("kv_update_tokens")
+    draft_s = profile_delta("draft_elapsed_ns") / 1_000_000_000.0
+    verification_s = profile_delta("verification_elapsed_ns") / 1_000_000_000.0
+    kv_update_s = profile_delta("kv_update_elapsed_ns") / 1_000_000_000.0
     return BenchResult(
         backend=args.backend,
         model=actual_model,
@@ -459,6 +488,15 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
             mtp_stats["verification_steps"] - mtp_baseline["verification_steps"]
         ),
         mtp_acceptance_rate=acceptance_rate,
+        mtp_draft_s=draft_s,
+        mtp_verification_s=verification_s,
+        mtp_kv_update_s=kv_update_s,
+        mtp_draft_graph_setup_s=profile_delta("draft_graph_setup_elapsed_ns") / 1_000_000_000.0,
+        mtp_verification_graph_setup_s=profile_delta("verification_graph_setup_elapsed_ns") / 1_000_000_000.0,
+        mtp_kv_update_graph_setup_s=profile_delta("kv_update_graph_setup_elapsed_ns") / 1_000_000_000.0,
+        mtp_draft_tok_s=draft_tokens / draft_s if draft_s > 0 else 0.0,
+        mtp_verification_tok_s=verification_tokens / verification_s if verification_s > 0 else 0.0,
+        mtp_kv_update_tok_s=kv_update_tokens / kv_update_s if kv_update_s > 0 else 0.0,
         enable_graph_reuse=not args.no_graph_reuse,
         native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
         native_attention_impl=args.native_attention_impl,
@@ -526,6 +564,17 @@ def print_result(result: BenchResult) -> None:
             "MTP drafted/accepted/verifications: "
             f"{result.mtp_drafted_tokens}/{result.mtp_accepted_tokens}/"
             f"{result.mtp_verification_steps}; acceptance={result.mtp_acceptance_rate:.2%}"
+        )
+        print(
+            "MTP stage wall(s) draft/verify/kv-update: "
+            f"{result.mtp_draft_s:.3f}/{result.mtp_verification_s:.3f}/"
+            f"{result.mtp_kv_update_s:.3f}"
+        )
+        print(
+            "MTP graph setup(s) draft/verify/kv-update: "
+            f"{result.mtp_draft_graph_setup_s:.3f}/"
+            f"{result.mtp_verification_graph_setup_s:.3f}/"
+            f"{result.mtp_kv_update_graph_setup_s:.3f}"
         )
     print(
         "graph cache hits/misses/evictions/active: "
