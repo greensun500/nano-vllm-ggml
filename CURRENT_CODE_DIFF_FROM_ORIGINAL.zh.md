@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.82 Mali Vulkan argmax 并行度工作区（上一个版本提交 `bcb7405 v3.81: record Mali auto attention benchmark`）
+- 当前分支：`qwen35-native-runtime`，v3.83 Mali argmax 验证记录工作区（上一个版本提交 `891692c v3.82: widen Mali Vulkan argmax`）
 
 总体规模：
 
@@ -43,7 +43,7 @@
 | v3.76 | `ad52eff` | 将未通过 Arm MTP oracle 的 GGML CPU_REPACK 改为默认关闭的实验构建选项；CMake 显式接受唯一的 `CPU_REPACK` header 兼容子模块 revision |
 | v3.77 | `5188da8` | benchmark 导出 native MTP draft/target verification/KV catch-up 的累计 wall/setup/tok-s，供定量定位 Mali verification 回归 |
 | v3.80 | `fc160da` | 默认 `native_attention_impl=auto`；MTP 保持 math，non-MTP 仅在 runtime capability probe 支持时使用 FlashAttention；Mali 统一基准 MTP-off decode `20.81 -> 21.24 tok/s` |
-| v3.82 working tree | 未提交 | Mali Vulkan `ARGMAX` 使用 256-lane specialization，缩短全词表 greedy reduction；保持非 Arm upstream 行为 |
+| v3.82 | `891692c` + vendored `1bd647a` | Mali Vulkan `ARGMAX` 使用 256-lane specialization，缩短全词表 greedy reduction；统一 MTP K=1 decode `18.58 -> 19.92 tok/s`、acceptance `100%` |
 
 ## 2. 目录级总览
 
