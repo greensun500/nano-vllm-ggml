@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.74 Vulkan graph reuse 安全探针工作区（上一个版本提交 `d18b3d2 v3.73: enable CPU weight repacking`）
+- 当前分支：`qwen35-native-runtime`，v3.75 CPU_REPACK embedding correctness 修复工作区（上一个版本提交 `904c7d5 v3.74: probe Vulkan graph reuse safely`）
 
 总体规模：
 
@@ -38,7 +38,8 @@
 | v3.71 | `21474dd` | 去除 fallback graph 的重复同步；plan speculative-tail 校验改为无 slot 向量分配的逻辑范围检查 |
 | v3.72 | `b413650` | 仅在 MTP draft 的调用方需要时将 hidden 声明为 GGML output；cache key 区分其活跃区间 |
 | v3.73 | `d18b3d2` | CPU loader 将符合 GGML 原生 ISA/shape 条件的 Q4_0/Q6_K 二维矩阵放入 CPU_REPACK，其余 tensor 保持 default buffer |
-| v3.74 working tree | 未提交 | 默认关闭的 Vulkan 单序列 graph-reuse 探针；用于验证历史 padded-mask bucket 问题是否仍存在 |
+| v3.74 | `904c7d5` | 默认关闭的 Vulkan 单序列 graph-reuse 探针；用于验证历史 padded-mask bucket 问题是否仍存在 |
+| v3.75 working tree | 未提交 | 修复 CPU_REPACK 不应改变 `GET_ROWS` embedding 权重物理布局的问题 |
 
 ## 2. 目录级总览
 
@@ -706,7 +707,7 @@ nanovllm._C.Qwen35Runtime
 - mmap/读取 tensor data；
 - 提供 metadata/tensor descriptor 给后续权重加载。
 
-v3.73 的 CPU load 会先检测 GGML 是否支持 `CPU_REPACK`，并只为符合运行时 ISA 和 shape 条件的二维 Q4_0/Q6_K 权重建立一个 repack buffer；GGML 随后为尚未分配的 descriptor 建立 default buffer。这样既能让 Q4_0/Q6_K `mul_mat` 命中 GGML 已有的重排内核，又不会把没有可用 traits 的普通 tensor 放入 repack buffer。repack 上传要求完整 tensor 的单次写入，因而仅在加载期对这些矩阵临时整块读取；runtime 持有并在销毁前释放两类 persistent buffer，resident bytes 统计两者之和。
+v3.73 的 CPU load 会先检测 GGML 是否支持 `CPU_REPACK`，并只为符合运行时 ISA 和 shape 条件、且只作为 `mul_mat` 权重使用的二维 Q4_0/Q6_K 建立一个 repack buffer；GGML 随后为尚未分配的 descriptor 建立 default buffer。v3.75 明确保留 `token_embd.weight` 与可选 `*.nextn.embed_tokens.weight` 的原始布局，因为 embedding `GET_ROWS` 不支持 repacked physical layout。这样既能让 Q4_0/Q6_K `mul_mat` 命中 GGML 已有的重排内核，又不会把没有可用 traits 或存在非矩阵消费的 tensor 放入 repack buffer。repack 上传要求完整 tensor 的单次写入，因而仅在加载期对这些矩阵临时整块读取；runtime 持有并在销毁前释放两类 persistent buffer，resident bytes 统计两者之和。
 
 ### 15.2 Qwen3.5 contract
 

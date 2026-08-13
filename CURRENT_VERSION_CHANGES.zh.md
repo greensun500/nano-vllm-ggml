@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.74 Vulkan graph reuse 安全探针
+# nano-vLLM 当前版本修改说明：v3.75 修复 Arm CPU_REPACK embedding 布局
 
 ## 1. 版本定位
 
@@ -12,7 +12,8 @@
 - v3.71：`21474dd v3.71: remove fallback runtime overhead`
 - v3.72：`b413650 v3.72: trim MTP draft hidden lifetime`
 - v3.73：`d18b3d2 v3.73: enable CPU weight repacking`
-- v3.74 工作区：默认关闭的 Vulkan persistent graph reuse 安全探针，待本次提交固化
+- v3.74：`904c7d5 v3.74: probe Vulkan graph reuse safely`
+- v3.75 工作区：修复 Arm CPU_REPACK 错用于 embedding 的布局错误，待本次提交固化
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`，项目固定修订 `5ed33380b4679533243ca45e172804d5ddfe59ec`
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -28,6 +29,8 @@ v3.72 保持 MTP draft 的计算和 host readback 内容不变，但让不需要
 v3.73 不改模型图、量化格式或 token 语义。此前 CPU 路径把所有 GGUF tensor 放入 default buffer，即使本机 GGML 已启用 `CPU_REPACK`，Q4_0/Q6_K 的专用 matmul 内核也无法被选中。现在只对运行时 ISA、量化类型和矩阵行数均满足 GGML 原生条件的二维 Q4_0/Q6_K 权重分配 repack buffer，其余 tensor 仍留在 default buffer；因此不会把不支持的 norm、bias、embedding 或量化布局放入会在上传时解引用空 traits 的 buffer。
 
 v3.74 新增一个默认关闭的 Vulkan persistent graph reuse 安全探针。v3.5 曾记录 Mali 在 padded-mask bucket attention 下的不稳定行为，因此本版本不会改变 `native_vulkan` 默认执行链；只有显式 `--native-vulkan-graph-reuse` 或 `NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE=1` 才让单序列 decode/MTP 复用 CPU 已验证的同一 bucket 机制。该开关用于远机 correctness oracle 和与 `--no-graph-reuse` 的交替 A/B，bench JSON 会记录它；多序列、prefill 和 MTP prefill fusion 保持 eager graph。
+
+v3.75 修复 v3.73 的 Arm-only correctness bug。`token_embd.weight` 在该 GGUF 中是 Q6_K：它既是 tied output head 的 `MUL_MAT` 权重，也是 target/MTP embedding 的 `GET_ROWS` source。CPU_REPACK 只改变矩阵乘所需的物理 layout，`GET_ROWS` 不识别该 layout；Arm 远机在第一步 embedding 后 abort。加载器现在按 tensor 名称排除 `token_embd.weight` 和可选 `*.nextn.embed_tokens.weight`，令它们保持 default buffer；其余满足条件的 Q4_0 projection 和只作 lm_head 的 Q6_K 权重仍可 repack。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 
@@ -132,6 +135,14 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 | chat/bench CLI | 新增 `--native-vulkan-graph-reuse` 和环境变量；bench 结果记录开关，便于交替 A/B。 |
 
 历史 profile 中 Vulkan MTP graph setup/placement/allocation 约占总 wall 的 1%–2%，因此即使通过也预期为小收益。更重要的是先证明带 padded causal mask 的 bucket 在当前 Mali/GGML revision 中保持 greedy token 一致；若 oracle 失败，开关保持关闭并将问题留给 direct paged attention/fused verification 图，而不将未验证路径变成默认。
+
+### 2.11 v3.75 CPU_REPACK embedding correctness 修复
+
+| 文件 | v3.75 改动 |
+| --- | --- |
+| `csrc/runtime/gguf_loader.cpp` | CPU repack eligibility 接收 tensor name；显式排除 global 与 MTP token embedding，避免 `GET_ROWS` 读取重排后的物理 layout。 |
+
+本地 x86 真实 GGUF oracle（5/5）继续通过，但该问题的触发与验证都以 Arm 的 Q6_K token embedding 为准。远端结果目录保留了修复前的 abort 日志；修复后必须重新 clean build 并通过 Arm CPU oracle 才能进行性能基准。
 
 ## 3. 当前运行链路的新增部分
 

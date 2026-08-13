@@ -15,8 +15,21 @@ std::runtime_error load_error(const std::string & path, const std::string & deta
     return std::runtime_error("GGUF load failed for '" + path + "': " + detail);
 }
 
-bool is_cpu_repack_candidate(ggml_backend_t backend, const ggml_tensor * tensor) {
-    if (!ggml_backend_is_cpu(backend) || ggml_n_dims(tensor) != 2) {
+bool has_suffix(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool is_cpu_repack_candidate(
+    ggml_backend_t backend,
+    std::string_view name,
+    const ggml_tensor * tensor) {
+    // GGML's repack traits apply only to MUL_MAT.  Qwen3.5's tied token
+    // embedding is also read by GET_ROWS, which consumes its original GGUF
+    // layout, so it must always remain in the default buffer.
+    if (!ggml_backend_is_cpu(backend) || ggml_n_dims(tensor) != 2 ||
+        name == "token_embd.weight" ||
+        has_suffix(name, ".nextn.embed_tokens.weight")) {
         return false;
     }
 
@@ -134,8 +147,7 @@ void GgufWeights::load(ggml_backend_t backend, size_t chunk_bytes) {
         size_t repack_bytes = 0;
         if (use_cpu_repack) {
             for (const auto & [name, tensor] : tensors_) {
-                (void) name;
-                if (!is_cpu_repack_candidate(backend, tensor)) {
+                if (!is_cpu_repack_candidate(backend, name, tensor)) {
                     continue;
                 }
                 const size_t size = padded_allocation_size(repack_buft, tensor);
@@ -157,8 +169,7 @@ void GgufWeights::load(ggml_backend_t backend, size_t chunk_bytes) {
 
             size_t offset = 0;
             for (const auto & [name, tensor] : tensors_) {
-                (void) name;
-                if (!is_cpu_repack_candidate(backend, tensor)) {
+                if (!is_cpu_repack_candidate(backend, name, tensor)) {
                     continue;
                 }
                 const size_t size = padded_allocation_size(repack_buft, tensor);
