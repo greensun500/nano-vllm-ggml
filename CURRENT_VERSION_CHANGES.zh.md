@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.89 Mali MTP auto FlashAttention
+# nano-vLLM 当前版本修改说明：v3.90 native Vulkan prefill plan boundary
 
 ## 1. 版本定位
 
@@ -35,6 +35,8 @@
   TargetChunkGraph，消除 accepted-prefix 的独立 KV-only graph；默认关闭
 - v3.89：在 native Vulkan 的 MTP `auto` 路径按每张 draft/verification graph
   的真实 capability probe 选择 FlashAttention；其他 backend 仍为 math
+- v3.90：native Vulkan 单序列 prefill 由 runtime 内部 chunk，避免 Python
+  `max_num_batched_tokens` 边界反复结束 target graph 而改变 long-context trace
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -131,6 +133,16 @@ warmup 1、8 cores）下，math 的 draft/verification/KV 为
 batched recurrent snapshots 仍是噪声级变化（`19.904 tok/s`），故不改变其默认值。
 完整 build、math/flash/auto oracle 和 JSON 位于远端
 `v37-results/20260814-125732-v389-q6k-argmax-fix/`。
+
+v3.90 修复了一个 native Vulkan long prefill 的实现边界：Python scheduler 在
+`max_num_batched_tokens=64` 时把单条 521-token prompt 切成多个 plan，而 native
+Mali runtime 又在每个 plan 内以 64-token target graph 执行；每个外部 fragment
+都会被当成 `Last` output mode，结果与一次性 plan 的 greedy trace 不一致。现在
+单 sequence native Vulkan prefill 始终交给 runtime 的既有 64-token内部 chunk，
+并只放宽 Vulkan prefill 的 ABI plan-size 校验；多 sequence、CPU/CUDA、decode 和
+非 native scheduler 上限不变。远端 Arm/Mali math long probe 的 64-token scheduler
+配置已从全 `255` trace 恢复为与 768-token 配置相同的 `1814/9419` trace。完整
+MTP long-context trace 仍有独立历史差异，未在本阶段掩盖或声称解决。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 

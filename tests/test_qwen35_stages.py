@@ -58,6 +58,21 @@ class Qwen35Tests(unittest.TestCase):
         self.assertTrue(sequence.is_finished)
         self.assertEqual(scheduler.pop_block_releases(), [([0], sequence.seq_id)])
 
+    def test_native_vulkan_prefill_keeps_one_sequence_in_one_plan(self):
+        config = SimpleNamespace(
+            backend="native_vulkan", max_num_seqs=1, max_num_batched_tokens=64,
+            eos_token_ids=(), kvcache_block_size=256, num_kvcache_blocks=3,
+            enable_prefix_cache=False, enable_preemption=False, enable_mtp=False,
+            mtp_max_draft_tokens=3, max_model_len=768,
+        )
+        scheduler = Scheduler(config)
+        sequence = Sequence([1] * 521, SamplingParams(max_tokens=1))
+        scheduler.add(sequence)
+        scheduled, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [sequence])
+        self.assertEqual(sequence.num_scheduled_tokens, 521)
+
     def test_qwen35_prompt_disables_thinking(self):
         prompt = format_chat_prompt(
             [{"role": "user", "content": "Hello"}],

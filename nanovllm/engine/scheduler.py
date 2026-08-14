@@ -18,6 +18,7 @@ class Scheduler:
         self.block_size = config.kvcache_block_size  # KV Cache的block大小（每个块包含的token数）
         self.enable_session_cache = bool(getattr(config, "enable_session_cache", False))
         self.native_runtime = str(getattr(config, "backend", "")).startswith("native_")
+        self.native_vulkan = getattr(config, "backend", "") == "native_vulkan"
         self.max_retained_sessions = int(getattr(config, "max_retained_sessions", 0))
         self.max_consecutive_prefill_rounds = int(
             getattr(config, "max_consecutive_prefill_rounds", 0)
@@ -104,7 +105,13 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            # The native Vulkan runtime owns its 64-token Mali prefill chunk
+            # policy. Keep one sequence's prompt in one execution plan so it
+            # preserves graph/state semantics across those internal chunks.
+            if self.native_vulkan and not scheduled_seqs:
+                seq.num_scheduled_tokens = num_tokens
+            else:
+                seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:##处理完了所有token
                 seq.status = SequenceStatus.RUNNING

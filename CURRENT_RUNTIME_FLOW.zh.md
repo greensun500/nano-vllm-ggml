@@ -57,6 +57,12 @@ num_cached_tokens
 temperatures
 ```
 
+v3.90 对 native Vulkan 的单 sequence prefill 保留完整 prompt execution plan，即使它
+超过 Python 的 `max_num_batched_tokens`。这是受限例外：runtime 已针对 Mali 在
+`run()` 内按 64 token 切 target graph，因而不会扩大单张 GGML graph；它避免外部
+scheduler 边界把每个 fragment 误作最终 `Last` output graph。多 sequence、其他
+backend 和 decode 仍遵守原 scheduler 上限。
+
 NativeRunner 将 Python sequence ID 映射到 native sequence slot。C++ 根据 block table 展开物理 read/write slots，并校验 Python slot mapping 与同图重复写入。校验 speculative tail 时只检查所需逻辑范围及其 block-table 前缀，不再提前展开一个随后丢弃的完整 context slot 向量；实际执行时仍在对应 target/MTP graph 前展开 read slots。
 
 fallback graph 的生命周期为 `build -> allocate -> synchronous compute -> scheduler reset -> ggml metadata arena reset`。GGML 的 `graph_compute` 已完成同步，因此成功路径的 scheduler reset 不重复发起 synchronize；任何构图、上传或计算异常仍走带 synchronize 的通用 reset，防止未完成 backend work 被错误复用。

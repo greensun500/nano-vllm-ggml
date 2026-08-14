@@ -705,7 +705,11 @@ struct Qwen35Runtime::Impl {
         }
         const std::size_t n_tokens = static_cast<std::size_t>(plan.n_tokens);
         const std::size_t n_seqs = static_cast<std::size_t>(plan.n_seqs);
-        if (n_tokens > options.max_num_batched_tokens) {
+        const bool allow_vulkan_prefill_over_batch =
+            plan.is_prefill && primary_backend != nullptr &&
+            primary_backend->kind() == BackendKind::Vulkan;
+        if (n_tokens > options.max_num_batched_tokens &&
+            !allow_vulkan_prefill_over_batch) {
             fail("execution plan exceeds max_num_batched_tokens");
         }
         if (n_seqs > options.max_num_seqs) {
