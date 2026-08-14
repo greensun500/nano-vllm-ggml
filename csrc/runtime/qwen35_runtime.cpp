@@ -1765,8 +1765,6 @@ struct Qwen35Runtime::Impl {
 // 每个元素都是一个 PagedKV 的 physical_slot，表示对应 token 的 K/V 要写到哪里。
             const std::vector<std::int32_t> write_slots = slice(
                 plan.slot_mapping, item.token_offset, item.token_count);//取出这些token实际要写入那些物理slot
-
-
             const BackendDeviceInfo & device = primary_backend->device_info();
 // 从整轮 plan.slot_mapping 里，取出当前 sequence 本轮输入 token 对应的写入位置。
 // write_slots 的长度 = item.token_count。
@@ -1778,9 +1776,12 @@ struct Qwen35Runtime::Impl {
 // 决定当前 sequence 的 prefill/decode 是否需要切 chunk。
 // 如果是 Mali Vulkan，则每个 target chunk 最多跑 kVulkanTargetPrefillChunk 个 token，当前代码里是 64。
 // 如果不是 Mali Vulkan，则整个 item.token_count 一次性跑完。                 
-            const std::size_t chunk_limit = is_mali_vulkan
+            const std::size_t chunk_limit = is_mali_vulkan &&
+                    !(options.enable_mtp && plan.is_prefill)
                 ? kVulkanTargetPrefillChunk
                 : item.token_count;
+            const bool fuse_mtp_prefill =
+                plan.is_prefill && mtp_prefill_fusion_available();
 
 // 保存当前 sequence 最后一个 chunk 产生的 greedy prediction。
 // 初始化为 -1，后面只有 final chunk 会真正写入预测 token。
@@ -1831,8 +1832,6 @@ struct Qwen35Runtime::Impl {
     // 后续 execute_target_chunk 会从这个 plane 读取 conv_state / delta_state。
                 const std::size_t input_plane =
                     recurrent->active_snapshot_plane(item.sequence_slot);
-                const bool fuse_mtp_prefill =
-                    plan.is_prefill && mtp_prefill_fusion_available();
                 TargetChunkResult target = execute_target_chunk(            //普通prefill或者decode进入graph的如来
                     item.sequence_slot,
                     chunk_tokens,   //输入token

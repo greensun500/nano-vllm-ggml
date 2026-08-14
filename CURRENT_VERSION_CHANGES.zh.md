@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.90 native Vulkan prefill plan boundary
+# nano-vLLM 当前版本修改说明：v3.91 native Vulkan MTP prefill boundary
 
 ## 1. 版本定位
 
@@ -37,6 +37,10 @@
   的真实 capability probe 选择 FlashAttention；其他 backend 仍为 math
 - v3.90：native Vulkan 单序列 prefill 由 runtime 内部 chunk，避免 Python
   `max_num_batched_tokens` 边界反复结束 target graph 而改变 long-context trace
+- v3.91：Mali Vulkan 的 MTP prefill 不再按 64 token 执行 target chunk；MTP
+  maintenance 需要 target hidden，而非最终 chunk 的 hidden-output 图会改变后续
+  target state。MTP prefill 改为一张完整 target graph，保持 MTP KV、recurrent
+  snapshot 与 greedy trace 一致；普通 MTP-off prefill 仍保持 64-token chunk
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -44,6 +48,11 @@
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
 
 v3.7 在此基础上加入可独立 A/B 的图级优化：非 MTP 的 FlashAttention 由 runtime capability probe 选择；MTP 的 `auto` 固定 math，避免不同 token-shape 的 Flash 舍入差异降低 draft acceptance；GDN delta snapshot 改为可选连续写回；MTP prefill 的 hidden-to-KV maintenance 可进入同一张 target graph；CUDA Graph 仅在显式 CUDA Graph build variant 中使用。没有实现自定义 Q4_0 `lm_head + argmax` kernel，避免在缺乏目标 GPU profile 的情况下引入高风险的量化算子分叉。
+
+v3.91 是正确性边界修复，不宣称 prefill 加速。Armv9.2/Mali-G720 的 521-token
+long-context MTP probe（math、K=3）此前输出全 `255`；改为单 target graph 后恢复
+与 MTP-off 相同的交替 `1814/9419` trace，`21/21` drafted token 被接受。该策略只在
+Mali Vulkan 的 MTP prefill 生效；CPU、CUDA、MTP-off 和普通 decode 仍使用既有图形状。
 
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 

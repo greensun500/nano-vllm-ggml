@@ -38,7 +38,7 @@ LLM(config)
   -> lazy persistent graph bucket cache
 ```
 
-accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64。默认 `enable_graph_reuse` 让 CPU 单序列 decode/MTP lazy 创建 persistent graph bucket；CUDA 只有 extension 由 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 编译时才允许 GGML CUDA Graph capture/replay。Vulkan 默认仍走 fallback scheduler，但 v3.74 可用默认关闭的 `native_vulkan_graph_reuse` 对其稳定 bucket 做显式 oracle/A/B。多序列和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
+accelerator 模式把模型 compute node 固定到 Vulkan 或 CUDA，并在 graph allocation 后执行 placement audit。runtime 读取 `BackendDeviceInfo`；设备 name/description 含 `Mali` 时，普通长 prefill 的 target chunk limit 设为 64，但启用 MTP 的 prefill 保持为一张完整 target graph：其 KV maintenance 要读取 target hidden，分段的非最终 hidden-output 图会改变后续 target state。默认 `enable_graph_reuse` 让 CPU 单序列 decode/MTP lazy 创建 persistent graph bucket；CUDA 只有 extension 由 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 编译时才允许 GGML CUDA Graph capture/replay。Vulkan 默认仍走 fallback scheduler，但 v3.74 可用默认关闭的 `native_vulkan_graph_reuse` 对其稳定 bucket 做显式 oracle/A/B。多序列和 prefill/chunk 仍走 fallback scheduler。native 默认 `max_num_seqs=1`、`max_num_batched_tokens=2048`，避免端侧启动时先为大量 recurrent slot 分配状态。
 
 ## 4. Python 执行计划
 
@@ -62,6 +62,13 @@ v3.90 对 native Vulkan 的单 sequence prefill 保留完整 prompt execution pl
 `run()` 内按 64 token 切 target graph，因而不会扩大单张 GGML graph；它避免外部
 scheduler 边界把每个 fragment 误作最终 `Last` output graph。多 sequence、其他
 backend 和 decode 仍遵守原 scheduler 上限。
+
+v3.91 增加一个更窄的 MTP 例外：同样的 Mali runtime 对 `enable_mtp && is_prefill`
+不再切 64-token target chunks。legacy MTP prefill 必须保留完整 target hidden 以更新
+MTP KV；若在非最终 chunk 执行该 hidden-output 图，long-context greedy trace 会偏离。
+将 prompt 作为一张 target graph 处理后，target KV、recurrent state、MTP KV 和最后
+token 的因果顺序重新一致。此例外是 correctness gate，后续需通过 long-context oracle
+和 prefill profile 才能重新引入不改变状态的分段实现。
 
 NativeRunner 将 Python sequence ID 映射到 native sequence slot。C++ 根据 block table 展开物理 read/write slots，并校验 Python slot mapping 与同图重复写入。校验 speculative tail 时只检查所需逻辑范围及其 block-table 前缀，不再提前展开一个随后丢弃的完整 context slot 向量；实际执行时仍在对应 target/MTP graph 前展开 read slots。
 
@@ -217,7 +224,7 @@ K=3 常规轮次为：
 readback 规则：
 
 - 非最终 MTP-off Mali prefill 片：无 token/hidden readback，无 output norm/head；
-- legacy 非最终 MTP-on prefill 片：读取完整 hidden，执行 KV-only maintenance，不读 token；fusion 路径只读取最后一列 hidden；
+- Mali Vulkan 的 MTP prefill：整段 prompt 作为一个 target graph，读取完整 hidden 并执行 KV-only maintenance；不创建 legacy 非最终片；
 - 最终 prefill 片：读取一个 token；legacy MTP 还读取完整 hidden，fusion MTP 只读取最后一列；
 - MTP draft：读取 draft token，非末步还读取下一步 hidden；
 - verification：读取 K+1 predictions 与全部 target hidden；KV fusion 只改变 cache 写入位置，不减少这些用于 acceptance 的 readback；
