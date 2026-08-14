@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.91 native Vulkan MTP prefill-boundary 工作区
+- 当前分支：`qwen35-native-runtime`，v3.92 Vulkan T>1 paged-attention 工作区
 
 总体规模：
 
@@ -49,6 +49,7 @@
 | v3.89 | current working tree | native Vulkan 的 MTP `auto` 按 T=1 draft / T=K+1 verification 的 capability probe 使用 Flash；Mali oracle 通过，K=1 decode `19.885 -> 23.219 tok/s` |
 | v3.90 | current working tree | 单 sequence native Vulkan prefill 交由 runtime 内部 64-token chunk，修复 Python scheduler 64-token plan 边界改变 long-context non-MTP greedy trace |
 | v3.91 | current working tree | Mali Vulkan 的 MTP prefill 保持为单张 target graph；避免非最终 chunk 为 KV maintenance 保留 hidden-output 时改变后续 target state，恢复 long-context MTP greedy trace |
+| v3.92 | current working tree | 显式 paged attention 解除 T=1 selector 限制；Mali real-model long oracle 已覆盖 multi-token prefill、MTP verification、64/768 plan boundary 与 verification KV fusion |
 
 ## 2. 目录级总览
 

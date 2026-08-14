@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.91 native Vulkan MTP prefill boundary
+# nano-vLLM 当前版本修改说明：v3.92 Vulkan T>1 paged attention
 
 ## 1. 版本定位
 
@@ -41,6 +41,9 @@
   maintenance 需要 target hidden，而非最终 chunk 的 hidden-output 图会改变后续
   target state。MTP prefill 改为一张完整 target graph，保持 MTP KV、recurrent
   snapshot 与 greedy trace 一致；普通 MTP-off prefill 仍保持 64-token chunk
+- v3.92：显式 `native_attention_impl=paged` 解除 T=1 限制；Mali long-context
+  MTP-off/on、`max_batch=64/768` 与 verification-KV fusion 的完整 greedy oracle
+  已覆盖 multi-token prefill 和 verification
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -53,6 +56,10 @@ v3.91 是正确性边界修复，不宣称 prefill 加速。Armv9.2/Mali-G720 �
 long-context MTP probe（math、K=3）此前输出全 `255`；改为单 target graph 后恢复
 与 MTP-off 相同的交替 `1814/9419` trace，`21/21` drafted token 被接受。该策略只在
 Mali Vulkan 的 MTP prefill 生效；CPU、CUDA、MTP-off 和普通 decode 仍使用既有图形状。
+
+v3.92 不改变 `auto` 默认策略：只有显式 `paged` 才会选择 direct-cache kernel。
+CPU/CUDA 或不满足固定 Qwen3.5 F32/256-dim/GQA contract 的 Vulkan shape 仍报错；
+已验证 T>1 的 token 语义，但性能是否优于 math/Flash 仍需以统一 wall-time benchmark 为准。
 
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 
@@ -377,5 +384,5 @@ PYTHONPATH=. python3 -m nanovllm.cli.chat "$MODEL" \
 2. Native 不支持 preemption；容量不足时 session LRU 释放 idle state，active request 仍沿用原有的显式错误/调度路径。
 3. graph reuse 默认只覆盖 CPU 单 sequence 高频 decode/MTP；native CUDA 需使用 `NANOVLLM_NATIVE_CUDA_GRAPHS=ON` 的独立构建且尚未在 NVIDIA 实机验收。Vulkan 的 bucket reuse 仅有 v3.74 默认关闭的实验开关，需先通过 Mali oracle。
 4. Native 路径使用 HF tokenizer；当前 MTP 热路径并不调用 Python tokenizer，验证耗时主要在 native graph 和 LM head。
-5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。v3.87 的 direct paged kernel 也保持显式、仅 T=1；v3.88 verification-KV fusion 同样保持 opt-in，直到更多 context/K 值的 Vulkan oracle 和收益通过。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、split-K paged attention 和自适应 K 策略。
+5. v3.76 默认关闭当前 GGML CPU_REPACK，等待上游/target oracle 证明数值等价。v3.92 的 direct paged kernel 保持显式，但已通过 T>1 long-context/MTP oracle；v3.88 verification-KV fusion 同样保持 opt-in，直到更多 context/K 值的 Vulkan oracle 和收益通过。后续高风险第二阶段是 Q4_0/Q6_K lm_head + argmax 融合、split-K paged attention 和自适应 K 策略。
 6. v3.77 的 stage profile 是上述融合与自适应 K 的验收指标；Vulkan graph reuse 仍是默认关闭的 correctness 探针，当前 Mali 数据显示不应启用。

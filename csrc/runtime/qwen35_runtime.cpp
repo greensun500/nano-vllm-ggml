@@ -517,15 +517,6 @@ struct Qwen35Runtime::Impl {
                 }
                 return qwen35::AttentionImplementation::Flash;
             case Qwen35AttentionImplementation::Paged:
-                // The direct kernel is currently validated for decode only.
-                // Keep multi-token prefill and MTP verification on the exact
-                // math path until the tiled T>1 kernel has a cross-chunk
-                // oracle.  This is intentional fallback, not a capability
-                // probe failure: explicit paged still accelerates the
-                // latency-critical T=1 decode steps.
-                if (n_tokens != 1) {
-                    return qwen35::AttentionImplementation::Math;
-                }
                 if (!paged_attention_supported(n_tokens, n_kv)) {
                     fail(
                         "attention_impl='paged' is supported only by the Vulkan "
