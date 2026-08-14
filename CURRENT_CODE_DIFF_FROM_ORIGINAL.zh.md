@@ -5,7 +5,7 @@
 对比基线：
 
 - 原始 nano-vLLM 基线：`origin/main` / `native-upstream`，commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`
-- 当前分支：`qwen35-native-runtime`，v3.88 MTP verification-KV fusion 工作区
+- 当前分支：`qwen35-native-runtime`，v3.89 Mali MTP auto FlashAttention 工作区
 
 总体规模：
 
@@ -46,6 +46,7 @@
 | v3.82 | `891692c` + vendored `1bd647a` | Mali Vulkan `ARGMAX` 使用 256-lane specialization，缩短全词表 greedy reduction；统一 MTP K=1 decode `18.58 -> 19.92 tok/s`、acceptance `100%` |
 | v3.86/v3.87 | working tree + vendored GGML | 新增 Vulkan `PAGED_ATTN` direct-cache kernel；v3.87 加入真实 context length input、消除孤立 mask，并将已验证范围限制为 T=1 decode |
 | v3.88 | current working tree | 可选地将 MTP verification 的后缀 KV 写入合入 `TargetChunkGraph`，消除 accepted draft 的独立 KV-only graph；Mali K=1 统一 A/B decode `19.885 -> 20.057 tok/s`，默认保持关闭 |
+| v3.89 | current working tree | native Vulkan 的 MTP `auto` 按 T=1 draft / T=K+1 verification 的 capability probe 使用 Flash；Mali oracle 通过，K=1 decode `19.885 -> 23.219 tok/s` |
 
 ## 2. 目录级总览
 

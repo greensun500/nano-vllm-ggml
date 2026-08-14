@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.88 MTP verification KV graph fusion
+# nano-vLLM 当前版本修改说明：v3.89 Mali MTP auto FlashAttention
 
 ## 1. 版本定位
 
@@ -33,6 +33,8 @@
   已通过 oracle 的 T=1 decode 启用，T>1 prefill/MTP verification 保持 math
 - v3.88：把 verification 中 target-conditioned MTP KV 写入可选地附加到同一
   TargetChunkGraph，消除 accepted-prefix 的独立 KV-only graph；默认关闭
+- v3.89：在 native Vulkan 的 MTP `auto` 路径按每张 draft/verification graph
+  的真实 capability probe 选择 FlashAttention；其他 backend 仍为 math
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -110,6 +112,25 @@ draft/verification/KV 为 `12.377/68.134/0.784s`，融合后为
 `18.084 -> 18.226 tok/s`。收益很小且仍需更多 context/K 值验证，故不改变默认。
 完整 build、oracle、失败的历史 long-MTP baseline 与 JSON 位于远端
 `v37-results/20260814-041222-v388-mtp-verification-kv-fusion/`。
+
+v3.89 不改变 MTP 的 speculative accept/rollback、KV/state 布局或 graph 边界，
+只调整 `native_attention_impl="auto"` 的选择器。此前它为避免历史版本的
+shape-dependent Flash rounding，在所有 MTP backend 无条件选择 math；现在仅当
+primary backend 是 Vulkan，且当前 T=1 draft 或 T=K+1 verification 的真实
+`FLASH_ATTN_EXT` capability probe 成功时选择 Flash。CPU、CUDA、probe 不支持的
+Vulkan shape 与显式 `math/flash/paged` 请求不变。真实模型 oracle 同时比较
+`math`、`flash` 和新的 `auto`：Armv9.2/Mali-G720 5/5 通过 full accept、partial
+accept、immediate reject、release 和 optimization trace，证明该目标环境的 greedy
+trace 与 acceptance 没有变化。
+
+统一 Vulkan K=1 基准（Qwen3.5-2B-Q4_0、prompt 186、generate 541、repeat 3、
+warmup 1、8 cores）下，math 的 draft/verification/KV 为
+`12.377/68.134/0.784s`、decode `19.885 tok/s`；v3.89 auto 为
+`12.191/56.656/0.765s`、decode `23.219 tok/s`（`+16.76%`），两组
+`drafted/accepted/verification=810/810/810`、acceptance `100%`。单独打开
+batched recurrent snapshots 仍是噪声级变化（`19.904 tok/s`），故不改变其默认值。
+完整 build、math/flash/auto oracle 和 JSON 位于远端
+`v37-results/20260814-125732-v389-q6k-argmax-fix/`。
 
 ## 2. 从 v3.5 到 v3.7 的文件与改动
 

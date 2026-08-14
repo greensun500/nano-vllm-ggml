@@ -89,6 +89,7 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
         *,
         enable_mtp: bool,
         max_model_len: int = BLOCK_SIZE,
+        native_attention_impl: str = "auto",
         native_batched_recurrent_snapshots: bool = False,
         native_mtp_prefill_fusion: bool = False,
         native_mtp_verification_kv_fusion: bool = False,
@@ -105,6 +106,7 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
             num_kvcache_blocks=1,
             enable_mtp=enable_mtp,
             mtp_max_draft_tokens=3,
+            native_attention_impl=native_attention_impl,
             native_batched_recurrent_snapshots=native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=native_mtp_prefill_fusion,
             native_mtp_verification_kv_fusion=native_mtp_verification_kv_fusion,
@@ -243,15 +245,18 @@ class TestNativeQwen35CpuOracle(unittest.TestCase):
     def test_opt_in_graph_optimizations_match_the_legacy_mtp_trace(self):
         prompt_ids = self.prompt_tokens("Once upon a time", [12162, 5028, 264, 854])
         traces = []
-        variants = [(False, False, False), (False, False, True)]
+        variants = [(False, False, False, "math"), (False, False, True, "math")]
         # The pre-existing snapshot/prefill pair is CPU-only experimental: it
         # has no Vulkan token oracle yet, so do not let that unrelated path
         # hide the verification-KV fusion gate on Mali.
         if self.backend == "cpu":
-            variants.extend(((True, True, False), (True, True, True)))
-        for batched_snapshots, prefill_fusion, verification_kv_fusion in variants:
+            variants.extend(((True, True, False, "math"), (True, True, True, "math")))
+        else:
+            variants.extend(((False, False, False, "flash"), (False, False, False, "auto")))
+        for batched_snapshots, prefill_fusion, verification_kv_fusion, attention_impl in variants:
             runner = self.make_runner(
                 enable_mtp=True,
+                native_attention_impl=attention_impl,
                 native_batched_recurrent_snapshots=batched_snapshots,
                 native_mtp_prefill_fusion=prefill_fusion,
                 native_mtp_verification_kv_fusion=verification_kv_fusion,

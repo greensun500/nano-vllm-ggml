@@ -533,11 +533,17 @@ struct Qwen35Runtime::Impl {
                 }
                 return qwen35::AttentionImplementation::Paged;
             case Qwen35AttentionImplementation::Auto:
-                // MTP compares greedy results from T=1 draft and T=K+1
-                // verification graphs.  Shape-dependent Flash rounding can
-                // lower acceptance without changing final target tokens.
-                // Keep auto numerically aligned; explicit flash remains A/B.
+                // MTP must use the same attention implementation for both
+                // T=1 draft and T=K+1 verification.  The Qwen3.5-2B Mali
+                // oracle covers their exact greedy trace, so accept the
+                // backend's Flash capability for both shapes instead of
+                // leaving the dominant verification path on math attention.
                 if (options.enable_mtp) {
+                    if (primary_backend != nullptr &&
+                        primary_backend->kind() == BackendKind::Vulkan &&
+                        flash_attention_supported(n_tokens, n_kv, use_causal_mask)) {
+                        return qwen35::AttentionImplementation::Flash;
+                    }
                     return qwen35::AttentionImplementation::Math;
                 }
                 if (primary_backend == nullptr ||
