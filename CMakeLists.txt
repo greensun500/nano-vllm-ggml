@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.19)
 
 project(nanovllm_native_runtime LANGUAGES C CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 include(CTest)
 
 option(NANOVLLM_NATIVE_VULKAN "Build the native runtime with the GGML Vulkan backend" OFF)
