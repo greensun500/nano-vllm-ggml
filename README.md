@@ -57,11 +57,12 @@ outputs[0]["text"]
 ## In-tree Qwen3.5 CPU/Vulkan/CUDA runtime
 
 The new runtime keeps request scheduling and cache ownership in nano-vLLM and
-statically embeds only the official GGML CPU/Vulkan/CUDA implementation. It does not
-link `llama`, construct a `llama_context`, or require `--library-path`.
+statically embeds the vendored GGML CPU/Vulkan/CUDA implementation. It does not
+link `llama`, construct a `llama_context`, or require `--library-path`. The
+vendored source provenance is recorded in
+[`third_party/llama.cpp/NANOVLLM_VENDOR_REVISION.md`](third_party/llama.cpp/NANOVLLM_VENDOR_REVISION.md).
 
 ```bash
-git submodule update --init --recursive
 ./scripts/build_native_runtime.sh
 
 # Build one module containing CPU plus Vulkan:

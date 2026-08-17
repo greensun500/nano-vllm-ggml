@@ -1,0 +1,116 @@
+#version 450
+
+// Direct attention over a persistent, slot-addressed F32 KV cache. One
+// workgroup computes one (query token, query head) row. Qwen3.5 uses a
+// head_dim of 256: each invocation owns one output dimension, while sixteen
+// 16-lane groups form dot products for a tile of sixteen cache slots. Scores
+// are reduced online, so no [n_kv] score/probability or gathered KV tensor is
+// materialized.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float data_q[]; };
+layout(binding = 1) readonly buffer KeyCache { float data_key[]; };
+layout(binding = 2) readonly buffer ValueCache { float data_value[]; };
+layout(binding = 3) readonly buffer Slots { int data_slots[]; };
+layout(binding = 4) readonly buffer ContextLen { int data_context_len[]; };
+layout(binding = 5) writeonly buffer Out { float data_out[]; };
+
+layout(push_constant) uniform Params {
+    uint n_kv;
+    uint n_tokens;
+    uint n_heads;
+    uint n_kv_heads;
+    uint cache_width;
+    float scale;
+} p;
+
+shared float dot_partials[256];
+shared float tile_scores[16];
+shared float tile_weights[16];
+shared float running_max;
+shared float running_sum;
+shared float old_scale;
+
+void main() {
+    const uint dim = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint token = gl_WorkGroupID.z;
+    const uint group = dim >> 4;
+    const uint lane = dim & 15u;
+    const uint gqa_ratio = p.n_heads / p.n_kv_heads;
+    const uint kv_head = head / gqa_ratio;
+    const uint q_base = (token * p.n_heads + head) * 256u;
+    // Persistent graphs keep a bucket-sized slot tensor.  Read the true
+    // length separately so padded duplicate slots never enter softmax.
+    const uint actual_n_kv = uint(data_context_len[0]);
+    const uint visible_kv = actual_n_kv - p.n_tokens + token + 1u;
+
+    float output_value = 0.0;
+    if (dim == 0u) {
+        running_max = -3.402823466e+38;
+        running_sum = 0.0;
+    }
+    barrier();
+
+    for (uint base = 0u; base < visible_kv; base += 16u) {
+        const uint logical_slot = base + group;
+        float dot = 0.0;
+        if (logical_slot < visible_kv) {
+            const uint physical_slot = uint(data_slots[logical_slot]);
+            const uint key_base = physical_slot * p.cache_width + kv_head * 256u;
+            for (uint k = lane; k < 256u; k += 16u) {
+                dot += data_q[q_base + k] * data_key[key_base + k];
+            }
+        }
+        dot_partials[dim] = dot;
+        barrier();
+
+        if (lane == 0u) {
+            float score = -3.402823466e+38;
+            if (logical_slot < visible_kv) {
+                const uint partial_base = group * 16u;
+                float sum = 0.0;
+                for (uint k = 0u; k < 16u; ++k) {
+                    sum += dot_partials[partial_base + k];
+                }
+                score = sum * p.scale;
+            }
+            tile_scores[group] = score;
+        }
+        barrier();
+
+        if (dim == 0u) {
+            float tile_max = -3.402823466e+38;
+            for (uint k = 0u; k < 16u; ++k) {
+                tile_max = max(tile_max, tile_scores[k]);
+            }
+            const float new_max = max(running_max, tile_max);
+            old_scale = exp(running_max - new_max);
+            float new_sum = running_sum * old_scale;
+            for (uint k = 0u; k < 16u; ++k) {
+                const float weight = tile_scores[k] > -3.0e+38
+                    ? exp(tile_scores[k] - new_max)
+                    : 0.0;
+                tile_weights[k] = weight;
+                new_sum += weight;
+            }
+            running_max = new_max;
+            running_sum = new_sum;
+        }
+        barrier();
+
+        output_value *= old_scale;
+        for (uint k = 0u; k < 16u; ++k) {
+            const uint logical_slot = base + k;
+            if (logical_slot < visible_kv) {
+                const uint physical_slot = uint(data_slots[logical_slot]);
+                const uint value_base = physical_slot * p.cache_width + kv_head * 256u;
+                output_value += tile_weights[k] * data_value[value_base + dim];
+            }
+        }
+        barrier();
+    }
+
+    data_out[(token * p.n_heads + head) * 256u + dim] = output_value / running_sum;
+}

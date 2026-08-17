@@ -28,48 +28,20 @@ set(
     CACHE PATH
     "Pinned llama.cpp source tree; only its ggml subdirectory is compiled"
 )
-# The embedded GGML tree is the official b9986 revision plus nano-vLLM's
-# reviewed Mali/runtime patches. Pin the actual gitlink so a fresh build
-# cannot silently compile a different tree, while reporting the official base
-# separately for upstream traceability.
+# The embedded GGML tree is vendored in this repository at the official b9986
+# revision plus nano-vLLM's reviewed Mali/runtime patches. Keep the effective
+# vendor revision in build_info() and the detailed provenance beside the
+# vendored source, without requiring a nested Git checkout on a fresh clone.
 set(NANOVLLM_GGML_BASE_COMMIT "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb")
-set(NANOVLLM_GGML_COMMIT "0caa416ded34e746f308ef75ea1d9cb24e50f552")
-# Remote source snapshots intentionally synchronize source files without
-# touching the embedded llama.cpp .git metadata.  Keep the reviewed Mali
-# source revision accepted so a fresh remote build can validate the synced
-# working tree without a submodule checkout or metadata rewrite.
-set(NANOVLLM_GGML_MALI_PATCH_COMMIT "5ed33380b4679533243ca45e172804d5ddfe59ec")
-# This local, single-header compatibility patch exposes GGML_TYPE_CPU_REPACK
-# to the native loader. Keep the official base revision above as the primary
-# pin and accept only this explicitly reviewed derivative.
-set(NANOVLLM_GGML_COMPAT_PATCH_COMMIT "62d87d7e76b584ffdec4763919dfd6833a8a2f3e")
+set(NANOVLLM_GGML_COMMIT "8e29a9e44f40797b2173b179949780cc98ee7176")
+# ggml's upstream CMakeLists normally discovers its revision from a nested
+# Git checkout.  This source tree is deliberately vendored, so provide the
+# pinned revision explicitly rather than letting Git walk up to nano-vLLM.
+set(NANOVLLM_GGML_VENDORED_COMMIT "${NANOVLLM_GGML_COMMIT}")
 
 if(NOT EXISTS "${NANOVLLM_LLAMA_CPP_DIR}/ggml/CMakeLists.txt")
     message(FATAL_ERROR
-        "GGML sources are missing at ${NANOVLLM_LLAMA_CPP_DIR}/ggml. "
-        "Run: git submodule update --init --recursive")
-endif()
-
-find_package(Git REQUIRED)
-execute_process(
-    COMMAND "${GIT_EXECUTABLE}" -C "${NANOVLLM_LLAMA_CPP_DIR}" rev-parse HEAD
-    RESULT_VARIABLE NANOVLLM_GGML_GIT_RESULT
-    OUTPUT_VARIABLE NANOVLLM_GGML_ACTUAL_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT NANOVLLM_GGML_GIT_RESULT EQUAL 0)
-    message(FATAL_ERROR
-        "Cannot determine the llama.cpp revision at ${NANOVLLM_LLAMA_CPP_DIR}; "
-        "the native runtime requires the pinned official source checkout")
-endif()
-if(NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMMIT}"
-   AND NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_MALI_PATCH_COMMIT}"
-   AND NOT "${NANOVLLM_GGML_ACTUAL_COMMIT}" STREQUAL "${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}")
-    message(FATAL_ERROR
-        "llama.cpp revision mismatch: expected ${NANOVLLM_GGML_COMMIT}, "
-        "${NANOVLLM_GGML_MALI_PATCH_COMMIT}, or ${NANOVLLM_GGML_COMPAT_PATCH_COMMIT}, "
-        "found ${NANOVLLM_GGML_ACTUAL_COMMIT}")
+        "Vendored GGML sources are missing at ${NANOVLLM_LLAMA_CPP_DIR}/ggml")
 endif()
 
 # GGML is statically embedded into the nano-vLLM Python extension.  It is not

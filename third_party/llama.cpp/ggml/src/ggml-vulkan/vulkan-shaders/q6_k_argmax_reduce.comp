@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+struct Candidate {
+    float value;
+    uint index;
+};
+layout (binding = 0) readonly buffer C { Candidate data_candidates[]; };
+layout (binding = 1) writeonly buffer D { int data_tokens[]; };
+
+layout (push_constant) uniform parameter {
+    uint candidate_count;
+    uint candidate_stride;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+shared Candidate partial[256];
+
+bool better(const Candidate lhs, const Candidate rhs) {
+    return lhs.value > rhs.value || (lhs.value == rhs.value && lhs.index < rhs.index);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint token = gl_WorkGroupID.x;
+    Candidate best = Candidate(-3.402823466e+38, 0u);
+    for (uint i = tid; i < p.candidate_count; i += gl_WorkGroupSize.x) {
+        const Candidate candidate = data_candidates[token * p.candidate_stride + i];
+        if (better(candidate, best)) {
+            best = candidate;
+        }
+    }
+    partial[tid] = best;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && better(partial[tid + stride], partial[tid])) {
+            partial[tid] = partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_tokens[token] = int(partial[0].index);
+    }
+}

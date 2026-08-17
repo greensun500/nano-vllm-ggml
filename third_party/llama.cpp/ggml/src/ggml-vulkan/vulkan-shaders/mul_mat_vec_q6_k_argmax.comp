@@ -1,0 +1,143 @@
+#version 450
+
+// Fused Q6_K vocabulary head: one workgroup evaluates sixteen output rows,
+// writes one (logit, vocabulary-id) candidate per input token, and leaves the
+// final reduction to q6_k_argmax_reduce.comp.  This deliberately mirrors the
+// arithmetic and row traversal of mul_mat_vec_q6_k.comp; only the final store
+// is changed.  It is therefore safe to use for greedy decoding, including
+// equal-logit tie breaking in the reducer.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout (binding = 0) readonly buffer APacked { A_TYPE_PACKED16 data_a_packed16[]; };
+layout (binding = 1) readonly buffer B { float data_b[]; };
+
+struct Candidate {
+    float value;
+    uint index;
+};
+layout (binding = 2) writeonly buffer C { Candidate data_candidates[]; };
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint nrows;
+    uint ntokens;
+    uint candidate_stride;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Every Q6_K superblock is split across sixteen lanes.  Keeping the same
+// reduction width as the standard shader preserves the per-row accumulation
+// order while grouping sixteen vocabulary rows into one workgroup.
+shared float scales_cache[16];
+shared float reduce_cache[16][16];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_base = gl_WorkGroupID.x * 16;
+    const uint token = gl_WorkGroupID.y;
+    if (token >= p.ntokens || tid >= 16) {
+        return;
+    }
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    float sums[16];
+    [[unroll]] for (uint row = 0; row < 16; ++row) {
+        sums[row] = 0.0;
+    }
+
+    // ncols is 2048 for the Qwen3.5 vocabulary head, hence eight Q6_K
+    // superblocks.  The loop remains general for future compatible heads.
+    for (uint block = 0; block < num_blocks_per_row; ++block) {
+        const uint v_im = tid / 8;
+        const uint v_in = tid - 8 * v_im;
+        const uint l0 = 4 * v_in;
+        const uint is = v_in / 4;
+        const uint ql_offset = 64 * v_im + l0;
+        const uint qh_offset = 32 * v_im + l0;
+        const uint s_offset = 8 * v_im + is;
+        const uint y_offset = 128 * v_im + l0;
+
+        const uint y_idx = block * QUANT_K + y_offset;
+        const vec4 by0  = vec4(data_b[(token * p.ncols + y_idx) / 4]);
+        const vec4 by32 = vec4(data_b[(token * p.ncols + y_idx) / 4 +  8]);
+        const vec4 by64 = vec4(data_b[(token * p.ncols + y_idx) / 4 + 16]);
+        const vec4 by96 = vec4(data_b[(token * p.ncols + y_idx) / 4 + 24]);
+
+        [[unroll]] for (uint local_row = 0; local_row < 16; ++local_row) {
+            const uint absolute_row = row_base + local_row;
+            if (absolute_row >= p.nrows) {
+                continue;
+            }
+            const uint a_offset = absolute_row * num_blocks_per_row + block;
+            scales_cache[tid] = float(data_a[a_offset].scales[tid]);
+            barrier();
+
+            const uint32_t ql0_u32 = uint32_t(data_a_packed16[a_offset].ql[ql_offset / 2]) |
+                                     (uint32_t(data_a_packed16[a_offset].ql[ql_offset / 2 + 1]) << 16);
+            const uint32_t ql32_u32 = uint32_t(data_a_packed16[a_offset].ql[ql_offset / 2 + 16]) |
+                                      (uint32_t(data_a_packed16[a_offset].ql[ql_offset / 2 + 17]) << 16);
+            const uint32_t qh_u32 = uint32_t(data_a_packed16[a_offset].qh[qh_offset / 2]) |
+                                    (uint32_t(data_a_packed16[a_offset].qh[qh_offset / 2 + 1]) << 16);
+            const uint32_t q0_u32 = (ql0_u32 & 0x0F0F0F0F) | ((qh_u32 & 0x03030303) << 4);
+            const uint32_t q1_u32 = (ql32_u32 & 0x0F0F0F0F) | ((qh_u32 & 0x0C0C0C0C) << 2);
+            const uint32_t q2_u32 = ((ql0_u32 >> 4) & 0x0F0F0F0F) | (qh_u32 & 0x30303030);
+            const uint32_t q3_u32 = ((ql32_u32 >> 4) & 0x0F0F0F0F) | ((qh_u32 & 0xC0C0C0C) >> 2);
+            const vec4 q0 = vec4(unpack8(q0_u32)) - 32;
+            const vec4 q1 = vec4(unpack8(q1_u32)) - 32;
+            const vec4 q2 = vec4(unpack8(q2_u32)) - 32;
+            const vec4 q3 = vec4(unpack8(q3_u32)) - 32;
+            float partial[4] = float[4](0.0, 0.0, 0.0, 0.0);
+            [[unroll]] for (uint lane = 0; lane < 4; ++lane) {
+                partial[0] = fma(by0[lane], q0[lane], partial[0]);
+                partial[1] = fma(by32[lane], q1[lane], partial[1]);
+                partial[2] = fma(by64[lane], q2[lane], partial[2]);
+                partial[3] = fma(by96[lane], q3[lane], partial[3]);
+            }
+            sums[local_row] = fma(
+                fma(partial[0], scales_cache[s_offset],
+                    fma(partial[1], scales_cache[s_offset + 2],
+                        fma(partial[2], scales_cache[s_offset + 4],
+                            partial[3] * scales_cache[s_offset + 6]))),
+                float(data_a[a_offset].d), sums[local_row]);
+            barrier();
+        }
+    }
+
+    // Reduce the 16 lane fragments for each vocabulary row.  Lane zero then
+    // computes the local maximum across the 16 rows and records its global id.
+    [[unroll]] for (uint row = 0; row < 16; ++row) {
+        reduce_cache[row][tid] = sums[row];
+    }
+    barrier();
+    for (uint stride = 8; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            [[unroll]] for (uint row = 0; row < 16; ++row) {
+                reduce_cache[row][tid] += reduce_cache[row][tid + stride];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        float best = -3.402823466e+38;
+        uint best_index = 0;
+        [[unroll]] for (uint row = 0; row < 16; ++row) {
+            const uint index = row_base + row;
+            if (index >= p.nrows) {
+                break;
+            }
+            const float value = reduce_cache[row][0];
+            if (value > best || (value == best && index < best_index)) {
+                best = value;
+                best_index = index;
+            }
+        }
+        data_candidates[token * p.candidate_stride + gl_WorkGroupID.x] = Candidate(best, best_index);
+    }
+}
