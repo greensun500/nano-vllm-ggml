@@ -160,6 +160,11 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 struct ggml_backend_vk_context;
 
+// The native runtime is single-threaded per request, but Vulkan device objects
+// can be shared by independent runtimes. Keep workload selection per caller
+// rather than storing it in vk_device_struct.
+static thread_local int ggml_vk_mali_mmq_safe_depth = 0;
+
 #define MAX_PARAMETER_COUNT 12
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
@@ -777,8 +782,16 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_matmul_f16_f32;
 
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
+    // Mali-G720 tuned variants are built in parallel with the generic MMQ
+    // pipelines. Keeping both sets makes correctness fallback a runtime
+    // choice rather than a device-global reconfiguration.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_mali[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
+    // Optional Mali-G720 integer-dot variants. The ordinary arrays above
+    // remain the safe baseline and are never overwritten.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1_mali[GGML_TYPE_COUNT];
+    bool mali_mmq_tune = false;
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -4843,6 +4856,75 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #undef CREATE_MM
 
+    // Build a second MMQ family for Mali-G720 rather than changing the
+    // baseline tiles above. A few workloads with an existing KV prefix and
+    // multiple new tokens are deliberately routed to the baseline family by
+    // ggml_vk_set_mali_mmq_safe_mode(); ordinary text prefill and T=1 decode
+    // can use these larger, Mali-specific tiles.
+    //
+    // This is the corrected configuration from the CIX Mali workgroup
+    // coverage fix: WN=32 for the large tile and dispatch denominators match
+    // BM/BN, so each launched workgroup covers its complete output tile.
+    // This vendor snapshot is newer than the CIX llama.cpp baseline. Keep the
+    // port opt-in until its KHR-cooperative-matrix interaction is qualified on
+    // the actual Mali driver. GGML_VK_DISABLE_MALI_MMQ_TUNE remains a stronger
+    // kill switch for experiments and CI bisects.
+    if (device->vendor_id == VK_VENDOR_ID_ARM && device->subgroup_size == 16 &&
+        getenv("GGML_VK_ENABLE_MALI_MMQ_TUNE") != nullptr &&
+        getenv("GGML_VK_DISABLE_MALI_MMQ_TUNE") == nullptr) {
+        device->mali_mmq_tune = true;
+
+        const std::vector<uint32_t> mali_l_q4 = { 256, 64, 128, 64, 16, 32, 2, 2, 2, 1, 16 };
+        const std::vector<uint32_t> mali_m_q4 = { 256, 64,  64, 64, 16, 16, 2, 2, 2, 1, 16 };
+        const std::vector<uint32_t> mali_s_q4 = { 128, 32,  64, 32, 16, 16, 2, 2, 2, 1, 16 };
+        const std::vector<uint32_t> mali_l_q6 = { 256, 64, 128, 64, 16, 32, 1, 2, 2, 1, 16 };
+        const std::vector<uint32_t> mali_m_q6 = { 256, 64,  64, 64, 16, 16, 1, 2, 2, 1, 16 };
+        const std::vector<uint32_t> mali_s_q6 = { 128, 32,  64, 32, 16, 16, 1, 2, 2, 1, 16 };
+        const std::array<uint32_t, 3> mali_l_denoms = { 64, 128, 1 };
+        const std::array<uint32_t, 3> mali_m_denoms = { 64,  64, 1 };
+        const std::array<uint32_t, 3> mali_s_denoms = { 32,  64, 1 };
+
+        const auto validate_mali_tile = [](const std::vector<uint32_t> & tile,
+                                           const std::array<uint32_t, 3> & denoms) {
+            GGML_ASSERT(tile[0] / tile[10] ==
+                        (tile[1] / tile[4]) * (tile[2] / tile[5]));
+            GGML_ASSERT(denoms[0] == tile[1] && denoms[1] == tile[2]);
+        };
+        validate_mali_tile(mali_l_q4, mali_l_denoms);
+        validate_mali_tile(mali_m_q4, mali_m_denoms);
+        validate_mali_tile(mali_s_q4, mali_s_denoms);
+        validate_mali_tile(mali_l_q6, mali_l_denoms);
+        validate_mali_tile(mali_m_q6, mali_m_denoms);
+        validate_mali_tile(mali_s_q6, mali_s_denoms);
+
+#define CREATE_MALI_MMQ(TYPE, PIPELINE, NAME, TILE_L, TILE_M, TILE_S) \
+        if (device->mul_mat_l_int[TYPE]) { \
+            ggml_vk_create_pipeline(device, PIPELINE.f32acc->l, #NAME "_mali_l", NAME ## _fp32_len, NAME ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), mali_l_denoms, TILE_L, 1); \
+        } \
+        if (device->mul_mat_m_int[TYPE]) { \
+            ggml_vk_create_pipeline(device, PIPELINE.f32acc->m, #NAME "_mali_m", NAME ## _fp32_len, NAME ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), mali_m_denoms, TILE_M, 1); \
+        } \
+        if (device->mul_mat_s_int[TYPE]) { \
+            ggml_vk_create_pipeline(device, PIPELINE.f32acc->s, #NAME "_mali_s", NAME ## _fp32_len, NAME ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), mali_s_denoms, TILE_S, 1); \
+        }
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        if (device->integer_dot_product) {
+            CREATE_MALI_MMQ(
+                GGML_TYPE_Q4_0,
+                device->pipeline_dequant_mul_mat_mat_q8_1_mali[GGML_TYPE_Q4_0],
+                matmul_q4_0_q8_1, mali_l_q4, mali_m_q4, mali_s_q4);
+            CREATE_MALI_MMQ(
+                GGML_TYPE_Q6_K,
+                device->pipeline_dequant_mul_mat_mat_q8_1_mali[GGML_TYPE_Q6_K],
+                matmul_q6_k_q8_1, mali_l_q6, mali_m_q6, mali_s_q6);
+        }
+#endif
+#undef CREATE_MALI_MMQ
+
+        GGML_LOG_INFO("ggml_vulkan: Mali G720 tuned MMQ enabled (safe fallback available)\\n");
+    }
+
     // mul mat vec
 
     // the number of rows computed per shader depends on GPU model and quant
@@ -6273,6 +6355,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
+        // The CIX Mali MMQ tiles are raw integer-dot shaders.  On this newer
+        // vendor snapshot, advertising KHR cooperative matrix at the same
+        // time changes MMQ setup/selection enough to corrupt real Qwen3.5
+        // prefill.  Keep the behavior tied to the experimental MMQ opt-in;
+        // normal Mali Vulkan users retain the upstream cooperative-matrix
+        // path unchanged.
+        if (device->vendor_id == VK_VENDOR_ID_ARM &&
+            getenv("GGML_VK_ENABLE_MALI_MMQ_TUNE") != nullptr) {
+            device->coopmat_support = false;
+            coopmat2_support = false;
+        }
+
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
         device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support;
@@ -7242,6 +7336,13 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     // MMQ
     if (src1_type == GGML_TYPE_Q8_1) {
         vk_matmul_pipeline pipelines = ctx->device->pipeline_dequant_mul_mat_mat_q8_1[src0_type].f32acc;
+        if (ctx->device->mali_mmq_tune && ggml_vk_mali_mmq_safe_depth == 0) {
+            vk_matmul_pipeline mali =
+                ctx->device->pipeline_dequant_mul_mat_mat_q8_1_mali[src0_type].f32acc;
+            if (!mali->is_empty()) {
+                pipelines = mali;
+            }
+        }
 
         if (pipelines->is_empty()) {
             return nullptr;
@@ -17209,6 +17310,14 @@ static ggml_backend_i ggml_backend_vk_interface = {
 static ggml_guid_t ggml_backend_vk_guid() {
     static ggml_guid guid = { 0xb8, 0xf7, 0x4f, 0x86, 0x40, 0x3c, 0xe1, 0x02, 0x91, 0xc8, 0xdd, 0xe9, 0x02, 0x3f, 0xc0, 0x2b };
     return &guid;
+}
+
+void ggml_vk_set_mali_mmq_safe_mode(bool safe) {
+    if (safe) {
+        ++ggml_vk_mali_mmq_safe_depth;
+    } else if (ggml_vk_mali_mmq_safe_depth > 0) {
+        --ggml_vk_mali_mmq_safe_depth;
+    }
 }
 
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {

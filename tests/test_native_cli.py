@@ -1,3 +1,4 @@
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -72,6 +73,15 @@ class FakeLlm:
 
 
 class NativeBenchCliTests(unittest.TestCase):
+    def test_bench_parser_accepts_mali_mtp_prefill_strategy(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["bench.py", "--native-mali-mtp-prefill-strategy", "chunked_staged"],
+        ):
+            args = bench.parse_args()
+        self.assertEqual(args.native_mali_mtp_prefill_strategy, "chunked_staged")
+
     def assert_rejected_before_build(self, args, message):
         with patch.object(bench, "build_llm") as build_llm:
             with self.assertRaisesRegex(SystemExit, message):
@@ -160,6 +170,15 @@ class NativeBenchCliTests(unittest.TestCase):
 
 
 class NativeChatCliTests(unittest.TestCase):
+    def test_chat_parser_accepts_mali_mtp_prefill_strategy(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["chat.py", "--native-mali-mtp-prefill-strategy", "chunked_legacy"],
+        ):
+            args = chat.parse_args()
+        self.assertEqual(args.native_mali_mtp_prefill_strategy, "chunked_legacy")
+
     @staticmethod
     def make_args(**overrides):
         values = {

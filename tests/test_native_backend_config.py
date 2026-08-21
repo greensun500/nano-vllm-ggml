@@ -87,6 +87,18 @@ class NativeBackendConfigTests(unittest.TestCase):
             self.assertTrue(config.native_mtp_prefill_fusion)
             self.assertTrue(config.native_mtp_verification_kv_fusion)
 
+            staged = Config(
+                model=model.name,
+                backend="native_vulkan",
+                tokenizer=tokenizer,
+                enable_mtp=True,
+                native_mali_mtp_prefill_strategy="chunked_staged",
+            )
+            self.assertEqual(
+                staged.native_mali_mtp_prefill_strategy,
+                "chunked_staged",
+            )
+
             paged = Config(
                 model=model.name,
                 backend="native_vulkan",
@@ -117,6 +129,38 @@ class NativeBackendConfigTests(unittest.TestCase):
                     tokenizer=tokenizer,
                     native_mtp_prefill_fusion=True,
                 )
+            with self.assertRaisesRegex(ValueError, "native_mali_mtp_prefill_strategy"):
+                Config(
+                    model=model.name,
+                    backend="native_vulkan",
+                    tokenizer=tokenizer,
+                    enable_mtp=True,
+                    native_mali_mtp_prefill_strategy="invalid",
+                )
+            with self.assertRaisesRegex(ValueError, "backend='native_vulkan'"):
+                Config(
+                    model=model.name,
+                    backend="native_cpu",
+                    tokenizer=tokenizer,
+                    enable_mtp=True,
+                    native_mali_mtp_prefill_strategy="chunked_legacy",
+                )
+            with self.assertRaisesRegex(ValueError, "requires enable_mtp=True"):
+                Config(
+                    model=model.name,
+                    backend="native_vulkan",
+                    tokenizer=tokenizer,
+                    native_mali_mtp_prefill_strategy="chunked_legacy",
+                )
+            fused_staged = Config(
+                model=model.name,
+                backend="native_vulkan",
+                tokenizer=tokenizer,
+                enable_mtp=True,
+                native_mtp_prefill_fusion=True,
+                native_mali_mtp_prefill_strategy="chunked_staged",
+            )
+            self.assertTrue(fused_staged.native_mtp_prefill_fusion)
 
     def test_explicit_physical_blocks_do_not_change_per_sequence_context(self):
         with self.make_model() as model, tempfile.TemporaryDirectory() as tokenizer:

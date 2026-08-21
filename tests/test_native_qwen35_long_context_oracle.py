@@ -20,6 +20,7 @@ MODEL_ENV = "NANOVLLM_TEST_QWEN35_GGUF"
 TOKENIZER_ENV = "NANOVLLM_TEST_QWEN35_TOKENIZER"
 BACKENDS_ENV = "NANOVLLM_TEST_QWEN35_LONG_BACKENDS"
 ATTENTION_IMPL_ENV = "NANOVLLM_TEST_QWEN35_ATTENTION_IMPL"
+MALI_MTP_PREFILL_STRATEGIES_ENV = "NANOVLLM_TEST_QWEN35_MALI_MTP_PREFILL_STRATEGIES"
 RESULT_PREFIX = "NANOVLLM_LONG_PROBE_JSON="
 PROMPT = [9419, 1814] * 260 + [9419]
 GENERATED_TOKENS = 31
@@ -43,7 +44,9 @@ def _run_probe(args: argparse.Namespace) -> None:
         mtp_max_draft_tokens=3,
         device_config={"n_threads": args.threads, "device_index": 0},
         native_attention_impl=args.attention_impl,
+        native_mtp_prefill_fusion=args.mtp_prefill_fusion,
         native_mtp_verification_kv_fusion=args.mtp_verification_kv_fusion,
+        native_mali_mtp_prefill_strategy=args.mali_mtp_prefill_strategy,
     )
     try:
         output = llm.generate(
@@ -63,7 +66,9 @@ def _run_probe(args: argparse.Namespace) -> None:
                     "backend": args.backend,
                     "max_batch": args.max_batch,
                     "mtp": args.mtp,
+                    "mtp_prefill_fusion": args.mtp_prefill_fusion,
                     "mtp_verification_kv_fusion": args.mtp_verification_kv_fusion,
+                    "mali_mtp_prefill_strategy": args.mali_mtp_prefill_strategy,
                     "token_ids": list(output["token_ids"]),
                     "mtp_stats": stats,
                 },
@@ -110,6 +115,26 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
             raise AssertionError(
                 f"{ATTENTION_IMPL_ENV} must be auto, math, flash, or paged"
             )
+        cls.mali_mtp_prefill_strategies = tuple(
+            strategy.strip()
+            for strategy in os.environ.get(
+                MALI_MTP_PREFILL_STRATEGIES_ENV, "whole"
+            ).split(",")
+            if strategy.strip()
+        )
+        invalid_strategies = sorted(
+            set(cls.mali_mtp_prefill_strategies)
+            - {"whole", "chunked_legacy", "chunked_staged"}
+        )
+        if (
+            invalid_strategies
+            or not cls.mali_mtp_prefill_strategies
+            or "whole" not in cls.mali_mtp_prefill_strategies
+        ):
+            raise AssertionError(
+                f"{MALI_MTP_PREFILL_STRATEGIES_ENV} must include whole and may include "
+                f"chunked_legacy/chunked_staged; invalid={invalid_strategies}"
+            )
 
     @classmethod
     def probe(
@@ -118,6 +143,7 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
         max_batch: int,
         mtp: bool,
         mtp_verification_kv_fusion: bool = False,
+        mali_mtp_prefill_strategy: str = "whole",
     ) -> dict:
         command = [
             sys.executable,
@@ -135,6 +161,8 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
             str(cls.threads),
             "--attention-impl",
             cls.attention_impl,
+            "--mali-mtp-prefill-strategy",
+            mali_mtp_prefill_strategy,
         ]
         if mtp:
             command.append("--mtp")
@@ -158,22 +186,40 @@ class TestNativeQwen35LongContextOracle(unittest.TestCase):
     def test_mtp_and_chunk_boundaries_preserve_backend_greedy_trace(self):
         for backend in self.backends:
             with self.subTest(backend=backend):
-                results = {
-                    (max_batch, mtp, fusion): self.probe(
-                        backend, max_batch, mtp, fusion
-                    )
-                    for max_batch in (768, 64)
-                    for mtp in (False, True)
-                    for fusion in ((False, True) if mtp else (False,))
-                }
-                expected = results[(768, False, False)]["token_ids"]
+                strategies = (
+                    self.mali_mtp_prefill_strategies
+                    if backend == "vulkan"
+                    else ("whole",)
+                )
+                results = {}
+                for max_batch in (768, 64):
+                    for mtp in (False, True):
+                        for fusion in ((False, True) if mtp else (False,)):
+                            for strategy in strategies:
+                                # Chunked Mali prefill is meaningful only with
+                                # MTP enabled.  Cover both the legacy host-side
+                                # KV update and the in-graph fused transaction:
+                                # the latter is a candidate fix for the
+                                # cross-graph chunk-boundary corruption.
+                                if strategy != "whole" and not mtp:
+                                    continue
+                                key = (max_batch, mtp, fusion, strategy)
+                                results[key] = self.probe(
+                                    backend,
+                                    max_batch,
+                                    mtp,
+                                    fusion,
+                                    strategy,
+                                )
+                expected = results[(768, False, False, "whole")]["token_ids"]
                 self.assertEqual(len(expected), GENERATED_TOKENS)
                 for key, result in results.items():
                     self.assertEqual(
                         result["token_ids"],
                         expected,
                         f"{backend} max_batch={key[0]} mtp={key[1]} "
-                        f"mtp_verification_kv_fusion={key[2]} changed the greedy trace",
+                        f"mtp_verification_kv_fusion={key[2]} "
+                        f"mali_mtp_prefill_strategy={key[3]} changed the greedy trace",
                     )
                     if key[1]:
                         stats = result["mtp_stats"]
@@ -197,7 +243,13 @@ def _parse_probe_args() -> argparse.Namespace:
         "--attention-impl", choices=("auto", "math", "flash", "paged"), required=True
     )
     parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-prefill-fusion", action="store_true")
     parser.add_argument("--mtp-verification-kv-fusion", action="store_true")
+    parser.add_argument(
+        "--mali-mtp-prefill-strategy",
+        choices=("whole", "chunked_legacy", "chunked_staged"),
+        required=True,
+    )
     return parser.parse_args()
 
 

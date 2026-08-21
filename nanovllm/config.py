@@ -38,6 +38,9 @@ class Config:
     native_batched_recurrent_snapshots: bool = False
     native_mtp_prefill_fusion: bool = False
     native_mtp_verification_kv_fusion: bool = False
+    # Explicit, default-off Mali-G720 MTP-prefill experiments.  The runtime
+    # rejects these modes on non-Mali-G720 Vulkan devices.
+    native_mali_mtp_prefill_strategy: str = "whole"
     enable_session_cache: bool = True
     max_retained_sessions: int = 1
     max_consecutive_prefill_rounds: int = 4
@@ -100,6 +103,15 @@ class Config:
             self.native_attention_impl in ("math", "auto", "flash", "paged"),
             "native_attention_impl must be 'math', 'auto', 'flash', or 'paged'",
         )
+        _require(
+            self.native_mali_mtp_prefill_strategy in (
+                "whole",
+                "chunked_legacy",
+                "chunked_staged",
+            ),
+            "native_mali_mtp_prefill_strategy must be 'whole', "
+            "'chunked_legacy', or 'chunked_staged'",
+        )
         if self.native_mtp_prefill_fusion:
             _require(is_native, "native_mtp_prefill_fusion requires a native backend")
             _require(self.enable_mtp, "native_mtp_prefill_fusion requires enable_mtp=True")
@@ -111,6 +123,15 @@ class Config:
             _require(
                 self.enable_mtp,
                 "native_mtp_verification_kv_fusion requires enable_mtp=True",
+            )
+        if self.native_mali_mtp_prefill_strategy != "whole":
+            _require(
+                self.backend == "native_vulkan",
+                "chunked Mali MTP prefill requires backend='native_vulkan'",
+            )
+            _require(
+                self.enable_mtp,
+                "chunked Mali MTP prefill requires enable_mtp=True",
             )
         if self.native_vulkan_graph_reuse:
             _require(

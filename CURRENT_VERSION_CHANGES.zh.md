@@ -44,6 +44,14 @@
 - v3.92：显式 `native_attention_impl=paged` 解除 T=1 限制；Mali long-context
   MTP-off/on、`max_batch=64/768` 与 verification-KV fusion 的完整 greedy oracle
   已覆盖 multi-token prefill 和 verification
+- 当前未提交开发：新增默认关闭的 Mali-G720 MTP prefill 分块实验
+  `native_mali_mtp_prefill_strategy={whole,chunked_legacy,chunked_staged}`；2026-08-21
+  Mali-G720 real-model long-context oracle 已证实：`chunked_legacy` 与带两个
+  recurrent scratch plane 的 `chunked_staged` 在 host-side MTP KV update 下均从首个
+  generated token 退化为 255；`chunked_staged + native_mtp_prefill_fusion=1` 仍失败，
+  故 state-plane alias 和 host KV graph boundary 都不是充分根因。实验选项保持 opt-in，
+  `whole` 默认不变，禁止以它们作性能结论，下一步须按 chunk 比对 target recurrent
+  state、target KV、MTP KV 和 last hidden 的首个差异。
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
@@ -60,6 +68,20 @@ Mali Vulkan 的 MTP prefill 生效；CPU、CUDA、MTP-off 和普通 decode 仍�
 v3.92 不改变 `auto` 默认策略：只有显式 `paged` 才会选择 direct-cache kernel。
 CPU/CUDA 或不满足固定 Qwen3.5 F32/256-dim/GQA contract 的 Vulkan shape 仍报错；
 已验证 T>1 的 token 语义，但性能是否优于 math/Flash 仍需以统一 wall-time benchmark 为准。
+
+当前未提交的 Mali-G720 MTP prefill 实验不改变任何默认路径：`whole` 继续使用
+v3.91 的完整 prompt target graph。`chunked_legacy` 只用于复现旧的 64-token
+MTP prefill 行为；`chunked_staged` 则为 recurrent state 增加两个不参与 MTP
+`K-a` rollback 的 scratch plane，并让连续 chunk 在这两个 plane 间显式交替读写。
+它仅允许 Mali-G720 Vulkan + MTP 的显式组合；`chunked_*` 可分别测试 host-side
+MTP KV update 与 in-graph MTP prefill fusion，后者用于验证能否消除跨 graph 的 chunk
+边界事务问题。2026-08-21 的远机 oracle 已否定这两个初始假设：legacy、staged、
+staged+fusion 均失败，默认仍必须为 `whole`。CPU、CUDA、NVIDIA Vulkan、MTP-off、
+普通 decode 和现有 Vulkan graph reuse 均不改变。该实现仍只用于定位跨 chunk
+state/MTP maintenance 的首个差异，尚不能视为性能或正确性结论。
+`Qwen35Runtime.execution_profile_stats()` 及 `bench --json` 还会记录实际 device
+profile、MTP prefill chunk 大小和 staged recurrent plane 数，避免将 NVIDIA Vulkan
+的完整 prefill 路径误归因于 Mali 专用策略。
 
 v3.71 不改变模型图、权重、缓存布局或 greedy token 语义，只去除两个已确认的运行时实现损耗：GGML `graph_compute` 成功后重复的 scheduler synchronize，以及 execution plan 校验中为 speculative tail 创建后即丢弃的完整 context slot 向量。
 
@@ -308,6 +330,19 @@ MTP K draft 中，除最后一个 draft 外都要把 hidden 传给下一轮；�
 | `third_party/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp` | Arm Vulkan 创建 `argmax_f32` pipeline 时把 local size specialization 从 `subgroup_size` 提升为 `min(256, maxComputeWorkGroupInvocations 的 2 次幂)`；其他 vendor 不变。 |
 
 这是一个单独的 `ARGMAX` 调度优化，不宣称已经完成 fused Q6_K head：后续融合仍需要令 matvec 直接产生局部 `(logit, token_id)`，再只归约局部候选，才能避免全量 logits 写回。v3.82 的完整 MTP acceptance 和 profile 已证明更宽的精确归约可保留；下一阶段可以基于 256-lane reduction 写专用 Q6_K partial-max，而不再猜测 MMVQ（`GGML_VK_FORCE_MMVQ=1` 的短 K=1 probe 反而使 decode `17.08 -> 13.45 tok/s`）。
+
+### 2.16 Mali 双 MMQ pipeline 移植（实验性、默认关闭）
+
+| 文件 | 改动 |
+| --- | --- |
+| `third_party/llama.cpp/ggml/{include,src}/ggml-vulkan/*` | 移植 CIX llama.cpp 的双 MMQ pipeline 基础设施：保留 upstream pipeline 作为安全基线，为 Mali subgroup=16 创建 Q4_0/Q6_K 的 Q8_1 调优 variant；增加线程局部 safe-mode API。 |
+| `csrc/runtime/qwen35_runtime.cpp` | 对 Mali-G720 的“已有 KV” target chunk 以 RAII 方式进入 safe-mode；tuned MMQ 仅覆盖 cold whole-prompt prefill，draft、verification、decode 和后续 turn 均回到基线路径，不改变 Python scheduler 或 prompt 切分。 |
+
+该移植的目标是把 Mali 的 tile/workgroup 优化放在 GGML backend，而不是重新让 Python 将 prompt 切成 64 token。CIX 的 Kevin.Li/Kevin.Yang 修复包含 WN=32 和与 BM/BN 对齐的 dispatch denominator；本地 Q4_0/Q6_K 所需的最小子集已保留。
+
+但 nano-vLLM vendored GGML（`8e29a9e`）比参考提交的代码基线更新，并在 G720 上仍暴露 `KHR_coopmat`。在开发板真实 Qwen3.5-2B-Q4_0 521-token probe 中，直接打开该最小移植会使 greedy trace 退化为无效 token；将 Mali cooperative matrix 与 MMQ tuning 一同关闭/打开后，whole-prompt MTP probe 恢复原 trace，并保持 `21/21` drafts accepted。实现已将这一条件绑定到同一 `GGML_VK_ENABLE_MALI_MMQ_TUNE=1` 实验开关：默认安全，不影响 Mali/NVIDIA/CUDA 的既有行为；实验模式才在 Arm 上禁用 coopmat 并选择 tuned raw-MMQ。
+
+开发板 `pp512/tg128`、math、MTP K=3 的首个 A/B 进一步验证该方向：安全路径 prefill/decode 为 `19.42/22.33 tok/s`，实验 MMQ 为 `159.61/19.92 tok/s`。prefill 提升约 `8.2x`，但 experiment 的 acceptance 从 `288/288 (100%)` 降至 `285/315 (90.48%)`，verification step 从 `96` 增至 `105`。因此它解决的是 Mali whole-prompt prefill 的 kernel 吞吐，而非可直接默认启用的端到端优化。runtime 已进一步收紧边界为“已有 KV 即安全”，将 tuned MMQ 严格限制到 cold prefill；该边界仍需以单 tensor Q4_0×Q8_1 differential、MTP-off/verification/长上下文 oracle 和 A/B 性能矩阵资格化。
 
 ## 3. 当前运行链路的新增部分
 

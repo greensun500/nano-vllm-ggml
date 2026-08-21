@@ -43,6 +43,11 @@ class BenchResult:
     native_batched_recurrent_snapshots: bool
     native_mtp_prefill_fusion: bool
     native_mtp_verification_kv_fusion: bool
+    native_mali_mtp_prefill_strategy: str
+    native_execution_profile: str
+    native_device_name: str
+    native_mtp_prefill_chunk_tokens: int
+    native_staged_recurrent_planes: int
     graph_cache_hits: int
     graph_cache_misses: int
     graph_cache_evictions: int
@@ -170,6 +175,15 @@ def parse_args() -> argparse.Namespace:
         help="Fuse target-conditioned MTP KV maintenance into each verification graph.",
     )
     parser.add_argument(
+        "--native-mali-mtp-prefill-strategy",
+        choices=("whole", "chunked_legacy", "chunked_staged"),
+        default=os.environ.get("NANOVLLM_NATIVE_MALI_MTP_PREFILL_STRATEGY", "whole"),
+        help=(
+            "Mali-G720-only MTP prefill experiment; 'whole' preserves the "
+            "current correctness workaround."
+        ),
+    )
+    parser.add_argument(
         "--use-prefix-cache",
         action="store_true",
         help="Reuse identical prompts across runs to benchmark prefix-cache behavior.",
@@ -217,6 +231,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
             native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
+            native_mali_mtp_prefill_strategy=args.native_mali_mtp_prefill_strategy,
             device_config={
                 "n_threads": args.threads,
                 "device_index": args.device_index,
@@ -408,6 +423,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     mtp_profile_baseline: dict[str, int] = {}
     mtp_profile: dict[str, int] = {}
     graph_stats = {"hits": 0, "misses": 0, "evictions": 0, "active_entries": 0}
+    execution_profile: dict[str, str | int] = {}
     actual_num_kvcache_blocks = int(llm.config.num_kvcache_blocks)
     actual_model = os.fspath(llm.config.gguf_model or llm.config.model)
     ggml_commit = ""
@@ -425,6 +441,9 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
     get_mtp_stats = getattr(llm.model_runner, "mtp_stats", None)
     get_mtp_profile = getattr(llm.model_runner, "mtp_profile_stats", None)
     get_graph_stats = getattr(llm.model_runner, "graph_reuse_stats", None)
+    get_execution_profile = getattr(llm.model_runner, "execution_profile_stats", None)
+    if callable(get_execution_profile):
+        execution_profile.update(get_execution_profile())
     try:
         run_index = 0
         for _ in range(args.warmup):
@@ -511,6 +530,15 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
         native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
         native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
+        native_mali_mtp_prefill_strategy=args.native_mali_mtp_prefill_strategy,
+        native_execution_profile=str(execution_profile.get("profile_name", "")),
+        native_device_name=str(execution_profile.get("device_name", "")),
+        native_mtp_prefill_chunk_tokens=int(
+            execution_profile.get("mtp_prefill_chunk_tokens", 0)
+        ),
+        native_staged_recurrent_planes=int(
+            execution_profile.get("staged_recurrent_planes", 0)
+        ),
         graph_cache_hits=int(graph_stats["hits"]),
         graph_cache_misses=int(graph_stats["misses"]),
         graph_cache_evictions=int(graph_stats["evictions"]),
@@ -555,6 +583,12 @@ def print_result(result: BenchResult) -> None:
     print(f"batched snapshots:  {result.native_batched_recurrent_snapshots}")
     print(f"MTP prefill fusion: {result.native_mtp_prefill_fusion}")
     print(f"MTP verification KV fusion: {result.native_mtp_verification_kv_fusion}")
+    print(f"Mali MTP prefill strategy: {result.native_mali_mtp_prefill_strategy}")
+    if result.native_execution_profile:
+        print(f"execution profile:  {result.native_execution_profile}")
+        print(f"device:             {result.native_device_name}")
+        print(f"MTP prefill chunk:  {result.native_mtp_prefill_chunk_tokens or 'whole'}")
+        print(f"staged state planes:{result.native_staged_recurrent_planes}")
     if result.ggml_commit:
         print(f"GGML commit:        {result.ggml_commit}")
         print(f"Vulkan compiled:    {result.vulkan_compiled}")

@@ -71,6 +71,9 @@ class NativeRunner:
             enable_mtp_verification_kv_fusion=bool(
                 getattr(config, "native_mtp_verification_kv_fusion", False)
             ),
+            mali_mtp_prefill_strategy=str(
+                getattr(config, "native_mali_mtp_prefill_strategy", "whole")
+            ),
         )
 
     @staticmethod
@@ -240,6 +243,29 @@ class NativeRunner:
             "misses": int(stats.get("misses", 0)),
             "evictions": int(stats.get("evictions", 0)),
             "active_entries": int(stats.get("active_entries", 0)),
+        }
+
+    def execution_profile_stats(self) -> dict[str, str | int]:
+        runtime = self._require_live_runtime()
+        method = getattr(runtime, "execution_profile_stats", None)
+        if not callable(method):
+            return {}
+        stats = method()
+        return {
+            "backend": str(stats.get("backend", "")),
+            "device_name": str(stats.get("device_name", "")),
+            "device_description": str(stats.get("device_description", "")),
+            "profile_name": str(stats.get("profile_name", "")),
+            "mali_mtp_prefill_strategy": str(
+                stats.get("mali_mtp_prefill_strategy", "")
+            ),
+            "normal_prefill_chunk_tokens": int(
+                stats.get("normal_prefill_chunk_tokens", 0)
+            ),
+            "mtp_prefill_chunk_tokens": int(
+                stats.get("mtp_prefill_chunk_tokens", 0)
+            ),
+            "staged_recurrent_planes": int(stats.get("staged_recurrent_planes", 0)),
         }
 
     def memory_stats(self) -> dict[str, int]:

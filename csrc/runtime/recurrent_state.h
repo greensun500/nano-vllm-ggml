@@ -41,6 +41,11 @@ struct RecurrentStateOptions {
     // verification also consumes the pending token.
     std::size_t max_draft_tokens = 0;
 
+    // Extra planes are intentionally outside the MTP rollback range [0, K].
+    // They are available to an execution policy that needs to stage a
+    // multi-graph state transition without changing the K-a rollback mapping.
+    std::size_t extra_snapshot_planes = 0;
+
     // This is deliberately an explicit request rather than an architecture
     // guess.  The currently supported Qwen3.5-2B manifest declares blk.24 as
     // full attention, so requesting an MTP recurrent bank is rejected.  The
@@ -62,7 +67,8 @@ struct RecurrentStateOptions {
 //   delta [delta_elements, max_sequence_slots * snapshot_planes]
 //
 // Rows for one sequence slot are contiguous and ordered by newest-first
-// snapshot plane.  snapshot_planes is max_draft_tokens + 1.
+// snapshot plane.  snapshot_planes is max_draft_tokens + 1 plus any explicit
+// staging planes requested by the runtime.
 class RecurrentStateCache {
 public:
     RecurrentStateCache(
@@ -87,6 +93,12 @@ public:
 
     std::size_t max_sequence_slots() const noexcept { return options_.max_sequence_slots; }
     std::size_t max_draft_tokens() const noexcept { return options_.max_draft_tokens; }
+    std::size_t verification_snapshot_planes() const noexcept {
+        return options_.max_draft_tokens + 1;
+    }
+    std::size_t extra_snapshot_planes() const noexcept {
+        return options_.extra_snapshot_planes;
+    }
     std::size_t snapshot_planes() const noexcept { return snapshot_planes_; }
 
     std::size_t conv_kernel_size() const noexcept { return conv_kernel_size_; }
@@ -125,6 +137,9 @@ public:
         std::size_t draft_count,
         std::size_t accepted_drafts);
     void select_latest(std::size_t sequence_slot);
+    // Select an explicitly committed state plane.  This is used by staged
+    // prefill only; MTP verification continues to use select_mtp_rollback().
+    void select_snapshot_plane(std::size_t sequence_slot, std::size_t snapshot_plane);
     std::size_t active_snapshot_plane(std::size_t sequence_slot) const;
 
     // Persistent row ids for GGML get_rows/set_rows.  Snapshot index vectors

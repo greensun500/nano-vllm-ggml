@@ -40,6 +40,18 @@ class FakeQwen35Runtime:
     def eog_token_ids(self):
         return [248044, 248046]
 
+    def execution_profile_stats(self):
+        return {
+            "backend": "vulkan",
+            "device_name": "Mali-G720",
+            "device_description": "test device",
+            "profile_name": "mali-g720-vulkan",
+            "mali_mtp_prefill_strategy": "chunked_staged",
+            "normal_prefill_chunk_tokens": 64,
+            "mtp_prefill_chunk_tokens": 64,
+            "staged_recurrent_planes": 2,
+        }
+
     def tokenize(self, text):
         return [1, len(text), 2]
 
@@ -65,6 +77,7 @@ def make_config(**overrides):
         "mtp_max_draft_tokens": 3,
         "enable_graph_reuse": True,
         "native_vulkan_graph_reuse": False,
+        "native_mali_mtp_prefill_strategy": "whole",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -147,6 +160,7 @@ class NativeRunnerTests(unittest.TestCase):
                 "enable_batched_recurrent_snapshots": False,
                 "enable_mtp_prefill_fusion": False,
                 "enable_mtp_verification_kv_fusion": False,
+                "mali_mtp_prefill_strategy": "whole",
             },
         )
         self.assertNotIn("library_path", kwargs)
@@ -172,6 +186,36 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertTrue(kwargs["enable_mtp_prefill_fusion"])
         self.assertTrue(kwargs["enable_mtp_verification_kv_fusion"])
         self.assertTrue(kwargs["enable_vulkan_graph_reuse"])
+        self.assertEqual(kwargs["mali_mtp_prefill_strategy"], "whole")
+
+    def test_constructor_forwards_mali_mtp_prefill_strategy(self):
+        runner = self.make_runner(
+            make_config(
+                backend="native_vulkan",
+                enable_mtp=True,
+                native_mali_mtp_prefill_strategy="chunked_staged",
+            )
+        )
+        self.assertEqual(
+            runner.runtime.constructor_kwargs["mali_mtp_prefill_strategy"],
+            "chunked_staged",
+        )
+
+    def test_execution_profile_stats_are_normalized_for_benchmarks(self):
+        runner = self.make_runner()
+        self.assertEqual(
+            runner.execution_profile_stats(),
+            {
+                "backend": "vulkan",
+                "device_name": "Mali-G720",
+                "device_description": "test device",
+                "profile_name": "mali-g720-vulkan",
+                "mali_mtp_prefill_strategy": "chunked_staged",
+                "normal_prefill_chunk_tokens": 64,
+                "mtp_prefill_chunk_tokens": 64,
+                "staged_recurrent_planes": 2,
+            },
+        )
 
     def test_greedy_run_flattens_and_converts_the_execution_plan(self):
         runner = self.make_runner()

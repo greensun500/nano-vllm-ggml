@@ -21,10 +21,12 @@ namespace {
 
 using nanovllm::native::Qwen35ExecutionPlan;
 using nanovllm::native::Qwen35AttentionImplementation;
+using nanovllm::native::Qwen35ExecutionProfileStats;
 using nanovllm::native::Qwen35GraphReuseStats;
 using nanovllm::native::Qwen35MemoryStats;
 using nanovllm::native::Qwen35MtpProfileStats;
 using nanovllm::native::Qwen35MtpResult;
+using nanovllm::native::Qwen35MaliMtpPrefillStrategy;
 using nanovllm::native::Qwen35Runtime;
 using nanovllm::native::Qwen35RuntimeOptions;
 
@@ -182,6 +184,38 @@ bool parse_attention_implementation(
     PyErr_SetString(
         PyExc_ValueError,
         "Qwen35Runtime argument 'attention_impl' must be 'math', 'auto', 'flash', or 'paged'");
+    return false;
+}
+
+bool parse_mali_mtp_prefill_strategy(
+    PyObject * value,
+    Qwen35MaliMtpPrefillStrategy & result) {
+    if (!PyUnicode_Check(value)) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "Qwen35Runtime argument 'mali_mtp_prefill_strategy' must be str");
+        return false;
+    }
+    const char * strategy = PyUnicode_AsUTF8(value);
+    if (strategy == nullptr) {
+        return false;
+    }
+    if (std::strcmp(strategy, "whole") == 0) {
+        result = Qwen35MaliMtpPrefillStrategy::WholePrompt;
+        return true;
+    }
+    if (std::strcmp(strategy, "chunked_legacy") == 0) {
+        result = Qwen35MaliMtpPrefillStrategy::ChunkedLegacy;
+        return true;
+    }
+    if (std::strcmp(strategy, "chunked_staged") == 0) {
+        result = Qwen35MaliMtpPrefillStrategy::ChunkedStaged;
+        return true;
+    }
+    PyErr_SetString(
+        PyExc_ValueError,
+        "Qwen35Runtime argument 'mali_mtp_prefill_strategy' must be "
+        "'whole', 'chunked_legacy', or 'chunked_staged'");
     return false;
 }
 
@@ -370,6 +404,7 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
     PyObject * enable_batched_recurrent_snapshots_object = Py_False;
     PyObject * enable_mtp_prefill_fusion_object = Py_False;
     PyObject * enable_mtp_verification_kv_fusion_object = Py_False;
+    PyObject * mali_mtp_prefill_strategy_object = nullptr;
     static const char * keywords[] = {
         "model_path",
         "backend",
@@ -388,12 +423,13 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         "enable_batched_recurrent_snapshots",
         "enable_mtp_prefill_fusion",
         "enable_mtp_verification_kv_fusion",
+        "mali_mtp_prefill_strategy",
         nullptr,
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|OOOOOO:Qwen35Runtime",
+            "OOOOOOOOOOO|OOOOOOO:Qwen35Runtime",
             const_cast<char **>(keywords),
             &model_path_object,
             &backend_object,
@@ -411,7 +447,8 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
             &attention_impl_object,
             &enable_batched_recurrent_snapshots_object,
             &enable_mtp_prefill_fusion_object,
-            &enable_mtp_verification_kv_fusion_object)) {
+            &enable_mtp_verification_kv_fusion_object,
+            &mali_mtp_prefill_strategy_object)) {
         return -1;
     }
     if (self->runtime != nullptr) {
@@ -490,6 +527,12 @@ int runtime_init(PyObject * self_object, PyObject * args, PyObject * kwargs) {
         !parse_attention_implementation(
             attention_impl_object,
             options.attention_implementation)) {
+        return -1;
+    }
+    if (mali_mtp_prefill_strategy_object != nullptr &&
+        !parse_mali_mtp_prefill_strategy(
+            mali_mtp_prefill_strategy_object,
+            options.mali_mtp_prefill_strategy)) {
         return -1;
     }
 
@@ -716,6 +759,63 @@ PyObject * runtime_graph_reuse_stats(PyObject * self_object, PyObject *) {
     }
 }
 
+PyObject * runtime_execution_profile_stats(PyObject * self_object, PyObject *) {
+    auto * self = reinterpret_cast<PyQwen35Runtime *>(self_object);
+    Qwen35Runtime * runtime = require_runtime(self);
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        Qwen35ExecutionProfileStats stats;
+        {
+            AllowThreads allow_threads;
+            stats = runtime->execution_profile_stats();
+        }
+        PyObject * result = PyDict_New();
+        if (result == nullptr) {
+            return nullptr;
+        }
+        const auto set_string = [&](const char * key, const std::string & value) -> bool {
+            PyObject * object = PyUnicode_FromStringAndSize(
+                value.data(), static_cast<Py_ssize_t>(value.size()));
+            if (object == nullptr) {
+                return false;
+            }
+            const int status = PyDict_SetItemString(result, key, object);
+            Py_DECREF(object);
+            return status == 0;
+        };
+        const auto set_uint = [&](const char * key, std::uint64_t value) -> bool {
+            PyObject * object = PyLong_FromUnsignedLongLong(
+                static_cast<unsigned long long>(value));
+            if (object == nullptr) {
+                return false;
+            }
+            const int status = PyDict_SetItemString(result, key, object);
+            Py_DECREF(object);
+            return status == 0;
+        };
+        if (!set_string("backend", stats.backend) ||
+            !set_string("device_name", stats.device_name) ||
+            !set_string("device_description", stats.device_description) ||
+            !set_string("profile_name", stats.profile_name) ||
+            !set_string(
+                "mali_mtp_prefill_strategy", stats.mali_mtp_prefill_strategy) ||
+            !set_uint(
+                "normal_prefill_chunk_tokens", stats.normal_prefill_chunk_tokens) ||
+            !set_uint(
+                "mtp_prefill_chunk_tokens", stats.mtp_prefill_chunk_tokens) ||
+            !set_uint("staged_recurrent_planes", stats.staged_recurrent_planes)) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        return result;
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
 PyObject * runtime_memory_stats(PyObject * self_object, PyObject *) {
     auto * self = reinterpret_cast<PyQwen35Runtime *>(self_object);
     Qwen35Runtime * runtime = require_runtime(self);
@@ -827,6 +927,8 @@ PyMethodDef runtime_methods[] = {
      "Return persistent graph cache hit/miss/eviction counters."},
     {"mtp_profile_stats", runtime_mtp_profile_stats, METH_NOARGS,
      "Return cumulative native MTP stage timing counters."},
+    {"execution_profile_stats", runtime_execution_profile_stats, METH_NOARGS,
+     "Return the effective native device execution policy."},
     {"memory_stats", runtime_memory_stats, METH_NOARGS,
      "Return native persistent-memory accounting by allocation class."},
     {"shutdown", runtime_shutdown, METH_NOARGS,

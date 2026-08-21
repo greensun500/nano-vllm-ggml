@@ -74,8 +74,10 @@ RecurrentStateCache::RecurrentStateCache(
     if (options_.max_sequence_slots == 0) {
         throw RecurrentStateError("max_sequence_slots must be greater than zero");
     }
-    if (options_.max_draft_tokens == std::numeric_limits<std::size_t>::max()) {
-        throw RecurrentStateError("max_draft_tokens is too large");
+    if (options_.max_draft_tokens == std::numeric_limits<std::size_t>::max() ||
+        options_.extra_snapshot_planes >
+            std::numeric_limits<std::size_t>::max() - options_.max_draft_tokens - 1) {
+        throw RecurrentStateError("snapshot plane count is too large");
     }
     if (model_config_.main_layers + model_config_.nextn_predict_layers !=
         model_config_.block_count) {
@@ -130,7 +132,7 @@ RecurrentStateCache::RecurrentStateCache(
             "declares blk.24 as a full-attention block");
     }
 
-    snapshot_planes_ = options_.max_draft_tokens + 1;
+    snapshot_planes_ = options_.max_draft_tokens + 1 + options_.extra_snapshot_planes;
     total_rows_ = checked_multiply(
         options_.max_sequence_slots, snapshot_planes_, "persistent state row");
     if (total_rows_ > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -371,6 +373,14 @@ std::size_t RecurrentStateCache::select_mtp_rollback(
 void RecurrentStateCache::select_latest(std::size_t sequence_slot) {
     require_active_slot(sequence_slot);
     active_snapshot_planes_[sequence_slot] = 0;
+}
+
+void RecurrentStateCache::select_snapshot_plane(
+    std::size_t sequence_slot,
+    std::size_t snapshot_plane) {
+    require_active_slot(sequence_slot);
+    require_plane(snapshot_plane);
+    active_snapshot_planes_[sequence_slot] = snapshot_plane;
 }
 
 std::size_t RecurrentStateCache::active_snapshot_plane(
