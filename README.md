@@ -58,7 +58,9 @@ outputs[0]["text"]
 
 The new runtime keeps request scheduling and cache ownership in nano-vLLM and
 statically embeds the vendored GGML CPU/Vulkan/CUDA implementation. It does not
-link `llama`, construct a `llama_context`, or require `--library-path`. The
+link `llama`, construct a `llama_context`, or require `--library-path`. Native
+chat and benchmark commands also use the tokenizer metadata stored in the GGUF,
+so a matching Hugging Face tokenizer checkout is no longer required. The
 vendored source provenance is recorded in
 [`third_party/llama.cpp/NANOVLLM_VENDOR_REVISION.md`](third_party/llama.cpp/NANOVLLM_VENDOR_REVISION.md).
 
@@ -83,7 +85,6 @@ sequence while validating the correctness-first F32 state implementation:
 PYTHONPATH=. python3 -m nanovllm.cli.chat \
   /path/to/Qwen3.5-2B-Q4_0.gguf \
   --backend native_cpu \
-  --tokenizer /path/to/Qwen3.5-2B \
   --max-model-len 256 \
   --max-num-batched-tokens 256 \
   --max-num-seqs 1 \
@@ -104,7 +105,6 @@ After a Vulkan-enabled build, change only the execution backend:
 PYTHONPATH=. python3 -m nanovllm.cli.chat \
   /path/to/Qwen3.5-2B-Q4_0.gguf \
   --backend native_vulkan \
-  --tokenizer /path/to/Qwen3.5-2B \
   --max-model-len 256 \
   --max-num-batched-tokens 256 \
   --max-num-seqs 1 \
@@ -122,8 +122,7 @@ select `native_cuda`:
 ```bash
 NANOVLLM_NATIVE_CUDA=ON scripts/build_native_runtime.sh
 python -m nanovllm.cli.chat /path/to/Qwen3.5.gguf \
-  --backend native_cuda \
-  --tokenizer /path/to/Qwen3.5-tokenizer
+  --backend native_cuda
 ```
 
 ## Native graph optimization experiments
@@ -176,7 +175,6 @@ statistics:
 PYTHONPATH=. python3 -m nanovllm.cli.bench \
   /path/to/Qwen3.5-2B-Q4_0.gguf \
   --backend native_cpu \
-  --tokenizer /path/to/Qwen3.5-2B \
   --max-model-len 256 \
   --max-num-batched-tokens 256 \
   --max-num-seqs 1 \

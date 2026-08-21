@@ -138,6 +138,10 @@ class NativeRunner:
     def detokenize(self, token_ids: list[int]) -> str:
         return str(self._optional_tokenizer_method("detokenize")([int(token) for token in token_ids]))
 
+    @property
+    def vocab_size(self) -> int:
+        return int(self._optional_tokenizer_method("vocabulary_size")())
+
     def allocate_kv_cache(self, num_blocks: int, block_size: int):
         # Cache sizes are construction parameters of Qwen35Runtime.  Retain the
         # common runner method without creating a second allocation path.

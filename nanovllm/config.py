@@ -102,9 +102,13 @@ class Config:
             "native_cuda",
         ), f"unsupported backend: {self.backend}")
         _require(self.model_format in ("hf", "gguf"), "model_format must be 'hf' or 'gguf'")
+        # A native runtime can take its tokenizer solely from the GGUF. Keep
+        # an explicitly supplied HF directory as a compatibility override.
+        if is_native and self.tokenizer_backend == "hf" and not self.tokenizer:
+            self.tokenizer_backend = "native"
         _require(
-            self.tokenizer_backend in ("hf", "llamacpp"),
-            "tokenizer_backend must be 'hf' or 'llamacpp'",
+            self.tokenizer_backend in ("hf", "llamacpp", "native"),
+            "tokenizer_backend must be 'hf', 'llamacpp', or 'native'",
         )
         _require(
             self.kvcache_block_size % 256 == 0,
@@ -177,6 +181,10 @@ class Config:
                 not self.enable_mtp,
                 "built-in MTP is only supported by the GGUF CPU/Vulkan backends",
             )
+            _require(
+                self.tokenizer_backend == "hf",
+                "CUDA backend requires tokenizer_backend='hf'",
+            )
             from transformers import AutoConfig
 
             _require(os.path.isdir(self.model), "CUDA model must be a local Hugging Face directory")
@@ -194,17 +202,18 @@ class Config:
                     "native backend does not support preemption yet",
                 )
                 _require(
-                    self.tokenizer_backend == "hf",
-                    "native backend requires tokenizer_backend='hf'; it does not use llama.cpp tokenization",
+                    self.tokenizer_backend in ("native", "hf"),
+                    "native backend tokenizer_backend must be 'native' or 'hf'",
                 )
-                _require(
-                    bool(self.tokenizer),
-                    "native backend requires tokenizer=/path/to/the matching Hugging Face tokenizer",
-                )
-                _require(
-                    os.path.isdir(self.tokenizer),
-                    "native backend tokenizer must be a local Hugging Face tokenizer directory",
-                )
+                if self.tokenizer_backend == "hf":
+                    _require(
+                        bool(self.tokenizer),
+                        "native HF tokenizer requires tokenizer=/path/to/the matching tokenizer",
+                    )
+                    _require(
+                        os.path.isdir(self.tokenizer),
+                        "native HF tokenizer must be a local Hugging Face tokenizer directory",
+                    )
                 backend_label = "native backend"
                 process_label = "native backend"
             else:

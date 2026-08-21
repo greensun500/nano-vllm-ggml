@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer",
         default=os.environ.get("NANOVLLM_TOKENIZER"),
-        help="Local Hugging Face tokenizer directory required by native backends.",
+        help="Optional local Hugging Face tokenizer directory; native defaults to tokenizer metadata in GGUF.",
     )
     parser.add_argument(
         "--library-path",
@@ -238,15 +238,13 @@ def build_llm(args: argparse.Namespace) -> LLM:
     if args.backend.startswith("native"):
         if not gguf_model:
             raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
-        if not args.tokenizer:
-            raise SystemExit("Native backends require --tokenizer or NANOVLLM_TOKENIZER pointing to the HF tokenizer directory.")
         return LLM(
             gguf_model,
             backend=args.backend,
             model_format="gguf",
             gguf_model=gguf_model,
             tokenizer=args.tokenizer,
-            tokenizer_backend="hf",
+            tokenizer_backend="hf" if args.tokenizer else "native",
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,

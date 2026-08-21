@@ -32,18 +32,19 @@ class NativeBackendConfigTests(unittest.TestCase):
         self.assertEqual(config.max_num_seqs, 1)
         self.assertEqual(config.max_num_batched_tokens, 2048)
 
-    def test_native_backend_requires_the_explicit_hf_tokenizer_contract(self):
+    def test_native_backend_defaults_to_the_embedded_gguf_tokenizer(self):
         with self.make_model() as model, tempfile.TemporaryDirectory() as tokenizer:
-            with self.assertRaisesRegex(ValueError, "tokenizer_backend='hf'"):
+            with self.assertRaisesRegex(ValueError, "must be 'native' or 'hf'"):
                 Config(
                     model=model.name,
                     backend="native_vulkan",
                     tokenizer=tokenizer,
                     tokenizer_backend="llamacpp",
                 )
-            with self.assertRaisesRegex(ValueError, "requires tokenizer="):
-                Config(model=model.name, backend="native_vulkan")
-            with self.assertRaisesRegex(ValueError, "local Hugging Face tokenizer directory"):
+            native = Config(model=model.name, backend="native_vulkan")
+            self.assertEqual(native.tokenizer_backend, "native")
+            self.assertIsNone(native.tokenizer)
+            with self.assertRaisesRegex(ValueError, "native HF tokenizer must be"):
                 Config(
                     model=model.name,
                     backend="native_vulkan",

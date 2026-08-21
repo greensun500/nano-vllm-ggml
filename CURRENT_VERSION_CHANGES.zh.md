@@ -1,4 +1,19 @@
-# nano-vLLM 当前版本修改说明：v3.94 measured native platform defaults
+# nano-vLLM 当前版本修改说明：v3.95 embedded GGUF tokenizer
+
+## 1. v3.95：native GGUF 内嵌 tokenizer
+
+- native CPU/Vulkan/CUDA runtime 新增固定的 upstream llama.cpp tokenizer
+  子模块。它只包含 GGUF metadata loader、vocab/BPE、Unicode 和 split-file 名称
+  辅助函数；不创建 `llama_model`/`llama_context`，不进入 llama.cpp 推理执行路径。
+- `Qwen35Runtime` 直接从启动时传入的 GGUF 读取 tokenizer metadata，并向 Python
+  暴露 `tokenize`、`detokenize`、`eog_token_ids` 与 `vocabulary_size`。
+- native CLI 的 `--tokenizer` 由必填改为可选：默认 `tokenizer_backend=native`，
+  即一个完整 GGUF 即可完成 chat 和 benchmark；显式传入本地 HF tokenizer 目录时，
+  仍保持历史 HF 兼容路径，方便排查和对照。
+- 新增 opt-in real-GGUF gate：对 Qwen3.5-2B-Q4_0 验证英文、中文、emoji 与 ChatML
+  special token 的 round-trip；若提供 HF tokenizer，再逐 token 比较编码结果。
+
+## 2. 版本定位
 
 ## 1. 版本定位
 

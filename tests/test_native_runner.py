@@ -58,6 +58,9 @@ class FakeQwen35Runtime:
     def detokenize(self, token_ids):
         return ":".join(str(token) for token in token_ids)
 
+    def vocabulary_size(self):
+        return 248320
+
     def shutdown(self):
         self.shutdown_calls += 1
 
@@ -328,6 +331,7 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertEqual(runner.call("eog_token_ids"), (248044, 248046))
         self.assertEqual(runner.call("tokenize", "hello"), [1, 5, 2])
         self.assertEqual(runner.call("detokenize", [4, 5]), "4:5")
+        self.assertEqual(runner.vocab_size, 248320)
         self.assertIsNone(runner.allocate_kv_cache(8, 256))
         runner.call("exit")
         runner.exit()

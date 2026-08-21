@@ -16,7 +16,7 @@ class TestNativeRuntime(unittest.TestCase):
         self.assertEqual(info["runtime"], "nanovllm_native")
         self.assertEqual(info["abi_version"], 1)
         self.assertEqual(
-            info["ggml_commit"], "0caa416ded34e746f308ef75ea1d9cb24e50f552"
+            info["ggml_commit"], "8e29a9e44f40797b2173b179949780cc98ee7176"
         )
         self.assertEqual(
             info["ggml_base_commit"], "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb"

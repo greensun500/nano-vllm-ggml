@@ -377,6 +377,36 @@ PyObject * int32_list(const std::vector<std::int32_t> & values) {
     return result;
 }
 
+bool parse_token_ids(PyObject * object, std::vector<std::int32_t> & result) {
+    PyObject * sequence = PySequence_Fast(object, "token_ids must be a sequence of int32 values");
+    if (sequence == nullptr) {
+        return false;
+    }
+    const Py_ssize_t size = PySequence_Fast_GET_SIZE(sequence);
+    result.clear();
+    result.reserve(static_cast<std::size_t>(size));
+    PyObject ** items = PySequence_Fast_ITEMS(sequence);
+    for (Py_ssize_t index = 0; index < size; ++index) {
+        PyObject * item = items[index];
+        if (!PyLong_Check(item) || PyBool_Check(item)) {
+            Py_DECREF(sequence);
+            PyErr_Format(PyExc_TypeError, "token_ids[%zd] must be an int32", index);
+            return false;
+        }
+        const long value = PyLong_AsLong(item);
+        if (PyErr_Occurred() || value < std::numeric_limits<std::int32_t>::min() ||
+            value > std::numeric_limits<std::int32_t>::max()) {
+            Py_DECREF(sequence);
+            PyErr_Clear();
+            PyErr_Format(PyExc_ValueError, "token_ids[%zd] is outside the int32 range", index);
+            return false;
+        }
+        result.push_back(static_cast<std::int32_t>(value));
+    }
+    Py_DECREF(sequence);
+    return true;
+}
+
 Qwen35Runtime * require_runtime(PyQwen35Runtime * self) {
     if (self->runtime == nullptr || self->runtime->is_shutdown()) {
         PyErr_SetString(PyExc_RuntimeError, "Qwen35Runtime has been shut down");
@@ -638,6 +668,99 @@ PyObject * runtime_run_mtp(PyObject * self_object, PyObject * args) {
         PyTuple_SET_ITEM(tuple, 1, output_counts);  // steals
         PyTuple_SET_ITEM(tuple, 2, draft_counts);   // steals
         return tuple;
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
+PyObject * runtime_tokenize(PyObject * self_object, PyObject * args) {
+    PyObject * text_object = nullptr;
+    if (!PyArg_ParseTuple(args, "U:tokenize", &text_object)) {
+        return nullptr;
+    }
+    Qwen35Runtime * runtime = require_runtime(reinterpret_cast<PyQwen35Runtime *>(self_object));
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    Py_ssize_t text_size = 0;
+    const char * text = PyUnicode_AsUTF8AndSize(text_object, &text_size);
+    if (text == nullptr) {
+        return nullptr;
+    }
+    try {
+        std::vector<std::int32_t> tokens;
+        {
+            AllowThreads allow_threads;
+            tokens = runtime->tokenize(std::string(text, static_cast<std::size_t>(text_size)));
+        }
+        return int32_list(tokens);
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
+PyObject * runtime_detokenize(PyObject * self_object, PyObject * args) {
+    PyObject * token_ids_object = nullptr;
+    if (!PyArg_ParseTuple(args, "O:detokenize", &token_ids_object)) {
+        return nullptr;
+    }
+    Qwen35Runtime * runtime = require_runtime(reinterpret_cast<PyQwen35Runtime *>(self_object));
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    std::vector<std::int32_t> token_ids;
+    if (!parse_token_ids(token_ids_object, token_ids)) {
+        return nullptr;
+    }
+    try {
+        std::string text;
+        {
+            AllowThreads allow_threads;
+            text = runtime->detokenize(token_ids);
+        }
+        // A valid vocabulary token may represent only part of a multi-byte
+        // UTF-8 sequence.  Match tokenizer-style decoding by returning a
+        // replacement character for such an isolated token rather than
+        // rejecting an otherwise valid token ID list.
+        return PyUnicode_DecodeUTF8(text.data(), static_cast<Py_ssize_t>(text.size()), "replace");
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
+PyObject * runtime_eog_token_ids(PyObject * self_object, PyObject *) {
+    Qwen35Runtime * runtime = require_runtime(reinterpret_cast<PyQwen35Runtime *>(self_object));
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        std::vector<std::int32_t> token_ids;
+        {
+            AllowThreads allow_threads;
+            token_ids = runtime->eog_token_ids();
+        }
+        return int32_list(token_ids);
+    } catch (...) {
+        translate_cpp_exception();
+        return nullptr;
+    }
+}
+
+PyObject * runtime_vocabulary_size(PyObject * self_object, PyObject *) {
+    Qwen35Runtime * runtime = require_runtime(reinterpret_cast<PyQwen35Runtime *>(self_object));
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    try {
+        std::uint32_t vocabulary_size = 0;
+        {
+            AllowThreads allow_threads;
+            vocabulary_size = runtime->vocabulary_size();
+        }
+        return PyLong_FromUnsignedLong(vocabulary_size);
     } catch (...) {
         translate_cpp_exception();
         return nullptr;
@@ -920,6 +1043,14 @@ PyMethodDef runtime_methods[] = {
      "Run one native greedy target-model execution plan."},
     {"run_mtp", runtime_run_mtp, METH_VARARGS,
      "Run native MTP draft, target verification, acceptance and rollback."},
+    {"tokenize", runtime_tokenize, METH_VARARGS,
+     "Tokenize UTF-8 text using tokenizer metadata embedded in the GGUF."},
+    {"detokenize", runtime_detokenize, METH_VARARGS,
+     "Detokenize token IDs using tokenizer metadata embedded in the GGUF."},
+    {"eog_token_ids", runtime_eog_token_ids, METH_NOARGS,
+     "Return all end-of-generation token IDs declared by the GGUF."},
+    {"vocabulary_size", runtime_vocabulary_size, METH_NOARGS,
+     "Return the GGUF tokenizer vocabulary size."},
     {"release_blocks", cast_keyword_function(runtime_release_blocks),
      METH_VARARGS | METH_KEYWORDS,
      "Release nano-vLLM Paged-KV blocks and native sequence state."},

@@ -82,7 +82,7 @@ class LLMEngine:
             "postprocess_seconds": 0.0,
             "steps": 0,
         }
-        if config.tokenizer_backend == "llamacpp":
+        if config.tokenizer_backend in ("llamacpp", "native"):
             self.tokenizer = None
             config.eos_token_ids = self.model_runner.call("eog_token_ids")
         else:
@@ -154,14 +154,14 @@ class LLMEngine:
             return prompt
         started = perf_counter()
         try:
-            if self.config.tokenizer_backend == "llamacpp":
+            if self.config.tokenizer_backend in ("llamacpp", "native"):
                 return self.model_runner.call("tokenize", prompt)
             return self.tokenizer.encode(prompt)
         finally:
             self._runtime_metrics["tokenize_seconds"] += perf_counter() - started
 
     def _decode_tokens(self, token_ids: list[int]) -> str:
-        if self.config.tokenizer_backend == "llamacpp":
+        if self.config.tokenizer_backend in ("llamacpp", "native"):
             return self.model_runner.call("detokenize", token_ids)
         return self.tokenizer.decode(token_ids)
 

@@ -1,5 +1,7 @@
 #include "runtime/qwen35_runtime.h"
 
+#include "runtime/gguf_tokenizer.h"
+
 #include "models/qwen35/graph.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen35/weights.h"
@@ -421,6 +423,7 @@ struct Qwen35Runtime::Impl {
         if (options.enable_mtp && config.nextn_predict_layers != 1) {
             fail("MTP requested, but the GGUF does not contain exactly one bundled MTP layer");
         }
+        tokenizer = std::make_unique<GgufTokenizer>(options.model_path);
 
         paged_kv = std::make_unique<PagedKvCache>(  //5. 初始化PagedKvCache，主要是用于存储KV缓存
             primary_backend->get(),
@@ -454,6 +457,7 @@ struct Qwen35Runtime::Impl {
     Qwen35ExecutionProfile execution_profile;
     std::unique_ptr<GgufWeights> model_storage;
     std::unique_ptr<qwen35::Qwen35Weights> model;
+    std::unique_ptr<GgufTokenizer> tokenizer;
     std::unique_ptr<PagedKvCache> paged_kv;
     std::unique_ptr<RecurrentStateCache> recurrent;
     std::unique_ptr<GraphExecutor> executor;
@@ -2399,6 +2403,35 @@ Qwen35MemoryStats Qwen35Runtime::memory_stats() const {
         fail("runtime has been shut down");
     }
     return impl_->memory_stats();
+}
+
+std::vector<std::int32_t> Qwen35Runtime::tokenize(const std::string & text) const {
+    if (impl_ == nullptr || impl_->tokenizer == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->tokenizer->tokenize(text);
+}
+
+std::string Qwen35Runtime::detokenize(
+    const std::vector<std::int32_t> & token_ids) const {
+    if (impl_ == nullptr || impl_->tokenizer == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->tokenizer->detokenize(token_ids);
+}
+
+std::vector<std::int32_t> Qwen35Runtime::eog_token_ids() const {
+    if (impl_ == nullptr || impl_->tokenizer == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->tokenizer->eog_token_ids();
+}
+
+std::uint32_t Qwen35Runtime::vocabulary_size() const {
+    if (impl_ == nullptr || impl_->tokenizer == nullptr) {
+        fail("runtime has been shut down");
+    }
+    return impl_->tokenizer->vocabulary_size();
 }
 
 void Qwen35Runtime::shutdown() {

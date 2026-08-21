@@ -70,6 +70,28 @@ add_subdirectory(
     EXCLUDE_FROM_ALL
 )
 
+# Fixed upstream tokenizer subset.  This deliberately excludes llama_model,
+# llama_context and every llama.cpp compute path: llama_vocab only reads the
+# GGUF tokenizer metadata and performs tokenization/detokenization.
+add_library(nanovllm_upstream_tokenizer STATIC
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-arch.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-hparams.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-impl.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-mmap.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-model-loader.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/llama-vocab.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/unicode-data.cpp
+    ${NANOVLLM_LLAMA_CPP_DIR}/src/unicode.cpp
+    csrc/runtime/upstream_llama_split.cpp
+)
+set_target_properties(nanovllm_upstream_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(nanovllm_upstream_tokenizer PRIVATE cxx_std_17)
+target_include_directories(nanovllm_upstream_tokenizer PUBLIC
+    ${NANOVLLM_LLAMA_CPP_DIR}/include
+    ${NANOVLLM_LLAMA_CPP_DIR}/src
+)
+target_link_libraries(nanovllm_upstream_tokenizer PRIVATE ggml::ggml)
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
 Python3_add_library(_C MODULE WITH_SOABI
@@ -81,6 +103,7 @@ Python3_add_library(_C MODULE WITH_SOABI
     csrc/runtime/backend.cpp
     csrc/runtime/graph_executor.cpp
     csrc/runtime/gguf_loader.cpp
+    csrc/runtime/gguf_tokenizer.cpp
     csrc/runtime/paged_kv.cpp
     csrc/runtime/qwen35_model.cpp
     csrc/runtime/qwen35_runtime.cpp
@@ -89,7 +112,7 @@ Python3_add_library(_C MODULE WITH_SOABI
 target_compile_features(_C PRIVATE cxx_std_17)
 target_compile_options(_C PRIVATE -Wall -Wextra)
 target_include_directories(_C PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/csrc")
-target_link_libraries(_C PRIVATE ggml::ggml)
+target_link_libraries(_C PRIVATE ggml::ggml nanovllm_upstream_tokenizer)
 target_compile_definitions(_C PRIVATE
     NANOVLLM_GGML_COMMIT="${NANOVLLM_GGML_COMMIT}"
     NANOVLLM_GGML_BASE_COMMIT="${NANOVLLM_GGML_BASE_COMMIT}"

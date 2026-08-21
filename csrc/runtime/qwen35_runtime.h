@@ -148,6 +148,13 @@ public:
     Qwen35MtpProfileStats mtp_profile_stats() const;
     Qwen35ExecutionProfileStats execution_profile_stats() const;
     Qwen35MemoryStats memory_stats() const;
+    // Tokenization is intentionally backed by tokenizer metadata embedded in
+    // the same GGUF passed to the runtime.  Native callers therefore do not
+    // need a separate Hugging Face tokenizer checkout.
+    std::vector<std::int32_t> tokenize(const std::string & text) const;
+    std::string detokenize(const std::vector<std::int32_t> & token_ids) const;
+    std::vector<std::int32_t> eog_token_ids() const;
+    std::uint32_t vocabulary_size() const;
     void shutdown();
     bool is_shutdown() const noexcept;
 
