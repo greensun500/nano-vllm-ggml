@@ -39,6 +39,7 @@ class BenchResult:
     mtp_kv_update_tok_s: float
     enable_graph_reuse: bool
     native_vulkan_graph_reuse: bool
+    native_performance_profile: str
     native_attention_impl: str
     native_batched_recurrent_snapshots: bool
     native_mtp_prefill_fusion: bool
@@ -127,16 +128,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=int(os.environ.get("NANOVLLM_BENCH_REPEAT", "3")))
     parser.add_argument("--warmup", type=int, default=int(os.environ.get("NANOVLLM_BENCH_WARMUP", "1")))
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
-    parser.add_argument(
+    mtp_group = parser.add_mutually_exclusive_group()
+    mtp_default = (
+        os.environ.get("NANOVLLM_ENABLE_MTP", "").lower() == "1"
+        if "NANOVLLM_ENABLE_MTP" in os.environ
+        else None
+    )
+    mtp_group.add_argument(
         "--enable-mtp",
         action="store_true",
-        default=os.environ.get("NANOVLLM_ENABLE_MTP", "0") == "1",
+        dest="enable_mtp",
+        default=mtp_default,
         help="Enable built-in Qwen3.5 MTP greedy speculative decoding.",
+    )
+    mtp_group.add_argument(
+        "--disable-mtp",
+        action="store_false",
+        dest="enable_mtp",
+        help="Disable MTP even when the native device auto profile recommends it.",
     )
     parser.add_argument(
         "--mtp-max-draft-tokens",
         type=int,
-        default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "3")),
+        default=(
+            int(os.environ["NANOVLLM_MTP_MAX_DRAFT_TOKENS"])
+            if "NANOVLLM_MTP_MAX_DRAFT_TOKENS" in os.environ
+            else None
+        ),
     )
     parser.add_argument(
         "--no-graph-reuse",
@@ -144,11 +162,30 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("NANOVLLM_NO_GRAPH_REUSE", "0") == "1",
         help="Disable native persistent graph bucket reuse for A/B measurements.",
     )
-    parser.add_argument(
+    vulkan_reuse_group = parser.add_mutually_exclusive_group()
+    vulkan_reuse_default = (
+        os.environ.get("NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE", "").lower() == "1"
+        if "NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE" in os.environ
+        else None
+    )
+    vulkan_reuse_group.add_argument(
         "--native-vulkan-graph-reuse",
         action="store_true",
-        default=os.environ.get("NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE", "0") == "1",
-        help="Experimental: reuse stable single-sequence Vulkan decode/MTP graph buckets.",
+        dest="native_vulkan_graph_reuse",
+        default=vulkan_reuse_default,
+        help="Force Vulkan persistent graph reuse on for a supported device.",
+    )
+    vulkan_reuse_group.add_argument(
+        "--no-native-vulkan-graph-reuse",
+        action="store_false",
+        dest="native_vulkan_graph_reuse",
+        help="Force Vulkan persistent graph reuse off.",
+    )
+    parser.add_argument(
+        "--native-performance-profile",
+        choices=("auto", "baseline", "arm_a720_cpu", "mali_g720_vulkan", "nvidia_a100_vulkan"),
+        default=os.environ.get("NANOVLLM_NATIVE_PERFORMANCE_PROFILE", "auto"),
+        help="Device-tuned native defaults; auto selects only measured A720, Mali-G720, and A100 systems.",
     )
     parser.add_argument(
         "--native-attention-impl",
@@ -227,6 +264,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
             mtp_max_draft_tokens=args.mtp_max_draft_tokens,
             enable_graph_reuse=not args.no_graph_reuse,
             native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
+            native_performance_profile=args.native_performance_profile,
             native_attention_impl=args.native_attention_impl,
             native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
             native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
@@ -391,7 +429,7 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         raise SystemExit("CPU/Vulkan GGUF backends currently require --temperature 0.")
     if args.backend != "cuda" and args.use_prefix_cache:
         raise SystemExit("--use-prefix-cache is currently supported only by the CUDA backend.")
-    if args.backend == "cuda" and args.enable_mtp:
+    if args.backend == "cuda" and args.enable_mtp is True:
         raise SystemExit("--enable-mtp is supported only by CPU/Vulkan GGUF backends.")
 
     load_start = perf_counter()
@@ -507,8 +545,8 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         threads=args.threads,
         device_index=args.device_index,
         num_kvcache_blocks=actual_num_kvcache_blocks,
-        enable_mtp=args.enable_mtp,
-        mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+        enable_mtp=bool(llm.config.enable_mtp),
+        mtp_max_draft_tokens=int(llm.config.mtp_max_draft_tokens),
         mtp_drafted_tokens=drafted_tokens,
         mtp_accepted_tokens=accepted_tokens,
         mtp_verification_steps=int(
@@ -525,7 +563,10 @@ def benchmark(args: argparse.Namespace) -> BenchResult:
         mtp_verification_tok_s=verification_tokens / verification_s if verification_s > 0 else 0.0,
         mtp_kv_update_tok_s=kv_update_tokens / kv_update_s if kv_update_s > 0 else 0.0,
         enable_graph_reuse=not args.no_graph_reuse,
-        native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
+        native_vulkan_graph_reuse=bool(llm.config.native_vulkan_graph_reuse),
+        native_performance_profile=str(
+            getattr(llm.config, "native_effective_performance_profile", "baseline")
+        ),
         native_attention_impl=args.native_attention_impl,
         native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
         native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
@@ -579,6 +620,7 @@ def print_result(result: BenchResult) -> None:
     print(f"MTP:                {result.enable_mtp} (K={result.mtp_max_draft_tokens})")
     print(f"graph reuse:        {result.enable_graph_reuse}")
     print(f"Vulkan graph reuse: {result.native_vulkan_graph_reuse}")
+    print(f"native perf profile:{result.native_performance_profile}")
     print(f"attention impl:     {result.native_attention_impl}")
     print(f"batched snapshots:  {result.native_batched_recurrent_snapshots}")
     print(f"MTP prefill fusion: {result.native_mtp_prefill_fusion}")

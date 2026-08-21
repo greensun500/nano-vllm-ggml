@@ -1,4 +1,4 @@
-# nano-vLLM 当前版本修改说明：v3.92 Vulkan T>1 paged attention
+# nano-vLLM 当前版本修改说明：v3.94 measured native platform defaults
 
 ## 1. 版本定位
 
@@ -44,6 +44,9 @@
 - v3.92：显式 `native_attention_impl=paged` 解除 T=1 限制；Mali long-context
   MTP-off/on、`max_batch=64/768` 与 verification-KV fusion 的完整 greedy oracle
   已覆盖 multi-token prefill 和 verification
+- v3.93：`18a952a v3.93 add Mali MTP prefill strategies and MMQ experiment`
+- v3.94：按真实 Qwen3.5-2B-Q4_0 单 sequence benchmark，对已识别的平台解析
+  native 默认性能策略；未知设备保持保守基线
 - 当前未提交开发：新增默认关闭的 Mali-G720 MTP prefill 分块实验
   `native_mali_mtp_prefill_strategy={whole,chunked_legacy,chunked_staged}`；2026-08-21
   Mali-G720 real-model long-context oracle 已证实：`chunked_legacy` 与带两个
@@ -55,6 +58,22 @@
 - 模型：Qwen3.5-2B-Q4_0 GGUF，24 层 target（6 attention + 18 recurrent）和 bundled 单层 MTP
 - GGML：官方基线 `91c631b21d6e5d09e9c6659efdf6baeef5a44ddb`；当前 v3.86 子模块 gitlink 为 `0caa416ded34e746f308ef75ea1d9cb24e50f552`。CMake 还精确接受远程 source snapshot 的 `5ed33380b4679533243ca45e172804d5ddfe59ec` 与仅导出 `GGML_TYPE_CPU_REPACK` 的受审计兼容提交 `62d87d7e76b584ffdec4763919dfd6833a8a2f3e`。
 - Native 后端：`native_cpu`、`native_vulkan`、`native_cuda`；仍不创建 `llama_context`、不调用 `llama_decode`
+
+v3.94 不改模型图或 greedy target 语义。`enable_mtp`、MTP K 和 native Vulkan
+graph reuse 在 native CLI/API 中允许保持未指定状态；Runner 在创建 runtime 与
+Scheduler 前读取已编译 GGML 的设备枚举，仅对三类已有真实模型实测覆盖的平台解析：
+
+- `aarch64` 且 `/proc/cpuinfo` 识别为 Cortex-A720：MTP K=1；
+- Mali-G720 Vulkan：MTP-off、Vulkan graph reuse-off；
+- NVIDIA A100 Vulkan：MTP K=3、Vulkan graph reuse-on。
+
+任一显式 `--enable-mtp`/`--disable-mtp`、`--mtp-max-draft-tokens`、
+`--native-vulkan-graph-reuse`/`--no-native-vulkan-graph-reuse` 都优先于自动策略；
+未知设备与 `--native-performance-profile baseline` 均保持 MTP-off/reuse-off。这样不会把
+Mali 的 prefill 正确性保护误套用到 A100，也不会把 A100 的 graph reuse 收益默认扩展到
+未验证的 Vulkan driver。chat 的 attention 默认也与 Config/bench 一致为 `auto`；CPU
+自动回退 math，而 MTP graph 仍保留 runtime 的数值安全 attention 选择。bench JSON 会
+记录最终生效的 profile、MTP 和 Vulkan reuse，便于将实际运行配置与性能数据一起发布。
 
 v3.6 的主题不是改变 Qwen3.5 图结构，而是让 native runtime 更接近端侧可用形态：多轮对话不重复 prefill、调度不会无限压住 decode、GGML CUDA 可作为第三个 native 后端、MTP 的时间与常驻内存可以直接测量。`cd6ced0` 同时补回 attention 的 query gate，保证 Qwen3.5 attention 图与模型结构一致。
 

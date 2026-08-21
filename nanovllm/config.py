@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -27,10 +27,15 @@ class Config:
     eos_token_ids: tuple[int, ...] = ()
     enable_prefix_cache: bool | None = None
     enable_preemption: bool | None = None
-    enable_mtp: bool = False
-    mtp_max_draft_tokens: int = 3
+    # None means that the native runner may select a measured, device-specific
+    # default before it creates the scheduler.  True/False is always an
+    # explicit user override.
+    enable_mtp: bool | None = None
+    mtp_max_draft_tokens: int | None = None
     enable_graph_reuse: bool = True
-    native_vulkan_graph_reuse: bool = False
+    native_vulkan_graph_reuse: bool | None = None
+    native_performance_profile: str = "auto"
+    native_effective_performance_profile: str = field(init=False, default="unresolved")
     # Probe FlashAttention for ordinary native target execution. The runtime
     # deliberately retains math attention for MTP because draft/verification
     # shapes must stay numerically aligned for acceptance.
@@ -49,6 +54,16 @@ class Config:
 
     def __post_init__(self):
         is_native = self.backend in ("native_cpu", "native_vulkan", "native_cuda")
+        # Only native backends can identify the active GGML device at runner
+        # creation time.  Keep historical concrete defaults for every other
+        # backend rather than leaking the tri-state native configuration there.
+        if not is_native:
+            if self.enable_mtp is None:
+                self.enable_mtp = False
+            if self.mtp_max_draft_tokens is None:
+                self.mtp_max_draft_tokens = 3
+            if self.native_vulkan_graph_reuse is None:
+                self.native_vulkan_graph_reuse = False
         if self.max_num_batched_tokens is None:
             self.max_num_batched_tokens = 2048 if is_native else 16384
         if self.max_num_seqs is None:
@@ -104,6 +119,17 @@ class Config:
             "native_attention_impl must be 'math', 'auto', 'flash', or 'paged'",
         )
         _require(
+            self.native_performance_profile in (
+                "auto",
+                "baseline",
+                "arm_a720_cpu",
+                "mali_g720_vulkan",
+                "nvidia_a100_vulkan",
+            ),
+            "native_performance_profile must be 'auto', 'baseline', "
+            "'arm_a720_cpu', 'mali_g720_vulkan', or 'nvidia_a100_vulkan'",
+        )
+        _require(
             self.native_mali_mtp_prefill_strategy in (
                 "whole",
                 "chunked_legacy",
@@ -114,14 +140,14 @@ class Config:
         )
         if self.native_mtp_prefill_fusion:
             _require(is_native, "native_mtp_prefill_fusion requires a native backend")
-            _require(self.enable_mtp, "native_mtp_prefill_fusion requires enable_mtp=True")
+            _require(self.enable_mtp is True, "native_mtp_prefill_fusion requires enable_mtp=True")
         if self.native_mtp_verification_kv_fusion:
             _require(
                 is_native,
                 "native_mtp_verification_kv_fusion requires a native backend",
             )
             _require(
-                self.enable_mtp,
+                self.enable_mtp is True,
                 "native_mtp_verification_kv_fusion requires enable_mtp=True",
             )
         if self.native_mali_mtp_prefill_strategy != "whole":
@@ -130,10 +156,10 @@ class Config:
                 "chunked Mali MTP prefill requires backend='native_vulkan'",
             )
             _require(
-                self.enable_mtp,
+                self.enable_mtp is True,
                 "chunked Mali MTP prefill requires enable_mtp=True",
             )
-        if self.native_vulkan_graph_reuse:
+        if self.native_vulkan_graph_reuse is True:
             _require(
                 self.backend == "native_vulkan",
                 "native_vulkan_graph_reuse requires backend='native_vulkan'",
@@ -201,12 +227,16 @@ class Config:
             )
             _require(os.path.isfile(self.gguf_model), f"GGUF model does not exist: {self.gguf_model}")
             _require(self.tensor_parallel_size == 1, f"{process_label} is single-process")
-            if self.enable_mtp:
-                _require(self.mtp_max_draft_tokens > 0, "mtp_max_draft_tokens must be positive")
+            if self.enable_mtp is True:
                 _require(
-                    self.max_num_batched_tokens >= self.max_num_seqs * (self.mtp_max_draft_tokens + 1),
-                    "max_num_batched_tokens must fit one MTP verification batch",
+                    self.mtp_max_draft_tokens is None or self.mtp_max_draft_tokens > 0,
+                    "mtp_max_draft_tokens must be positive",
                 )
+                if self.mtp_max_draft_tokens is not None:
+                    _require(
+                        self.max_num_batched_tokens >= self.max_num_seqs * (self.mtp_max_draft_tokens + 1),
+                        "max_num_batched_tokens must fit one MTP verification batch",
+                    )
             if self.num_kvcache_blocks == -1:
                 self.num_kvcache_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
             _require(

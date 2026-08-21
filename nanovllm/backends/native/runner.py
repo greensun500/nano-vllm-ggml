@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from nanovllm.backends.base import BackendExecutionPlan, BackendExecutionResult
+from nanovllm.backends.native.performance import apply_native_performance_defaults
 from nanovllm.config import Config
 
 
@@ -27,6 +28,10 @@ class NativeRunner:
     """
 
     def __init__(self, config: Config):
+        # Resolve only unset tuning options.  This happens before the runtime
+        # and Scheduler allocate MTP state, so a profile cannot alter a live
+        # request or override an explicit caller choice.
+        apply_native_performance_defaults(config)
         self.config = config
         self.block_size = int(config.kvcache_block_size)
         self._seq_slots: dict[int, int] = {}

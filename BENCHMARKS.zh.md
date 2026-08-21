@@ -107,3 +107,15 @@
 - v3.93 MMQ 实验的 build、CTest、oracle 和 benchmark 日志保存在远端 `/home/cix/nano-vllm/v37-results/20260821-151334-mali-mmq/`。
 
 用于 GitHub README 的图表应优先选取上面三张“稳定路径”表，页脚注明“single sequence, Qwen3.5-2B-Q4_0, greedy, repeat=3/warmup=1”。A100 数值来自 `7ced3e6`，Arm/Mali 数值来自 v3.92；在将它们标为 v3.93 release performance 前，必须按完全相同命令在 `18a952a` 上复跑。v3.93 MMQ 数据则必须标为 experimental，不能与默认路径混合。
+
+## 当前默认性能策略
+
+从 v3.93 起，native CLI/API 未显式指定 MTP、MTP K 或 native Vulkan graph reuse 时，只对已有实测覆盖的设备启用下列自动策略；其余硬件维持保守基线（MTP-off、Vulkan reuse-off）。任何显式参数都会覆盖自动选择。
+
+| 识别的平台 | 默认 MTP | 默认 native Vulkan graph reuse | attention | 依据 |
+| --- | --- | --- | --- | --- |
+| Arm Cortex-A720 CPU（`aarch64` + `Cortex-A720`） | on，K=1 | 不适用 | auto（实际 math） | pp186/tg541 decode `27.90 -> 35.58 tok/s`，接受率 100% |
+| Mali-G720 Vulkan | off | off | auto | MTP 的 pure decode 虽略快，但 whole-prompt prefill 回退会降低端到端 generated 吞吐 |
+| NVIDIA A100 Vulkan | on，K=3 | on | auto | MTP K=3 + reuse 在已测 pp128/tg128 与 pp2048/tg512 分别达到 `1.85x`/`1.84x` decode |
+
+使用 `--disable-mtp`、`--no-native-vulkan-graph-reuse` 或 `--native-performance-profile baseline` 可锁定基线；`--enable-mtp`、`--mtp-max-draft-tokens K` 和 `--native-vulkan-graph-reuse` 可按需覆盖。benchmark JSON 会记录最终解析的 profile 和开关。
