@@ -87,7 +87,6 @@ struct GraphInputs {
     ggml_tensor * positions = nullptr;
     ggml_tensor * write_slot = nullptr;
     ggml_tensor * read_slots = nullptr;
-    ggml_tensor * context_len = nullptr;
     ggml_tensor * causal_mask = nullptr;
 };
 
@@ -104,14 +103,7 @@ GraphInputs make_inputs(
     inputs.write_slot = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     inputs.read_slots = ggml_new_tensor_1d(
         ctx, GGML_TYPE_I32, static_cast<std::int64_t>(n_kv));
-    if (attention_implementation == AttentionImplementation::Paged) {
-        inputs.context_len = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    }
-    // The direct paged kernel derives the causal prefix from [n_kv, n_tokens]
-    // and therefore deliberately has no mask operand.  Do not create an
-    // orphan graph input for it: GGML correctly leaves unused inputs
-    // unallocated, and a later upload would otherwise abort.
-    if (use_causal_mask && attention_implementation != AttentionImplementation::Paged) {
+    if (use_causal_mask) {
         inputs.causal_mask = ggml_new_tensor_2d(
             ctx,
             causal_mask_type(attention_implementation),
@@ -122,9 +114,6 @@ GraphInputs make_inputs(
     ggml_set_input(inputs.positions);
     ggml_set_input(inputs.write_slot);
     ggml_set_input(inputs.read_slots);
-    if (inputs.context_len != nullptr) {
-        ggml_set_input(inputs.context_len);
-    }
     if (inputs.causal_mask != nullptr) {
         ggml_set_input(inputs.causal_mask);
     }
@@ -132,7 +121,6 @@ GraphInputs make_inputs(
     set_name(inputs.positions, "qwen35.input.positions");
     set_name(inputs.write_slot, "qwen35.input.write_slot");
     set_name(inputs.read_slots, "qwen35.input.read_slots");
-    set_name(inputs.context_len, "qwen35.input.context_len");
     set_name(inputs.causal_mask, "qwen35.input.causal_mask");
     return inputs;
 }
@@ -142,7 +130,6 @@ struct ChunkGraphInputs {
     ggml_tensor * positions = nullptr;
     ggml_tensor * write_slots = nullptr;
     ggml_tensor * read_slots = nullptr;
-    ggml_tensor * context_len = nullptr;
     ggml_tensor * causal_mask = nullptr;
 };
 
@@ -163,13 +150,7 @@ ChunkGraphInputs make_chunk_inputs(
     inputs.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count * 4);
     inputs.write_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_count);
     inputs.read_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_count);
-    if (attention_implementation == AttentionImplementation::Paged) {
-        inputs.context_len = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    }
-    // Paged attention implements causal visibility from token indices inside
-    // the kernel.  Other implementations consume this input explicitly.
-    if ((n_tokens > 1 || force_causal_mask) &&
-        attention_implementation != AttentionImplementation::Paged) {
+    if (n_tokens > 1 || force_causal_mask) {
         inputs.causal_mask = ggml_new_tensor_2d(
             ctx, causal_mask_type(attention_implementation), kv_count, token_count);
     }
@@ -178,9 +159,6 @@ ChunkGraphInputs make_chunk_inputs(
     ggml_set_input(inputs.positions);
     ggml_set_input(inputs.write_slots);
     ggml_set_input(inputs.read_slots);
-    if (inputs.context_len != nullptr) {
-        ggml_set_input(inputs.context_len);
-    }
     if (inputs.causal_mask != nullptr) {
         ggml_set_input(inputs.causal_mask);
     }
@@ -188,7 +166,6 @@ ChunkGraphInputs make_chunk_inputs(
     set_name(inputs.positions, "qwen35.target_chunk.positions");
     set_name(inputs.write_slots, "qwen35.target_chunk.write_slots");
     set_name(inputs.read_slots, "qwen35.target_chunk.read_slots");
-    set_name(inputs.context_len, "qwen35.target_chunk.context_len");
     set_name(inputs.causal_mask, "qwen35.target_chunk.causal_mask");
     return inputs;
 }
@@ -306,23 +283,13 @@ ggml_tensor * build_attention(
         {static_cast<std::int64_t>(n_kv), 1},
         attention_implementation,
         prefix);
+    // SET_ROWS returns a view of the persistent destination and establishes an
+    // explicit dependency for the subsequent GET_ROWS. The current token is
+    // therefore visible to its own causal attention without relying on graph
+    // insertion order as an implicit memory barrier.
+    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
     ggml_tensor * attended = nullptr;
-    if (attention_implementation == AttentionImplementation::Paged) {
-        // Keep SET_ROWS as the producer of both persistent cache inputs: the
-        // direct kernel sees this token's freshly written K/V row without a
-        // materialized GET_ROWS gather.
-        attended = ggml_paged_attn(
-            ctx, query_gate.query, stored.key, stored.value,
-            inputs.read_slots, inputs.context_len, scale);
-        set_name(attended, prefix + ".paged_attention");
-        add_critical(result, attended);
-    } else {
-        // SET_ROWS returns a view of the persistent destination and establishes an
-        // explicit dependency for the subsequent GET_ROWS. The current token is
-        // therefore visible to its own causal attention without relying on graph
-        // insertion order as an implicit memory barrier.
-        ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
-        ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
         gathered_key = ggml_reshape_3d(
             ctx,
             gathered_key,
@@ -374,7 +341,6 @@ ggml_tensor * build_attention(
                 config.attention_value_length * config.attention_head_count),
             1);
         }
-    }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
         ctx, layer.attn_output, attended, (prefix + ".output").c_str());
@@ -444,16 +410,9 @@ ggml_tensor * build_chunk_attention(
 
     const float scale = 1.0f /
         std::sqrt(static_cast<float>(config.attention_key_length));
+    ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
+    ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
     ggml_tensor * attended = nullptr;
-    if (attention_implementation == AttentionImplementation::Paged) {
-        attended = ggml_paged_attn(
-            ctx, query_gate.query, stored.key, stored.value,
-            inputs.read_slots, inputs.context_len, scale);
-        set_name(attended, prefix + ".paged_attention");
-        add_critical(result, attended);
-    } else {
-        ggml_tensor * gathered_key = ggml_get_rows(ctx, stored.key, inputs.read_slots);
-        ggml_tensor * gathered_value = ggml_get_rows(ctx, stored.value, inputs.read_slots);
         gathered_key = ggml_reshape_3d(
             ctx,
             gathered_key,
@@ -510,7 +469,6 @@ ggml_tensor * build_chunk_attention(
                 config.attention_value_length * config.attention_head_count),
             token_count);
         }
-    }
     attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, query_gate.gate));
     ggml_tensor * output = ops::linear(
         ctx, layer.attn_output, attended, (prefix + ".output").c_str());
@@ -728,26 +686,9 @@ ggml_tensor * build_chunk_recurrent(
     require(
         persistent.convolution_outputs.size() == snapshot_count,
         prefix + " convolution snapshot destination count differs from the graph request");
-    const bool batched_delta_snapshots = persistent.delta_snapshots_output != nullptr;
-    if (batched_delta_snapshots) {
-        require(
-            persistent.delta_outputs.empty(),
-            prefix + " cannot combine batched and per-plane delta destinations");
-        require_shape(
-            persistent.delta_snapshots_output,
-            {state_width * state_width * value_heads, 1, snapshots, 1},
-            (prefix + ".delta_snapshot_destination").c_str());
-        require(
-            persistent.delta_snapshots_output->type == GGML_TYPE_F32,
-            prefix + " delta snapshot destination must be F32");
-        require(
-            ggml_is_contiguous(persistent.delta_snapshots_output),
-            prefix + " delta snapshot destination must be contiguous");
-    } else {
-        require(
-            persistent.delta_outputs.size() == snapshot_count,
-            prefix + " delta snapshot destination count differs from the graph request");
-    }
+    require(
+        persistent.delta_outputs.size() == snapshot_count,
+        prefix + " delta snapshot destination count differs from the graph request");
     for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
         const std::string snapshot_prefix =
             prefix + ".snapshot." + std::to_string(snapshot);
@@ -758,15 +699,13 @@ ggml_tensor * build_chunk_recurrent(
         require(
             persistent.convolution_outputs[snapshot]->type == GGML_TYPE_F32,
             snapshot_prefix + " convolution destination must be F32");
-        if (!batched_delta_snapshots) {
-            require_shape(
-                persistent.delta_outputs[snapshot],
-                {state_width, state_width, value_heads, 1},
-                (snapshot_prefix + ".delta_destination").c_str());
-            require(
-                persistent.delta_outputs[snapshot]->type == GGML_TYPE_F32,
-                snapshot_prefix + " delta destination must be F32");
-        }
+        require_shape(
+            persistent.delta_outputs[snapshot],
+            {state_width, state_width, value_heads, 1},
+            (snapshot_prefix + ".delta_destination").c_str());
+        require(
+            persistent.delta_outputs[snapshot]->type == GGML_TYPE_F32,
+            snapshot_prefix + " delta destination must be F32");
     }
 //开始手写graph
 //按照线性注意力，第一步是把输入投影到qkv空间，形成一个qkv_like矩阵
@@ -887,32 +826,7 @@ ggml_tensor * build_chunk_recurrent(
         ggml_row_size(gdn->type, output_elements_per_token),
         ggml_row_size(gdn->type, attention_output_elements),
         0);
-    if (batched_delta_snapshots) {
-        // The GDN snapshot tail is newest-first and contiguous. Preserve that
-        // order in the state cache with one copy; CUDA additionally recognizes
-        // this exact GDN -> CPY layout and can write the cache directly.
-        ggml_tensor * new_deltas = ggml_view_4d(
-            ctx,
-            gdn,
-            state_elements,
-            1,
-            snapshots,
-            1,
-            ggml_row_size(gdn->type, state_elements),
-            ggml_row_size(gdn->type, state_elements),
-            ggml_row_size(
-                gdn->type,
-                state_elements * static_cast<std::int64_t>(snapshot_count)),
-            static_cast<std::size_t>(attention_output_elements) * ggml_element_size(gdn));
-        require(
-            ggml_is_contiguous(new_deltas),
-            prefix + " GDN delta snapshot source must be contiguous");
-        ggml_tensor * update = ggml_cpy(
-            ctx, new_deltas, persistent.delta_snapshots_output);
-        set_name(update, prefix + ".delta_state_update_batched");
-        ggml_build_forward_expand(graph, update);
-    } else {
-        for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
+    for (std::size_t snapshot = 0; snapshot < snapshot_count; ++snapshot) {
             const std::int64_t state_offset = attention_output_elements +
                 static_cast<std::int64_t>(snapshot) * state_elements;
             ggml_tensor * new_delta = ggml_view_4d(
@@ -932,7 +846,6 @@ ggml_tensor * build_chunk_recurrent(
                 update,
                 prefix + ".delta_state_update." + std::to_string(snapshot));
             ggml_build_forward_expand(graph, update);
-        }
     }
 
     z = ggml_reshape_4d(
@@ -1122,7 +1035,13 @@ void finalize_chunk_outputs(
         "target chunk hidden tensor must be contiguous");
     result.hidden = hidden;
     set_name(result.hidden, "qwen35.target_chunk.hidden");
-    if (retain_hidden) {
+    // Keep the full target hidden live through the final-token vocabulary
+    // projection.  On Vulkan, a Last-mode view otherwise permits the planner
+    // to recycle the parent hidden buffer too early for a multi-token graph.
+    // This is a graph-liveness pin only: callers still copy it back to host
+    // solely when retain_hidden is requested (MTP prefill/verification).
+    if (retain_hidden ||
+        (output_mode == TargetChunkOutputMode::Last && n_tokens > 1)) {
         ggml_set_output(result.hidden);
     }
 
@@ -1154,170 +1073,6 @@ void finalize_chunk_outputs(
     ggml_build_forward_expand(result.graph, result.greedy_tokens);
 }
 
-void append_mtp_prefill_kv_update(
-    ggml_context * ctx,
-    const Qwen35Weights & weights,
-    TargetChunkGraph & result,
-    ggml_tensor * target_hidden,
-    const AttentionCacheView & cache,
-    const ChunkGraphInputs & inputs,
-    std::size_t n_tokens) {
-    const Config & config = weights.config();
-    require(config.nextn_predict_layers == 1, "MTP prefill fusion requires one MTP layer");
-    const LayerWeights & layer = weights.layer(config.main_layers);
-    require(layer.is_mtp(), "last Qwen3.5 layer is not the bundled MTP block");
-
-    const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
-    require_shape(
-        target_hidden,
-        {static_cast<std::int64_t>(config.embedding_length), token_count},
-        "MTP prefill fusion target hidden");
-    require(
-        ggml_is_contiguous(target_hidden),
-        "MTP prefill fusion target hidden must be contiguous");
-
-    result.mtp_previous_hidden = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, config.embedding_length, 1);
-    ggml_set_input(result.mtp_previous_hidden);
-    set_name(result.mtp_previous_hidden, "qwen35.target_chunk.mtp_previous_hidden");
-
-    ggml_tensor * mtp_hidden = result.mtp_previous_hidden;
-    if (n_tokens > 1) {
-        ggml_tensor * target_prefix = ggml_view_2d(
-            ctx,
-            target_hidden,
-            target_hidden->ne[0],
-            token_count - 1,
-            target_hidden->nb[1],
-            0);
-        set_name(target_prefix, "qwen35.target_chunk.mtp_hidden_prefix");
-        mtp_hidden = ggml_concat(ctx, result.mtp_previous_hidden, target_prefix, 1);
-        set_name(mtp_hidden, "qwen35.target_chunk.mtp_hidden_shifted");
-    }
-    result.mtp_last_hidden = ggml_view_2d(
-        ctx,
-        target_hidden,
-        target_hidden->ne[0],
-        1,
-        target_hidden->nb[1],
-        static_cast<std::size_t>(token_count - 1) * target_hidden->nb[1]);
-    ggml_set_output(result.mtp_last_hidden);
-    set_name(result.mtp_last_hidden, "qwen35.target_chunk.mtp_last_hidden");
-
-    ggml_tensor * token_embedding = ggml_get_rows(
-        ctx, layer.mtp_token_embd, inputs.tokens);
-    ggml_tensor * current = ops::mtp_merge_embedding_and_hidden(
-        ctx,
-        token_embedding,
-        mtp_hidden,
-        layer.nextn_enorm,
-        layer.nextn_hnorm,
-        layer.nextn_eh_proj,
-        config);
-    current = ops::rms_norm(
-        ctx,
-        current,
-        layer.attn_norm,
-        config.attention_layer_norm_rms_epsilon,
-        "qwen35.target_chunk.mtp_attention_norm");
-
-    const StoredKeyValue stored = store_attention_key_value(
-        ctx,
-        current,
-        layer,
-        cache,
-        inputs.positions,
-        inputs.write_slots,
-        config,
-        token_count,
-        "qwen35.target_chunk.mtp_kv_update");
-    add_critical(result, stored.key);
-    add_critical(result, stored.value);
-    ggml_build_forward_expand(result.graph, result.mtp_last_hidden);
-    ggml_build_forward_expand(result.graph, stored.key);
-    ggml_build_forward_expand(result.graph, stored.value);
-}
-
-void append_mtp_verification_kv_update(
-    ggml_context * ctx,
-    const Qwen35Weights & weights,
-    TargetChunkGraph & result,
-    ggml_tensor * target_hidden,
-    const AttentionCacheView & cache,
-    std::size_t n_tokens) {
-    require(n_tokens > 1, "MTP verification fusion requires at least two target tokens");
-    const Config & config = weights.config();
-    require(config.nextn_predict_layers == 1, "MTP verification fusion requires one MTP layer");
-    const LayerWeights & layer = weights.layer(config.main_layers);
-    require(layer.is_mtp(), "last Qwen3.5 layer is not the bundled MTP block");
-
-    const std::int64_t suffix_count = static_cast<std::int64_t>(n_tokens - 1);
-    require_shape(
-        target_hidden,
-        {static_cast<std::int64_t>(config.embedding_length),
-         static_cast<std::int64_t>(n_tokens)},
-        "MTP verification fusion target hidden");
-    require(
-        ggml_is_contiguous(target_hidden),
-        "MTP verification fusion target hidden must be contiguous");
-
-    result.mtp_verification_tokens = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_I32, suffix_count);
-    result.mtp_verification_positions = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_I32, suffix_count * 4);
-    result.mtp_verification_write_slots = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_I32, suffix_count);
-    ggml_set_input(result.mtp_verification_tokens);
-    ggml_set_input(result.mtp_verification_positions);
-    ggml_set_input(result.mtp_verification_write_slots);
-    set_name(result.mtp_verification_tokens, "qwen35.target_chunk.mtp_verification_tokens");
-    set_name(result.mtp_verification_positions, "qwen35.target_chunk.mtp_verification_positions");
-    set_name(result.mtp_verification_write_slots, "qwen35.target_chunk.mtp_verification_write_slots");
-
-    // target_hidden[i] is the target state conditioned on verification input
-    // i.  It updates the MTP cache row for verification token i + 1, hence the
-    // first T - 1 hidden columns pair with a separately supplied token suffix.
-    ggml_tensor * hidden_prefix = ggml_view_2d(
-        ctx,
-        target_hidden,
-        target_hidden->ne[0],
-        suffix_count,
-        target_hidden->nb[1],
-        0);
-    set_name(hidden_prefix, "qwen35.target_chunk.mtp_verification_hidden_prefix");
-    ggml_tensor * token_embedding = ggml_get_rows(
-        ctx, layer.mtp_token_embd, result.mtp_verification_tokens);
-    ggml_tensor * current = ops::mtp_merge_embedding_and_hidden(
-        ctx,
-        token_embedding,
-        hidden_prefix,
-        layer.nextn_enorm,
-        layer.nextn_hnorm,
-        layer.nextn_eh_proj,
-        config);
-    current = ops::rms_norm(
-        ctx,
-        current,
-        layer.attn_norm,
-        config.attention_layer_norm_rms_epsilon,
-        "qwen35.target_chunk.mtp_verification_attention_norm");
-
-    const StoredKeyValue stored = store_attention_key_value(
-        ctx,
-        current,
-        layer,
-        cache,
-        result.mtp_verification_positions,
-        result.mtp_verification_write_slots,
-        config,
-        suffix_count,
-        "qwen35.target_chunk.mtp_verification_kv_update");
-    add_critical(result, stored.key);
-    add_critical(result, stored.value);
-    ggml_build_forward_expand(result.graph, stored.key);
-    ggml_build_forward_expand(result.graph, stored.value);
-}
-
 }  // namespace
 
 TokenGraph build_target_token_graph(
@@ -1346,7 +1101,6 @@ TokenGraph build_target_token_graph(
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
     result.read_slots = inputs.read_slots;
-    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
 
     ggml_tensor * current = ggml_get_rows(ctx, weights.global().token_embd, inputs.token);
@@ -1416,9 +1170,7 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     TargetChunkOutputMode output_mode,
     bool retain_hidden,
     bool force_causal_mask,
-    AttentionImplementation attention_implementation,
-    const AttentionCacheView * mtp_prefill_cache,
-    const AttentionCacheView * mtp_verification_cache) {
+    AttentionImplementation attention_implementation) {
 
     //执行校验，保证参数有效，随时准备抛出异常
     require(ctx != nullptr, "target chunk GGML context is null");
@@ -1432,13 +1184,6 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
             output_mode == TargetChunkOutputMode::Last ||
             output_mode == TargetChunkOutputMode::All,
         "target chunk output mode is invalid");
-    require(
-        mtp_prefill_cache == nullptr || mtp_verification_cache == nullptr,
-        "target chunk cannot fuse MTP prefill and verification KV updates together");
-    require(
-        mtp_verification_cache == nullptr || n_tokens > 1,
-        "MTP verification KV fusion requires at least two target tokens");
-
     const Config & config = weights.config();   //模型配置
     require(config.main_layers == 24, "target chunk graph requires 24 decoder layers");
     require(
@@ -1456,7 +1201,6 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
     result.positions = inputs.positions;
     result.write_slots = inputs.write_slots;
     result.read_slots = inputs.read_slots;
-    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
 
     ggml_tensor * current = ggml_get_rows(
@@ -1511,10 +1255,9 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
         "target chunk graph has an unused attention cache record");
 
     // A non-final MTP-off prefill slice only needs its persistent KV/recurrent
-    // side effects.  Its final hidden, output norm and 248K-row vocabulary head
-    // have no consumer.  MTP maintenance still requests the normalized hidden.
-    if (output_mode != TargetChunkOutputMode::None || retain_hidden ||
-        mtp_prefill_cache != nullptr || mtp_verification_cache != nullptr) {
+    // side effects. Its final hidden, output norm and 248K-row vocabulary head
+    // have no consumer.
+    if (output_mode != TargetChunkOutputMode::None || retain_hidden) {
         current = ops::rms_norm(
             ctx,
             current,
@@ -1530,25 +1273,6 @@ TargetChunkGraph build_target_chunk_graph(  //搭建计算图
                 n_tokens,
                 output_mode,
                 retain_hidden);
-        }
-        if (mtp_prefill_cache != nullptr) {
-            append_mtp_prefill_kv_update(
-                ctx,
-                weights,
-                result,
-                current,
-                *mtp_prefill_cache,
-                inputs,
-                n_tokens);
-        }
-        if (mtp_verification_cache != nullptr) {
-            append_mtp_verification_kv_update(
-                ctx,
-                weights,
-                result,
-                current,
-                *mtp_verification_cache,
-                n_tokens);
         }
     }
     return result;
@@ -1576,7 +1300,6 @@ TokenGraph build_mtp_token_graph(
     result.positions = inputs.positions;
     result.write_slot = inputs.write_slot;
     result.read_slots = inputs.read_slots;
-    result.context_len = inputs.context_len;
     result.causal_mask = inputs.causal_mask;
     result.hidden_input = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, config.embedding_length, 1);

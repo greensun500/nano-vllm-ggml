@@ -8,20 +8,6 @@ include(CTest)
 
 option(NANOVLLM_NATIVE_VULKAN "Build the native runtime with the GGML Vulkan backend" OFF)
 option(NANOVLLM_NATIVE_CUDA "Build the native runtime with the GGML CUDA backend" OFF)
-option(
-    NANOVLLM_NATIVE_CPU_REPACK
-    "Experimental: enable GGML CPU-repacked Q4_0/Q6_K weight buffers"
-    OFF
-)
-option(
-    NANOVLLM_NATIVE_CUDA_GRAPHS
-    "Enable GGML CUDA Graph capture/replay for stable native CUDA graphs"
-    OFF
-)
-if(NANOVLLM_NATIVE_CUDA_GRAPHS AND NOT NANOVLLM_NATIVE_CUDA)
-    message(FATAL_ERROR
-        "NANOVLLM_NATIVE_CUDA_GRAPHS requires NANOVLLM_NATIVE_CUDA=ON")
-endif()
 set(
     NANOVLLM_LLAMA_CPP_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp"
@@ -53,15 +39,12 @@ set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_CPU ON CACHE BOOL "" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
-# CPU_REPACK changes the physical tensor layout.  Keep it opt-in until every
-# target ISA/quantization combination passes the native greedy oracle.
-set(GGML_CPU_REPACK ${NANOVLLM_NATIVE_CPU_REPACK} CACHE BOOL "" FORCE)
+set(GGML_CPU_REPACK OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${NANOVLLM_NATIVE_CUDA} CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${NANOVLLM_NATIVE_VULKAN} CACHE BOOL "" FORCE)
-set(NANOVLLM_NATIVE_CUDA_GRAPHS_EFFECTIVE OFF)
-if(NANOVLLM_NATIVE_CUDA AND NANOVLLM_NATIVE_CUDA_GRAPHS)
-    set(NANOVLLM_NATIVE_CUDA_GRAPHS_EFFECTIVE ON)
-endif()
+# Persistent graph metadata is part of the native CUDA runtime contract.
+# CUDA builds therefore always enable GGML CUDA Graph capture/replay.
+set(NANOVLLM_NATIVE_CUDA_GRAPHS_EFFECTIVE ${NANOVLLM_NATIVE_CUDA})
 set(GGML_CUDA_GRAPHS ${NANOVLLM_NATIVE_CUDA_GRAPHS_EFFECTIVE} CACHE BOOL "" FORCE)
 
 add_subdirectory(

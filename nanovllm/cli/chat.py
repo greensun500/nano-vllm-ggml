@@ -47,9 +47,30 @@ def clean_response(text: str, template: str) -> str:
     return text.strip()
 
 
+def format_turn_metrics(metrics: dict[str, int | float]) -> str:
+    def stage(label: str, token_key: str, second_key: str) -> str:
+        tokens = int(metrics.get(token_key, 0))
+        seconds = float(metrics.get(second_key, 0.0))
+        if tokens <= 0 or seconds <= 0.0:
+            return f"{label}: n/a"
+        return f"{label}: {tokens / seconds:.2f} tok/s ({tokens} tok, {seconds * 1000.0:.1f} ms)"
+
+    generated = int(metrics.get("generated_tokens", 0))
+    prefill_generated = int(metrics.get("prefill_generated_tokens", 0))
+    decode_generated = int(metrics.get("decode_tokens", 0))
+    generated_summary = f"generated: {generated} tok"
+    if generated == prefill_generated + decode_generated:
+        generated_summary += f" (prefill {prefill_generated} + decode {decode_generated})"
+    return "[timing] " + " | ".join((
+        stage("prefill", "prefill_tokens", "prefill_seconds"),
+        stage("decode", "decode_tokens", "decode_seconds"),
+        generated_summary,
+    ))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive nano-vLLM chat CLI for native CPU, Vulkan, or CUDA backends.",
+        description="Interactive nanovllm-ggml chat CLI for native CPU, Vulkan, or CUDA backends.",
     )
     parser.add_argument(
         "model",
@@ -68,18 +89,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("NANOVLLM_GGUF_MODEL"),
         help="GGUF model path. Defaults to the positional model path.",
     )
-    parser.add_argument(
-        "--tokenizer",
-        default=os.environ.get("NANOVLLM_TOKENIZER"),
-        help="Optional local Hugging Face tokenizer directory; native defaults to tokenizer metadata in GGUF.",
-    )
-    parser.add_argument(
-        "--library-path",
-        default=os.environ.get("NANOVLLM_LLAMA_BACKEND_LIB"),
-        help="Path to libnanollama_backend.so (legacy staged llama.cpp backend only).",
-    )
     parser.add_argument("--max-model-len", type=int, default=int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "2048")))
-    parser.add_argument("--max-num-seqs", type=int, default=int(os.environ.get("NANOVLLM_MAX_NUM_SEQS", "1")))
     parser.add_argument(
         "--num-kvcache-blocks",
         type=int,
@@ -91,30 +101,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("NANOVLLM_MAX_NUM_BATCHED_TOKENS", "2048")),
     )
-    parser.add_argument(
-        "--ubatch-size",
-        type=int,
-        default=int(os.environ.get("NANOVLLM_UBATCH_SIZE", "0")),
-        help="llama.cpp physical ubatch size. 0 uses backend defaults; Vulkan defaults to min(batch, 512).",
-    )
     parser.add_argument("--threads", type=int, default=int(os.environ.get("NANOVLLM_THREADS", "8")))
     parser.add_argument("--device-index", type=int, default=int(os.environ.get("NANOVLLM_DEVICE_INDEX", "0")))
-    parser.add_argument(
-        "--threads-batch",
-        type=int,
-        default=int(os.environ.get("NANOVLLM_THREADS_BATCH", "8")),
-    )
-    parser.add_argument(
-        "--gpu-layers",
-        type=int,
-        default=int(os.environ.get("NANOVLLM_GPU_LAYERS", "-1")),
-        help="Number of layers to offload with Vulkan. -1 means all supported layers.",
-    )
     mtp_group = parser.add_mutually_exclusive_group()
     mtp_default = (
         os.environ.get("NANOVLLM_ENABLE_MTP", "").lower() == "1"
         if "NANOVLLM_ENABLE_MTP" in os.environ
-        else None
+        else False
     )
     mtp_group.add_argument(
         "--enable-mtp",
@@ -132,75 +125,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mtp-max-draft-tokens",
         type=int,
-        default=(
-            int(os.environ["NANOVLLM_MTP_MAX_DRAFT_TOKENS"])
-            if "NANOVLLM_MTP_MAX_DRAFT_TOKENS" in os.environ
-            else None
-        ),
+        default=int(os.environ.get("NANOVLLM_MTP_MAX_DRAFT_TOKENS", "1")),
     )
     parser.add_argument(
-        "--no-graph-reuse",
+        "--mali-experimental-graph-reuse",
         action="store_true",
-        default=os.environ.get("NANOVLLM_NO_GRAPH_REUSE", "0") == "1",
-        help="Disable native persistent graph bucket reuse.",
-    )
-    vulkan_reuse_group = parser.add_mutually_exclusive_group()
-    vulkan_reuse_default = (
-        os.environ.get("NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE", "").lower() == "1"
-        if "NANOVLLM_NATIVE_VULKAN_GRAPH_REUSE" in os.environ
-        else None
-    )
-    vulkan_reuse_group.add_argument(
-        "--native-vulkan-graph-reuse",
-        action="store_true",
-        dest="native_vulkan_graph_reuse",
-        default=vulkan_reuse_default,
-        help="Force Vulkan persistent graph reuse on for a supported device.",
-    )
-    vulkan_reuse_group.add_argument(
-        "--no-native-vulkan-graph-reuse",
-        action="store_false",
-        dest="native_vulkan_graph_reuse",
-        help="Force Vulkan persistent graph reuse off.",
-    )
-    parser.add_argument(
-        "--native-performance-profile",
-        choices=("auto", "baseline", "arm_a720_cpu", "mali_g720_vulkan", "nvidia_a100_vulkan"),
-        default=os.environ.get("NANOVLLM_NATIVE_PERFORMANCE_PROFILE", "auto"),
-        help="Device-tuned native defaults; auto selects only measured A720, Mali-G720, and A100 systems.",
-    )
-    parser.add_argument(
-        "--native-attention-impl",
-        choices=("math", "auto", "flash", "paged"),
-        default=os.environ.get("NANOVLLM_NATIVE_ATTENTION_IMPL", "auto"),
-        help="Native attention implementation. 'paged' is an explicit Vulkan direct-KV experiment; auto remains unchanged.",
-    )
-    parser.add_argument(
-        "--native-batched-recurrent-snapshots",
-        action="store_true",
-        default=os.environ.get("NANOVLLM_NATIVE_BATCHED_RECURRENT_SNAPSHOTS", "0") == "1",
-        help="Write contiguous recurrent delta snapshots with one GGML copy.",
-    )
-    parser.add_argument(
-        "--native-mtp-prefill-fusion",
-        action="store_true",
-        default=os.environ.get("NANOVLLM_NATIVE_MTP_PREFILL_FUSION", "0") == "1",
-        help="Fuse native MTP prefill hidden-to-KV maintenance into the target graph.",
-    )
-    parser.add_argument(
-        "--native-mtp-verification-kv-fusion",
-        action="store_true",
-        default=os.environ.get("NANOVLLM_NATIVE_MTP_VERIFICATION_KV_FUSION", "0") == "1",
-        help="Fuse target-conditioned MTP KV maintenance into each verification graph.",
-    )
-    parser.add_argument(
-        "--native-mali-mtp-prefill-strategy",
-        choices=("whole", "chunked_legacy", "chunked_staged"),
-        default=os.environ.get("NANOVLLM_NATIVE_MALI_MTP_PREFILL_STRATEGY", "whole"),
-        help=(
-            "Mali-G720-only MTP prefill experiment; 'whole' preserves the "
-            "current correctness workaround."
-        ),
+        default=os.environ.get("NANOVLLM_MALI_EXPERIMENTAL_GRAPH_REUSE", "0") == "1",
+        help="Experimental: enable persistent graph reuse on Mali Vulkan.",
     )
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("NANOVLLM_TEMPERATURE", "0.0")))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("NANOVLLM_MAX_TOKENS", "256")))
@@ -223,89 +154,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tqdm",
         action="store_true",
-        help="Show nano-vLLM generation progress for each turn.",
+        help="Show nanovllm-ggml generation progress for each turn.",
     )
     return parser.parse_args()
 
 
 def build_llm(args: argparse.Namespace) -> LLM:
-    model = args.model or (
-        os.environ.get("NANOVLLM_MODEL")
-        if args.backend == "cuda"
-        else args.gguf_model
-    )
+    model = args.model or args.gguf_model
     gguf_model = args.gguf_model or model
-    if args.backend.startswith("native"):
-        if not gguf_model:
-            raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
-        return LLM(
-            gguf_model,
-            backend=args.backend,
-            model_format="gguf",
-            gguf_model=gguf_model,
-            tokenizer=args.tokenizer,
-            tokenizer_backend="hf" if args.tokenizer else "native",
-            max_model_len=args.max_model_len,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            max_num_seqs=args.max_num_seqs,
-            num_kvcache_blocks=args.num_kvcache_blocks,
-            enable_mtp=args.enable_mtp,
-            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
-            enable_graph_reuse=not args.no_graph_reuse,
-            native_vulkan_graph_reuse=args.native_vulkan_graph_reuse,
-            native_performance_profile=args.native_performance_profile,
-            native_attention_impl=args.native_attention_impl,
-            native_batched_recurrent_snapshots=args.native_batched_recurrent_snapshots,
-            native_mtp_prefill_fusion=args.native_mtp_prefill_fusion,
-            native_mtp_verification_kv_fusion=args.native_mtp_verification_kv_fusion,
-            native_mali_mtp_prefill_strategy=args.native_mali_mtp_prefill_strategy,
-            device_config={
-                "n_threads": args.threads,
-                "device_index": args.device_index,
-            },
-        )
-    if args.backend.startswith("llamacpp"):
-        if not gguf_model:
-            raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
-        return LLM(
-            gguf_model,
-            backend=args.backend,
-            model_format="gguf",
-            gguf_model=gguf_model,
-            tokenizer_backend="llamacpp",
-            max_model_len=args.max_model_len,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            max_num_seqs=args.max_num_seqs,
-            num_kvcache_blocks=args.num_kvcache_blocks,
-            enable_mtp=args.enable_mtp,
-            mtp_max_draft_tokens=args.mtp_max_draft_tokens,
-            device_config={
-                "library_path": args.library_path,
-                "n_ubatch": args.ubatch_size or None,
-                "n_threads": args.threads,
-                "n_threads_batch": args.threads_batch,
-                "n_gpu_layers": 0 if args.backend == "llamacpp_cpu" else args.gpu_layers,
-            },
-        )
-
-    if not model:
-        raise SystemExit("Please pass an HF model path or set NANOVLLM_MODEL.")
+    if not gguf_model:
+        raise SystemExit("Please pass a GGUF model path or set NANOVLLM_GGUF_MODEL.")
     return LLM(
-        model,
-        backend="cuda",
+        gguf_model,
+        backend=args.backend,
+        gguf_model=gguf_model,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=1,
+        num_kvcache_blocks=args.num_kvcache_blocks,
+        enable_mtp=args.enable_mtp,
+        mtp_max_draft_tokens=args.mtp_max_draft_tokens,
+        mali_experimental_graph_reuse=args.mali_experimental_graph_reuse,
+        device_config={"n_threads": args.threads, "device_index": args.device_index},
     )
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.max_tokens <= 0:
         raise SystemExit("--max-tokens must be positive.")
-    if args.backend != "cuda" and args.temperature != 0:
+    if args.temperature != 0:
         raise SystemExit("CPU/Vulkan GGUF backends currently require --temperature 0.")
-    if args.backend == "cuda" and args.enable_mtp is True:
-        raise SystemExit("--enable-mtp is supported only by CPU/Vulkan GGUF backends.")
 
 
 def print_help() -> None:
@@ -325,7 +203,7 @@ def main() -> int:
     system_prompt = args.system
     session = None
 
-    print(f"nano-vLLM chat ready. backend={args.backend}, template={args.template}")
+    print(f"nanovllm-ggml chat ready. backend={args.backend}, template={args.template}")
     print_help()
     try:
         while True:
@@ -382,6 +260,9 @@ def main() -> int:
                 response = clean_response(outputs[0]["text"], args.template)
             messages.append({"role": "assistant", "content": response})
             print(f"\nassistant> {response}")
+            metrics = output.get("metrics") if args.backend.startswith("native") else None
+            if isinstance(metrics, dict):
+                print(format_turn_metrics(metrics))
     finally:
         if session is not None and session.is_open:
             session.close()

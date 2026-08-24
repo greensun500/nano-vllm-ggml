@@ -11,18 +11,6 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 
 
-def _hf_eog_token_ids(tokenizer, include_qwen_eog: bool = False) -> tuple[int, ...]:
-    eos = tokenizer.eos_token_id
-    values = [eos] if isinstance(eos, int) else list(eos or ())
-    if include_qwen_eog:
-        unknown = getattr(tokenizer, "unk_token_id", None)
-        for token in ("<|endoftext|>", "<|im_end|>"):
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            if isinstance(token_id, int) and token_id >= 0 and token_id != unknown:
-                values.append(token_id)
-    return tuple(dict.fromkeys(values))
-
-
 class ChatSession:
     """A retained single-user chat context backed by one native sequence slot."""
 
@@ -54,24 +42,17 @@ class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}#取出config的字段名称，写成一个集合
+        unsupported = sorted(set(kwargs) - config_fields)
+        if unsupported:
+            raise TypeError(
+                "unsupported native runtime options: " + ", ".join(unsupported)
+            )
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}#按照字段，取出key-value对，写成一个字典
         config = Config(model, **config_kwargs)#config初始化
         Sequence.block_size = config.kvcache_block_size#设定kvcache的block——size
         self.ps = []#保存子进程对象
         self.events = []#保存进程间同步的事件
-        if config.backend == "cuda":
-            import torch.multiprocessing as mp
-
-            ctx = mp.get_context("spawn")#获取ctx对象，后续创建进程都以spawn方式启动
-            for i in range(1, config.tensor_parallel_size):#以tensor_parallel_size为指标，创建多个子进程。为后续的多卡推理功能做准备
-                event = ctx.Event()
-                process = ctx.Process(target=create_backend, args=(config, i, event))
-                process.start()
-                self.ps.append(process)
-                self.events.append(event)
-            self.model_runner = create_backend(config, 0, self.events)#主进程会把模型初始化成功，然后创建共享内存之后返回来，子进程则在里面等待任务
-        else:
-            self.model_runner = create_backend(config)
+        self.model_runner = create_backend(config)
         self.config = config
         self.closed = False
         self._runtime_metrics = {
@@ -82,18 +63,8 @@ class LLMEngine:
             "postprocess_seconds": 0.0,
             "steps": 0,
         }
-        if config.tokenizer_backend in ("llamacpp", "native"):
-            self.tokenizer = None
-            config.eos_token_ids = self.model_runner.call("eog_token_ids")
-        else:
-            from transformers import AutoTokenizer
-
-            tokenizer_path = config.tokenizer or config.model
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
-            config.eos_token_ids = _hf_eog_token_ids(
-                self.tokenizer,
-                include_qwen_eog=config.backend in ("native_cpu", "native_vulkan", "native_cuda"),
-            )
+        self.tokenizer = None
+        config.eos_token_ids = self.model_runner.call("eog_token_ids")
         self.scheduler = Scheduler(config)#调度器
         atexit.register(self.exit)#整个程序退出时候字段调用
 
@@ -154,30 +125,58 @@ class LLMEngine:
             return prompt
         started = perf_counter()
         try:
-            if self.config.tokenizer_backend in ("llamacpp", "native"):
-                return self.model_runner.call("tokenize", prompt)
-            return self.tokenizer.encode(prompt)
+            return self.model_runner.call("tokenize", prompt)
         finally:
             self._runtime_metrics["tokenize_seconds"] += perf_counter() - started
 
     def _decode_tokens(self, token_ids: list[int]) -> str:
-        if self.config.tokenizer_backend in ("llamacpp", "native"):
-            return self.model_runner.call("detokenize", token_ids)
-        return self.tokenizer.decode(token_ids)
+        return self.model_runner.call("detokenize", token_ids)
 
     def _run_session_turn(self, seq: "Sequence", use_tqdm: bool) -> dict:
+        # Keep chat timing scoped to this turn.  Measure the same execution
+        # envelope as the benchmark command (schedule, plan, native run and
+        # postprocess), while excluding tokenization, detokenization and CLI
+        # output.  ``step`` reports prompt tokens as positive and generated
+        # decode tokens as negative.
+        turn_metrics = {
+            "prefill_tokens": 0,
+            "prefill_seconds": 0.0,
+            "prefill_generated_tokens": 0,
+            "decode_tokens": 0,
+            "decode_seconds": 0.0,
+        }
         pbar = tqdm(total=seq.max_tokens, desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         try:
             while seq.status != SequenceStatus.PARKED:
                 if seq.is_finished:
                     raise RuntimeError("chat session was evicted before its turn completed")
                 completed_before = seq.num_turn_completion_tokens
-                self.step()
-                pbar.update(seq.num_turn_completion_tokens - completed_before)
+                step_started = perf_counter()
+                _, signed_tokens = self.step()
+                step_elapsed = perf_counter() - step_started
+                completed = seq.num_turn_completion_tokens - completed_before
+                if signed_tokens > 0:
+                    turn_metrics["prefill_tokens"] += signed_tokens
+                    turn_metrics["prefill_seconds"] += step_elapsed
+                    turn_metrics["prefill_generated_tokens"] += completed
+                else:
+                    # A final MTP verification can compute more candidate
+                    # tokens than the request still has room to accept.  The
+                    # chat-facing rate must therefore count the completion
+                    # tokens scheduler.postprocess() actually retained, just
+                    # like the benchmark command does.
+                    turn_metrics["decode_tokens"] += completed
+                    turn_metrics["decode_seconds"] += step_elapsed
+                pbar.update(completed)
         finally:
             pbar.close()
         token_ids = list(seq.turn_completion_token_ids)
-        return {"text": self._decode_tokens(token_ids), "token_ids": token_ids}
+        turn_metrics["generated_tokens"] = len(token_ids)
+        return {
+            "text": self._decode_tokens(token_ids),
+            "token_ids": token_ids,
+            "metrics": turn_metrics,
+        }
 
     def flush_backend_releases(self):
         for block_ids, seq_id in self.scheduler.pop_block_releases():

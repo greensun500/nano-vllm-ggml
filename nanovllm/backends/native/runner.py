@@ -8,12 +8,11 @@ from typing import Any
 import numpy as np
 
 from nanovllm.backends.base import BackendExecutionPlan, BackendExecutionResult
-from nanovllm.backends.native.performance import apply_native_performance_defaults
 from nanovllm.config import Config
 
 
 class NativeRunner:
-    """nano-vLLM scheduler adapter for the in-tree Qwen3.5 runtime.
+    """nanovllm-ggml scheduler adapter for the in-tree Qwen3.5 runtime.
 
     The native extension owns the model, GGML graphs and cache storage.  This
     class deliberately keeps the scheduling-side responsibilities in Python:
@@ -28,10 +27,6 @@ class NativeRunner:
     """
 
     def __init__(self, config: Config):
-        # Resolve only unset tuning options.  This happens before the runtime
-        # and Scheduler allocate MTP state, so a profile cannot alter a live
-        # request or override an explicit caller choice.
-        apply_native_performance_defaults(config)
         self.config = config
         self.block_size = int(config.kvcache_block_size)
         self._seq_slots: dict[int, int] = {}
@@ -62,22 +57,9 @@ class NativeRunner:
             device_index=int(device_config.get("device_index", 0)),
             enable_mtp=bool(config.enable_mtp),
             mtp_max_draft_tokens=int(config.mtp_max_draft_tokens),
-            enable_graph_reuse=bool(getattr(config, "enable_graph_reuse", True)),
+            enable_graph_reuse=True,
             enable_vulkan_graph_reuse=bool(
-                getattr(config, "native_vulkan_graph_reuse", False)
-            ),
-            attention_impl=str(getattr(config, "native_attention_impl", "auto")),
-            enable_batched_recurrent_snapshots=bool(
-                getattr(config, "native_batched_recurrent_snapshots", False)
-            ),
-            enable_mtp_prefill_fusion=bool(
-                getattr(config, "native_mtp_prefill_fusion", False)
-            ),
-            enable_mtp_verification_kv_fusion=bool(
-                getattr(config, "native_mtp_verification_kv_fusion", False)
-            ),
-            mali_mtp_prefill_strategy=str(
-                getattr(config, "native_mali_mtp_prefill_strategy", "whole")
+                getattr(config, "mali_experimental_graph_reuse", False)
             ),
         )
 
@@ -87,7 +69,7 @@ class NativeRunner:
             extension = importlib.import_module("nanovllm._C")
         except ImportError as exc:
             raise RuntimeError(
-                "nano-vLLM's native Qwen3.5 runtime is not built. "
+                "nanovllm-ggml's native Qwen3.5 runtime is not built. "
                 "Run scripts/build_native_runtime.sh first."
             ) from exc
 
@@ -120,8 +102,7 @@ class NativeRunner:
         if not callable(method):
             raise RuntimeError(
                 f"the native Qwen3.5 runtime does not provide {name}(); "
-                "configure tokenizer_backend='hf' or rebuild the extension "
-                "with tokenizer support"
+                "rebuild the extension with embedded GGUF tokenizer support"
             )
         return method
 
@@ -265,16 +246,6 @@ class NativeRunner:
             "device_name": str(stats.get("device_name", "")),
             "device_description": str(stats.get("device_description", "")),
             "profile_name": str(stats.get("profile_name", "")),
-            "mali_mtp_prefill_strategy": str(
-                stats.get("mali_mtp_prefill_strategy", "")
-            ),
-            "normal_prefill_chunk_tokens": int(
-                stats.get("normal_prefill_chunk_tokens", 0)
-            ),
-            "mtp_prefill_chunk_tokens": int(
-                stats.get("mtp_prefill_chunk_tokens", 0)
-            ),
-            "staged_recurrent_planes": int(stats.get("staged_recurrent_planes", 0)),
         }
 
     def memory_stats(self) -> dict[str, int]:

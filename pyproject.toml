@@ -3,33 +3,22 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
+name = "nanovllm-ggml"
+version = "4.0.0"
 authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "nanovllm-ggml: a lightweight native Qwen3.5 GGUF inference runtime"
 requires-python = ">=3.10,<3.13"
-dependencies = [
-    "transformers>=4.51.0",
-    "numpy",
-    "xxhash",
-]
-
-[project.optional-dependencies]
-cuda = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
-    "flash-attn",
-]
+dependencies = ["numpy", "tqdm"]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/greensun500/nano-vllm-ggml"
 
 [project.scripts]
-nanovllm-chat = "nanovllm.cli.chat:main"
-nanovllm-bench = "nanovllm.cli.bench:main"
+nanovllm-ggml-chat = "nanovllm.cli.chat:main"
+nanovllm-ggml-bench = "nanovllm.cli.bench:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

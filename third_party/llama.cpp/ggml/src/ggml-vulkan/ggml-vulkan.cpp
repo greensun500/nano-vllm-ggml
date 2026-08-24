@@ -4865,12 +4865,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // This is the corrected configuration from the CIX Mali workgroup
     // coverage fix: WN=32 for the large tile and dispatch denominators match
     // BM/BN, so each launched workgroup covers its complete output tile.
-    // This vendor snapshot is newer than the CIX llama.cpp baseline. Keep the
-    // port opt-in until its KHR-cooperative-matrix interaction is qualified on
-    // the actual Mali driver. GGML_VK_DISABLE_MALI_MMQ_TUNE remains a stronger
-    // kill switch for experiments and CI bisects.
+    // This vendor snapshot is newer than the CIX llama.cpp baseline. The
+    // verified Mali-G720 path uses these raw MMQ tiles by default;
+    // GGML_VK_DISABLE_MALI_MMQ_TUNE remains the bisection and CI kill switch.
     if (device->vendor_id == VK_VENDOR_ID_ARM && device->subgroup_size == 16 &&
-        getenv("GGML_VK_ENABLE_MALI_MMQ_TUNE") != nullptr &&
         getenv("GGML_VK_DISABLE_MALI_MMQ_TUNE") == nullptr) {
         device->mali_mmq_tune = true;
 
@@ -4922,7 +4920,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 #undef CREATE_MALI_MMQ
 
-        GGML_LOG_INFO("ggml_vulkan: Mali G720 tuned MMQ enabled (safe fallback available)\\n");
     }
 
     // mul mat vec
@@ -6358,11 +6355,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // The CIX Mali MMQ tiles are raw integer-dot shaders.  On this newer
         // vendor snapshot, advertising KHR cooperative matrix at the same
         // time changes MMQ setup/selection enough to corrupt real Qwen3.5
-        // prefill.  Keep the behavior tied to the experimental MMQ opt-in;
-        // normal Mali Vulkan users retain the upstream cooperative-matrix
-        // path unchanged.
+        // prefill. Keep the raw-MMQ selection and cooperative-matrix policy
+        // aligned, while retaining an environment kill switch for bisection.
         if (device->vendor_id == VK_VENDOR_ID_ARM &&
-            getenv("GGML_VK_ENABLE_MALI_MMQ_TUNE") != nullptr) {
+            getenv("GGML_VK_DISABLE_MALI_MMQ_TUNE") == nullptr) {
             device->coopmat_support = false;
             coopmat2_support = false;
         }

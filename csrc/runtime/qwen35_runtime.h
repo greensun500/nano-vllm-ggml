@@ -8,23 +8,6 @@
 
 namespace nanovllm::native {
 
-enum class Qwen35AttentionImplementation : std::uint8_t {
-    Math,
-    Auto,
-    Flash,
-    Paged,
-};
-
-// Mali-G720 needs a device-specific MTP prefill policy because its efficient
-// target-prefill shape is much smaller than the full prompt graph.  WholePrompt
-// is deliberately the default: it preserves the v3.91 correctness workaround.
-// The two chunked modes are explicit diagnostic/experimental opt-ins.
-enum class Qwen35MaliMtpPrefillStrategy : std::uint8_t {
-    WholePrompt,
-    ChunkedLegacy,
-    ChunkedStaged,
-};
-
 struct Qwen35RuntimeOptions {
     std::string model_path;
     std::string backend = "cpu";
@@ -38,14 +21,9 @@ struct Qwen35RuntimeOptions {
     bool enable_mtp = false;
     std::size_t mtp_max_draft_tokens = 0;
     bool enable_graph_reuse = true;
+    // Explicitly opt into persistent graph reuse on Mali Vulkan. Other
+    // supported native devices select it automatically.
     bool enable_vulkan_graph_reuse = false;
-    Qwen35AttentionImplementation attention_implementation =
-        Qwen35AttentionImplementation::Math;
-    bool enable_batched_recurrent_snapshots = false;
-    bool enable_mtp_prefill_fusion = false;
-    bool enable_mtp_verification_kv_fusion = false;
-    Qwen35MaliMtpPrefillStrategy mali_mtp_prefill_strategy =
-        Qwen35MaliMtpPrefillStrategy::WholePrompt;
 };
 
 struct Qwen35GraphReuseStats {
@@ -80,10 +58,6 @@ struct Qwen35ExecutionProfileStats {
     std::string device_name;
     std::string device_description;
     std::string profile_name;
-    std::string mali_mtp_prefill_strategy;
-    std::uint64_t normal_prefill_chunk_tokens = 0;
-    std::uint64_t mtp_prefill_chunk_tokens = 0;
-    std::uint64_t staged_recurrent_planes = 0;
 };
 
 struct Qwen35MemoryStats {

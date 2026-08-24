@@ -28,8 +28,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 // and builds a second, tile-tuned Q8_1 MMQ pipeline. The selection is
 // thread-local so a caller can bracket multi-token work with existing KV (or
 // another shape known to be unsafe) without changing device-global state.
-// It is a no-op on devices without the opt-in tuned pipelines
-// (GGML_VK_ENABLE_MALI_MMQ_TUNE=1).
+// It is a no-op on devices without the tuned pipelines. Set
+// GGML_VK_DISABLE_MALI_MMQ_TUNE=1 to force the upstream safe pipeline.
 GGML_BACKEND_API void ggml_vk_set_mali_mmq_safe_mode(bool safe);
 
 #ifdef  __cplusplus

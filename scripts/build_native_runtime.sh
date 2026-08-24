@@ -4,8 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENABLE_VULKAN="${NANOVLLM_NATIVE_VULKAN:-OFF}"
 ENABLE_CUDA="${NANOVLLM_NATIVE_CUDA:-OFF}"
-ENABLE_CUDA_GRAPHS="${NANOVLLM_NATIVE_CUDA_GRAPHS:-OFF}"
-ENABLE_CPU_REPACK="${NANOVLLM_NATIVE_CPU_REPACK:-OFF}"
 BUILD_KIND="cpu"
 if [[ "${ENABLE_VULKAN}" == "ON" || "${ENABLE_VULKAN}" == "1" ]]; then
     ENABLE_VULKAN="ON"
@@ -16,26 +14,12 @@ fi
 if [[ "${ENABLE_CUDA}" == "ON" || "${ENABLE_CUDA}" == "1" ]]; then
     ENABLE_CUDA="ON"
     if [[ "${BUILD_KIND}" != "cpu" ]]; then
-        echo "nano-vLLM: build either Vulkan or CUDA at a time" >&2
+        echo "nanovllm-ggml: build either Vulkan or CUDA at a time" >&2
         exit 2
     fi
     BUILD_KIND="cuda"
 else
     ENABLE_CUDA="OFF"
-fi
-if [[ "${ENABLE_CUDA_GRAPHS}" == "ON" || "${ENABLE_CUDA_GRAPHS}" == "1" ]]; then
-    ENABLE_CUDA_GRAPHS="ON"
-else
-    ENABLE_CUDA_GRAPHS="OFF"
-fi
-if [[ "${ENABLE_CPU_REPACK}" == "ON" || "${ENABLE_CPU_REPACK}" == "1" ]]; then
-    ENABLE_CPU_REPACK="ON"
-else
-    ENABLE_CPU_REPACK="OFF"
-fi
-if [[ "${ENABLE_CUDA_GRAPHS}" == "ON" && "${ENABLE_CUDA}" != "ON" ]]; then
-    echo "nano-vLLM: NANOVLLM_NATIVE_CUDA_GRAPHS requires NANOVLLM_NATIVE_CUDA=ON" >&2
-    exit 2
 fi
 BUILD_DIR="${NANOVLLM_NATIVE_BUILD_DIR:-${ROOT_DIR}/build/native-${BUILD_KIND}}"
 RUN_TESTS="${NANOVLLM_NATIVE_RUN_TESTS:-ON}"
@@ -99,9 +83,9 @@ if [[ "${HAS_EXPLICIT_ARM_CONFIG}" == "0" && \
                     -DGGML_NATIVE=OFF
                     "-DGGML_CPU_ARM_ARCH=${AUTO_ARM_ARCH}"
                 )
-                echo "nano-vLLM: enabling Arm dotprod+i8mm kernels (${AUTO_ARM_ARCH})"
+                echo "nanovllm-ggml: enabling Arm dotprod+i8mm kernels (${AUTO_ARM_ARCH})"
             else
-                echo "nano-vLLM: Arm dotprod+i8mm auto-detection unavailable; using GGML defaults"
+                echo "nanovllm-ggml: Arm dotprod+i8mm auto-detection unavailable; using GGML defaults"
             fi
             ;;
         *)
@@ -109,20 +93,20 @@ if [[ "${HAS_EXPLICIT_ARM_CONFIG}" == "0" && \
                 -DGGML_NATIVE=OFF
                 "-DGGML_CPU_ARM_ARCH=${ARM_ARCH_MODE}"
             )
-            echo "nano-vLLM: using requested Arm architecture ${ARM_ARCH_MODE}"
+            echo "nanovllm-ggml: using requested Arm architecture ${ARM_ARCH_MODE}"
             ;;
     esac
 fi
 
 if [[ "${ENABLE_VULKAN}" == "ON" && -n "${NANOVLLM_VULKAN_GLSLC:-}" ]]; then
     if [[ ! -x "${NANOVLLM_VULKAN_GLSLC}" ]]; then
-        echo "nano-vLLM: NANOVLLM_VULKAN_GLSLC is not executable: ${NANOVLLM_VULKAN_GLSLC}" >&2
+        echo "nanovllm-ggml: NANOVLLM_VULKAN_GLSLC is not executable: ${NANOVLLM_VULKAN_GLSLC}" >&2
         exit 2
     fi
     AUTO_CMAKE_ARGS+=(
         "-DVulkan_GLSLC_EXECUTABLE=${NANOVLLM_VULKAN_GLSLC}"
     )
-    echo "nano-vLLM: using Vulkan shader compiler ${NANOVLLM_VULKAN_GLSLC}"
+    echo "nanovllm-ggml: using Vulkan shader compiler ${NANOVLLM_VULKAN_GLSLC}"
 fi
 
 cmake \
@@ -132,8 +116,6 @@ cmake \
     -DBUILD_TESTING="${RUN_TESTS}" \
     -DNANOVLLM_NATIVE_VULKAN="${ENABLE_VULKAN}" \
     -DNANOVLLM_NATIVE_CUDA="${ENABLE_CUDA}" \
-    -DNANOVLLM_NATIVE_CUDA_GRAPHS="${ENABLE_CUDA_GRAPHS}" \
-    -DNANOVLLM_NATIVE_CPU_REPACK="${ENABLE_CPU_REPACK}" \
     "${AUTO_CMAKE_ARGS[@]}" \
     "$@"
 cmake --build "${BUILD_DIR}" --target _C --parallel "${NANOVLLM_BUILD_JOBS:-$(nproc)}"

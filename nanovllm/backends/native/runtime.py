@@ -1,6 +1,6 @@
-"""Thin Python API for nano-vLLM's in-tree GGML runtime.
+"""Thin Python API for nanovllm-ggml's in-tree GGML runtime.
 
-The compiled module is deliberately imported as part of the nano-vLLM package.
+The compiled module is deliberately imported as part of the nanovllm-ggml package.
 It statically embeds GGML CPU/Vulkan and never loads ``llama_context`` or an
 external ``libnanollama_backend.so``.
 """
@@ -11,7 +11,7 @@ def _extension():
         from nanovllm import _C
     except ImportError as exc:
         raise RuntimeError(
-            "nano-vLLM native runtime is not built. Run "
+            "nanovllm-ggml native runtime is not built. Run "
             "scripts/build_native_runtime.sh first."
         ) from exc
     return _C

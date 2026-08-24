@@ -654,7 +654,7 @@ PyMethodDef methods[] = {
 PyModuleDef module = {
     PyModuleDef_HEAD_INIT,
     "_C",
-    "nano-vLLM native GGML runtime (does not link the llama.cpp high-level runtime)",
+    "nanovllm-ggml native GGML runtime (does not link the llama.cpp high-level runtime)",
     -1,
     methods,
 };

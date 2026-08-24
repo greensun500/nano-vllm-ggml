@@ -7,9 +7,6 @@ from nanovllm.engine.sequence import Sequence
 
 
 BackendName = Literal[
-    "cuda",
-    "llamacpp_cpu",
-    "llamacpp_vulkan",
     "native_cpu",
     "native_vulkan",
     "native_cuda",

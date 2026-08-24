@@ -43,11 +43,6 @@ namespace {
 
 constexpr std::size_t kGraphMetadataBytes = 32U * 1024U * 1024U;
 constexpr std::size_t kGraphNodeCapacity = 4096;
-// Mali-G720 is substantially faster at the model's projection shapes with 64
-// prompt columns than with one 512-column graph.  Keep this backend policy in
-// the native runtime so callers do not have to distort scheduler admission.
-constexpr std::size_t kVulkanTargetPrefillChunk = 64;
-constexpr std::size_t kMaliMtpPrefillStagingPlanes = 2;
 
 struct Qwen35ExecutionProfile {
     // Preserve the existing broad Mali policy for ordinary prefill, but limit
@@ -106,19 +101,6 @@ Qwen35ExecutionProfile resolve_execution_profile(
          contains_text(device.name, "Mali G720") ||
          contains_text(device.description, "Mali G720"));
     return profile;
-}
-
-const char * mali_mtp_prefill_strategy_name(
-    Qwen35MaliMtpPrefillStrategy strategy) noexcept {
-    switch (strategy) {
-    case Qwen35MaliMtpPrefillStrategy::WholePrompt:
-        return "whole";
-    case Qwen35MaliMtpPrefillStrategy::ChunkedLegacy:
-        return "chunked_legacy";
-    case Qwen35MaliMtpPrefillStrategy::ChunkedStaged:
-        return "chunked_staged";
-    }
-    return "invalid";
 }
 
 [[noreturn]] void fail(const std::string & detail) {
@@ -201,23 +183,6 @@ Qwen35RuntimeOptions validate_options(Qwen35RuntimeOptions options) {
     }
     if (!options.enable_mtp) {
         options.mtp_max_draft_tokens = 0;
-    }
-    switch (options.mali_mtp_prefill_strategy) {
-    case Qwen35MaliMtpPrefillStrategy::WholePrompt:
-    case Qwen35MaliMtpPrefillStrategy::ChunkedLegacy:
-    case Qwen35MaliMtpPrefillStrategy::ChunkedStaged:
-        break;
-    default:
-        fail("mali_mtp_prefill_strategy is invalid");
-    }
-    if (options.mali_mtp_prefill_strategy !=
-        Qwen35MaliMtpPrefillStrategy::WholePrompt) {
-        if (parse_backend_kind(options.backend) != BackendKind::Vulkan) {
-            fail("chunked Mali MTP prefill requires the Vulkan backend");
-        }
-        if (!options.enable_mtp) {
-            fail("chunked Mali MTP prefill requires MTP");
-        }
     }
     return options;
 }
@@ -324,7 +289,6 @@ struct TokenResult {
 struct TargetChunkResult {
     std::vector<std::int32_t> predictions;
     std::vector<float> hidden;
-    std::vector<float> mtp_last_hidden;
 };
 
 enum class PersistentGraphKind : std::uint8_t {
@@ -345,7 +309,6 @@ struct PersistentGraphKey {
     std::uint8_t attention_implementation = 0;
     bool retain_hidden = false;
     bool emit_greedy = false;
-    bool mtp_verification_kv_fusion = false;
 
     bool operator==(const PersistentGraphKey & other) const noexcept {
         return kind == other.kind &&
@@ -358,8 +321,7 @@ struct PersistentGraphKey {
                output_mode == other.output_mode &&
                attention_implementation == other.attention_implementation &&
                retain_hidden == other.retain_hidden &&
-               emit_greedy == other.emit_greedy &&
-               mtp_verification_kv_fusion == other.mtp_verification_kv_fusion;
+               emit_greedy == other.emit_greedy;
     }
 };
 
@@ -405,13 +367,6 @@ struct Qwen35Runtime::Impl {
         const BackendDeviceInfo & device = primary_backend->device_info();
         execution_profile = resolve_execution_profile(
             primary_backend->kind(), device);
-        if (options.mali_mtp_prefill_strategy !=
-                Qwen35MaliMtpPrefillStrategy::WholePrompt &&
-            !execution_profile.is_mali_g720_vulkan) {
-            fail(
-                "chunked Mali MTP prefill is supported only on a Mali-G720 Vulkan "
-                "device; detected '" + device.name + "' (" + device.description + ')');
-        }
         model_storage = std::make_unique<GgufWeights>(options.model_path);//1. 初始化Ggufweight加载器
         model_storage->load(primary_backend->get());//2. 将GGUF权重加载到后端的持久缓冲区中
         model = std::make_unique<qwen35::Qwen35Weights>(*model_storage);    //3.已经上传到ggml缓存区的权重绑定到qwen35::Qwen35Weights中，方便后续使用
@@ -434,11 +389,7 @@ struct Qwen35Runtime::Impl {
         RecurrentStateOptions state_options;    //6. 开始初始化recurrent state cache的参数
         state_options.max_sequence_slots = options.max_num_seqs;    //此处是总共能同时并发多少个请求
         state_options.max_draft_tokens = options.mtp_max_draft_tokens;  //每个序列最多允许的草稿token数
-        state_options.extra_snapshot_planes =
-            options.mali_mtp_prefill_strategy ==
-                    Qwen35MaliMtpPrefillStrategy::ChunkedStaged
-                ? kMaliMtpPrefillStagingPlanes
-                : 0;
+        state_options.extra_snapshot_planes = 0;
         state_options.include_mtp_recurrent = false;    //mtp层不需要额外存储
         recurrent = std::make_unique<RecurrentStateCache>(  //7. 初始化RecurrentStateCache，主要是用于存储模型的recurrent state
             config, primary_backend->get(), state_options);
@@ -475,51 +426,21 @@ struct Qwen35Runtime::Impl {
             primary_backend == nullptr) {
             return false;
         }
-        if (primary_backend->kind() == BackendKind::Cpu ||
-            (primary_backend->kind() == BackendKind::Vulkan &&
-             options.enable_vulkan_graph_reuse)) {
+        if (primary_backend->kind() == BackendKind::Cpu) {
             return true;
+        }
+        if (primary_backend->kind() == BackendKind::Vulkan) {
+            // Desktop/NVIDIA Vulkan benefits from persistent graphs. Mali is
+            // deliberately conservative unless its explicit experimental
+            // switch was requested.
+            return !execution_profile.is_mali_vulkan ||
+                   options.enable_vulkan_graph_reuse;
         }
         // GGML captures CUDA work only after the graph's tensor metadata and
         // addresses are stable. Persistent entries provide that stability;
         // all other backends retain their existing eager graph lifetime.
         return primary_backend->kind() == BackendKind::Cuda &&
                NANOVLLM_NATIVE_HAS_CUDA_GRAPHS != 0;
-    }
-
-    bool mtp_prefill_fusion_available() const noexcept {
-        return options.enable_mtp && options.enable_mtp_prefill_fusion &&
-               primary_backend != nullptr;
-    }
-
-    bool mali_mtp_prefill_chunking_enabled() const noexcept {
-        return options.enable_mtp && execution_profile.is_mali_g720_vulkan &&
-            options.mali_mtp_prefill_strategy !=
-                Qwen35MaliMtpPrefillStrategy::WholePrompt;
-    }
-
-    bool mali_mtp_prefill_staging_enabled() const noexcept {
-        return mali_mtp_prefill_chunking_enabled() &&
-            options.mali_mtp_prefill_strategy ==
-                Qwen35MaliMtpPrefillStrategy::ChunkedStaged;
-    }
-
-    std::size_t staged_prefill_output_plane(std::size_t input_plane) const {
-        if (!mali_mtp_prefill_staging_enabled() || recurrent == nullptr ||
-            recurrent->extra_snapshot_planes() < kMaliMtpPrefillStagingPlanes) {
-            fail("Mali staged MTP prefill state planes are unavailable");
-        }
-        const std::size_t first_staging_plane =
-            recurrent->verification_snapshot_planes();
-        const std::size_t second_staging_plane = first_staging_plane + 1;
-        return input_plane == first_staging_plane
-            ? second_staging_plane
-            : first_staging_plane;
-    }
-
-    bool mtp_verification_kv_fusion_available() const noexcept {
-        return options.enable_mtp && options.enable_mtp_verification_kv_fusion &&
-               paged_kv != nullptr && paged_kv->has_mtp_layer();
     }
 
     bool flash_attention_supported(
@@ -601,92 +522,28 @@ struct Qwen35Runtime::Impl {
         return supported;
     }
 
-    bool paged_attention_supported(std::size_t n_tokens, std::size_t n_kv) {
-        if (primary_backend == nullptr ||
-            primary_backend->kind() != BackendKind::Vulkan ||
-            n_tokens == 0 || n_kv < n_tokens) {
-            return false;
-        }
-        ggml_init_params params{};
-        params.mem_size = 16U * 1024U;
-        params.mem_buffer = nullptr;
-        params.no_alloc = true;
-        ggml_context * probe = ggml_init(params);
-        if (probe == nullptr) {
-            return false;
-        }
-        const qwen35::Config & config = model->config();
-        const std::int64_t head_dim = config.attention_key_length;
-        const std::int64_t query_heads = config.attention_head_count;
-        const std::int64_t kv_heads = config.attention_head_count_kv;
-        const std::int64_t token_count = static_cast<std::int64_t>(n_tokens);
-        const std::int64_t kv_count = static_cast<std::int64_t>(n_kv);
-        ggml_tensor * query = ggml_new_tensor_3d(
-            probe, GGML_TYPE_F32, head_dim, query_heads, token_count);
-        ggml_tensor * key_cache = ggml_new_tensor_2d(
-            probe, GGML_TYPE_F32, head_dim * kv_heads, kv_count);
-        ggml_tensor * value_cache = ggml_new_tensor_2d(
-            probe, GGML_TYPE_F32, head_dim * kv_heads, kv_count);
-        ggml_tensor * slots = ggml_new_tensor_1d(probe, GGML_TYPE_I32, kv_count);
-        ggml_tensor * context_len = ggml_new_tensor_1d(probe, GGML_TYPE_I32, 1);
-        ggml_tensor * attention = ggml_paged_attn(
-            probe,
-            query,
-            key_cache,
-            value_cache,
-            slots,
-            context_len,
-            1.0f / std::sqrt(static_cast<float>(head_dim)));
-        const bool supported = ggml_backend_supports_op(
-            primary_backend->get(), attention);
-        ggml_free(probe);
-        return supported;
-    }
-
     qwen35::AttentionImplementation select_attention_implementation(
         std::size_t n_tokens,
         std::size_t n_kv,
         bool use_causal_mask) {
-        switch (options.attention_implementation) {
-            case Qwen35AttentionImplementation::Math:
-                return qwen35::AttentionImplementation::Math;
-            case Qwen35AttentionImplementation::Flash:
-                if (!flash_attention_supported(n_tokens, n_kv, use_causal_mask)) {
-                    fail(
-                        "attention_impl='flash' is unsupported for the requested backend "
-                        "or attention shape");
-                }
+        // MTP must use the same implementation for both T=1 draft and
+        // T=K+1 verification. Flash is used only after the exact backend
+        // capability probe accepts each graph shape; otherwise math is the
+        // single stable fallback.
+        if (options.enable_mtp) {
+            if (primary_backend != nullptr &&
+                primary_backend->kind() == BackendKind::Vulkan &&
+                flash_attention_supported(n_tokens, n_kv, use_causal_mask)) {
                 return qwen35::AttentionImplementation::Flash;
-            case Qwen35AttentionImplementation::Paged:
-                if (!paged_attention_supported(n_tokens, n_kv)) {
-                    fail(
-                        "attention_impl='paged' is supported only by the Vulkan "
-                        "direct-cache kernel for the requested Qwen3.5 attention shape");
-                }
-                return qwen35::AttentionImplementation::Paged;
-            case Qwen35AttentionImplementation::Auto:
-                // MTP must use the same attention implementation for both
-                // T=1 draft and T=K+1 verification.  The Qwen3.5-2B Mali
-                // oracle covers their exact greedy trace, so accept the
-                // backend's Flash capability for both shapes instead of
-                // leaving the dominant verification path on math attention.
-                if (options.enable_mtp) {
-                    if (primary_backend != nullptr &&
-                        primary_backend->kind() == BackendKind::Vulkan &&
-                        flash_attention_supported(n_tokens, n_kv, use_causal_mask)) {
-                        return qwen35::AttentionImplementation::Flash;
-                    }
-                    return qwen35::AttentionImplementation::Math;
-                }
-                if (primary_backend == nullptr ||
-                    primary_backend->kind() == BackendKind::Cpu) {
-                    return qwen35::AttentionImplementation::Math;
-                }
-                return flash_attention_supported(n_tokens, n_kv, use_causal_mask)
-                    ? qwen35::AttentionImplementation::Flash
-                    : qwen35::AttentionImplementation::Math;
+            }
+            return qwen35::AttentionImplementation::Math;
         }
-        return qwen35::AttentionImplementation::Math;
+        if (primary_backend == nullptr || primary_backend->kind() == BackendKind::Cpu) {
+            return qwen35::AttentionImplementation::Math;
+        }
+        return flash_attention_supported(n_tokens, n_kv, use_causal_mask)
+            ? qwen35::AttentionImplementation::Flash
+            : qwen35::AttentionImplementation::Math;
     }
 
     std::size_t kv_bucket_for(std::size_t actual_n_kv) const {
@@ -1019,19 +876,12 @@ struct Qwen35Runtime::Impl {
                 ctx, layer, sequence_slot, input_plane);    //找到了ssm-conv的位置
             state.delta = recurrent->view_delta(ctx, layer, sequence_slot, input_plane);    //找到了ssm-delta的位置
             state.convolution_outputs.reserve(snapshot_count);
-            if (options.enable_batched_recurrent_snapshots) {
-                state.delta_snapshots_output = recurrent->view_delta_snapshots(
-                    ctx, layer, sequence_slot, first_output_plane, snapshot_count);
-            } else {
-                state.delta_outputs.reserve(snapshot_count);    //按照实际需要写回的palane数量来预留
-            }
+            state.delta_outputs.reserve(snapshot_count);
             for (std::size_t plane = 0; plane < snapshot_count; ++plane) {
                 state.convolution_outputs.push_back(recurrent->view_conv(
                     ctx, layer, sequence_slot, first_output_plane + plane)); //怎么存储新state的位置
-                if (!options.enable_batched_recurrent_snapshots) {
-                    state.delta_outputs.push_back(recurrent->view_delta(
-                        ctx, layer, sequence_slot, first_output_plane + plane));
-                }
+                state.delta_outputs.push_back(recurrent->view_delta(
+                    ctx, layer, sequence_slot, first_output_plane + plane));
             }
             persistent.recurrent.push_back(std::move(state));
         }
@@ -1084,8 +934,7 @@ struct Qwen35Runtime::Impl {
         std::size_t n_kv_bucket,
         qwen35::TargetChunkOutputMode output_mode,
         bool retain_hidden,
-        qwen35::AttentionImplementation attention_implementation,
-        bool fuse_mtp_verification_kv) {
+        qwen35::AttentionImplementation attention_implementation) {
         PersistentGraphKey key;
         key.kind = PersistentGraphKind::TargetChunk;
         key.n_tokens = n_tokens;
@@ -1098,7 +947,6 @@ struct Qwen35Runtime::Impl {
         key.attention_implementation =
             static_cast<std::uint8_t>(attention_implementation);
         key.retain_hidden = retain_hidden;
-        key.mtp_verification_kv_fusion = fuse_mtp_verification_kv;
 
         PersistentGraphEntry & entry = touch_or_create_entry(key);
         if (entry.target_chunk.graph == nullptr) {
@@ -1108,13 +956,6 @@ struct Qwen35Runtime::Impl {
                 input_plane,
                 first_output_plane,
                 snapshot_count);
-            qwen35::AttentionCacheView mtp_verification_cache;
-            const qwen35::AttentionCacheView * mtp_verification_cache_view = nullptr;
-            if (fuse_mtp_verification_kv) {
-                const PagedKvLayer & layer = paged_kv->mtp_layer();
-                mtp_verification_cache = {layer.key, layer.value};
-                mtp_verification_cache_view = &mtp_verification_cache;
-            }
             entry.target_chunk = qwen35::build_target_chunk_graph(
                 entry.context.get(),
                 *model,
@@ -1125,9 +966,7 @@ struct Qwen35Runtime::Impl {
                 output_mode,
                 retain_hidden,
                 true,
-                attention_implementation,
-                nullptr,
-                mtp_verification_cache_view);
+                attention_implementation);
             place_primary_compute_nodes(*entry.executor, entry.target_chunk.graph);
             entry.executor->allocate(entry.target_chunk.graph);
             assert_compute_placement(*entry.executor, entry.target_chunk.graph);
@@ -1202,16 +1041,12 @@ struct Qwen35Runtime::Impl {
             fail("actual paged-attention context length is outside its slot input range");
         }
         const std::int32_t position_i32 = static_cast<std::int32_t>(position);
-        const std::int32_t context_len_i32 = static_cast<std::int32_t>(actual_context_len);
         const std::array<std::int32_t, 4> positions{
             position_i32, position_i32, position_i32, 0};
         require_allocated_input(token_graph.token, "token");
         require_allocated_input(token_graph.positions, "positions");
         require_allocated_input(token_graph.write_slot, "write_slot");
         require_allocated_input(token_graph.read_slots, "read_slots");
-        if (token_graph.context_len != nullptr) {
-            require_allocated_input(token_graph.context_len, "context_len");
-        }
         ggml_backend_tensor_set(token_graph.token, &token, 0, sizeof(token));
         ggml_backend_tensor_set(
             token_graph.positions, positions.data(), 0, sizeof(positions));
@@ -1222,10 +1057,6 @@ struct Qwen35Runtime::Impl {
             read_slots.data(),
             0,
             read_slots.size() * sizeof(std::int32_t));
-        if (token_graph.context_len != nullptr) {
-            ggml_backend_tensor_set(
-                token_graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
-        }
     }
 
     TokenResult execute_target(
@@ -1294,9 +1125,7 @@ struct Qwen35Runtime::Impl {
         qwen35::TargetChunkOutputMode output_mode,
         bool retain_hidden,
         bool allow_graph_reuse,
-        bool profile_mtp_verification,
-        const std::vector<float> * mtp_prefill_previous_hidden = nullptr,
-        bool fuse_mtp_verification_kv = false) {
+        bool profile_mtp_verification) {
         // 这是 native target model 执行连续 token chunk 的主路径。
         // 上层调度器已经决定了本轮要计算哪些 token，以及这些 token 的 K/V
         // 应该写到哪些物理 slot；这里负责把这些执行计划转成 GGML graph 的输入，
@@ -1307,22 +1136,6 @@ struct Qwen35Runtime::Impl {
         const MaliMmqSafeModeGuard mali_mmq_safe_mode(
             execution_profile.is_mali_g720_vulkan &&
             start_position > 0);
-        const bool fuse_mtp_prefill = mtp_prefill_previous_hidden != nullptr;
-        if (fuse_mtp_prefill && fuse_mtp_verification_kv) {
-            fail("target chunk cannot fuse MTP prefill and verification KV updates together");
-        }
-        if (fuse_mtp_prefill) {
-            if (!options.enable_mtp || !paged_kv->has_mtp_layer()) {
-                fail("MTP prefill fusion was requested on an MTP-disabled runtime");
-            }
-            if (mtp_prefill_previous_hidden->size() !=
-                model->config().embedding_length) {
-                fail("MTP prefill fusion previous hidden has the wrong width");
-            }
-        }
-        if (fuse_mtp_verification_kv && tokens.size() <= 1) {
-            fail("MTP verification KV fusion requires at least two target tokens");
-        }
         // 当前 chunk 里的每个 token 都必须对应一个 PagedKV 物理写入位置。
         // graph 会为每个 token 产生一行 K 和一行 V。
         if (write_slots.size() != tokens.size()) {
@@ -1374,21 +1187,11 @@ struct Qwen35Runtime::Impl {
         }
         const std::vector<std::int32_t> expanded_positions =    //为了满足IMRoPE的要求，需要将position展开为4倍长度，其实前三维度是一样的，第四维度是0（空间尺度，文本模型设置为0）
             qwen35::ops::expand_text_positions(positions);
-        std::vector<std::int32_t> mtp_verification_tokens;
-        std::vector<std::int32_t> mtp_verification_positions;
-        std::vector<std::int32_t> mtp_verification_write_slots;
-        if (fuse_mtp_verification_kv) {
-            mtp_verification_tokens.assign(tokens.begin() + 1, tokens.end());
-            mtp_verification_positions.assign(positions.begin() + 1, positions.end());
-            mtp_verification_positions =
-                qwen35::ops::expand_text_positions(mtp_verification_positions);
-            mtp_verification_write_slots.assign(write_slots.begin() + 1, write_slots.end());
-        }
 
         // 快路径：对于形状稳定的场景复用 persistent graph，主要服务 decode。
         // 缓存 graph 使用 KV bucket 固定形状，因此 read_slots 可能会被 padding，
         // 再通过 causal mask 屏蔽 padding 出来的无效位置或未来位置。
-        if (allow_graph_reuse && !fuse_mtp_prefill && graph_reuse_available())   //使用graph reuse
+        if (allow_graph_reuse && graph_reuse_available())   //使用graph reuse
         {
             const std::size_t n_kv_bucket = kv_bucket_for(read_slots.size());
             const qwen35::AttentionImplementation attention_implementation =
@@ -1402,8 +1205,7 @@ struct Qwen35Runtime::Impl {
                 n_kv_bucket,
                 output_mode,
                 retain_hidden,
-                attention_implementation,
-                fuse_mtp_verification_kv);
+                attention_implementation);
             qwen35::TargetChunkGraph & graph = entry.target_chunk;
             const std::vector<std::int32_t> padded_slots =
                 padded_read_slots(read_slots, n_kv_bucket);
@@ -1413,36 +1215,6 @@ struct Qwen35Runtime::Impl {
             require_allocated_input(graph.positions, "target_chunk.positions");
             require_allocated_input(graph.write_slots, "target_chunk.write_slots");
             require_allocated_input(graph.read_slots, "target_chunk.read_slots");
-            if (graph.context_len != nullptr) {
-                require_allocated_input(graph.context_len, "target_chunk.context_len");
-            }
-            if (fuse_mtp_verification_kv) {
-                require_allocated_input(
-                    graph.mtp_verification_tokens,
-                    "target_chunk.mtp_verification_tokens");
-                require_allocated_input(
-                    graph.mtp_verification_positions,
-                    "target_chunk.mtp_verification_positions");
-                require_allocated_input(
-                    graph.mtp_verification_write_slots,
-                    "target_chunk.mtp_verification_write_slots");
-                ggml_backend_tensor_set(
-                    graph.mtp_verification_tokens,
-                    mtp_verification_tokens.data(),
-                    0,
-                    mtp_verification_tokens.size() * sizeof(mtp_verification_tokens.front()));
-                ggml_backend_tensor_set(
-                    graph.mtp_verification_positions,
-                    mtp_verification_positions.data(),
-                    0,
-                    mtp_verification_positions.size() * sizeof(mtp_verification_positions.front()));
-                ggml_backend_tensor_set(
-                    graph.mtp_verification_write_slots,
-                    mtp_verification_write_slots.data(),
-                    0,
-                    mtp_verification_write_slots.size() * sizeof(mtp_verification_write_slots.front()));
-            }
-            const std::int32_t context_len_i32 = static_cast<std::int32_t>(read_slots.size());
             ggml_backend_tensor_set(
                 graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
             ggml_backend_tensor_set(
@@ -1460,21 +1232,15 @@ struct Qwen35Runtime::Impl {
                 padded_slots.data(),
                 0,
                 padded_slots.size() * sizeof(padded_slots.front()));
-            if (graph.context_len != nullptr) {
-                ggml_backend_tensor_set(
-                    graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
+            if (graph.causal_mask == nullptr) {
+                fail("persistent target chunk graph omitted its causal mask");
             }
-            if (attention_implementation != qwen35::AttentionImplementation::Paged) {
-                if (graph.causal_mask == nullptr) {
-                    fail("persistent target chunk graph omitted its causal mask");
-                }
                 // mask 的宽度是 n_kv_bucket。
                 // 它允许真实 prefix 和当前 token 可见的 causal 范围，
                 // 同时屏蔽 bucket padding 产生的无效位置和 chunk 内的未来位置。
                 const std::vector<float> mask =
                     make_chunk_mask(read_slots.size(), n_kv_bucket, tokens.size());
-                upload_causal_mask(graph.causal_mask, mask);
-            }
+            upload_causal_mask(graph.causal_mask, mask);
             // 执行已经构建好的 graph。
             // graph 内部 full-attention 层会用 write_slots 写 PagedKV，
             // 再用 read_slots 读取完整上下文；recurrent 层会从 input_plane
@@ -1536,20 +1302,6 @@ struct Qwen35Runtime::Impl {
         const qwen35::AttentionImplementation attention_implementation =
             select_attention_implementation(
                 tokens.size(), read_slots.size(), tokens.size() > 1);
-        qwen35::AttentionCacheView mtp_prefill_cache;
-        const qwen35::AttentionCacheView * mtp_prefill_cache_view = nullptr;
-        qwen35::AttentionCacheView mtp_verification_cache;
-        const qwen35::AttentionCacheView * mtp_verification_cache_view = nullptr;
-        if (fuse_mtp_prefill) {
-            const PagedKvLayer & mtp_layer = paged_kv->mtp_layer();
-            mtp_prefill_cache = {mtp_layer.key, mtp_layer.value};
-            mtp_prefill_cache_view = &mtp_prefill_cache;
-        }
-        if (fuse_mtp_verification_kv) {
-            const PagedKvLayer & mtp_layer = paged_kv->mtp_layer();
-            mtp_verification_cache = {mtp_layer.key, mtp_layer.value};
-            mtp_verification_cache_view = &mtp_verification_cache;
-        }
         // 手写构建 T 个 token 的 Qwen3.5 forward graph：
         // embedding -> 24 decoder layers -> optional output_norm/lm_head.
         qwen35::TargetChunkGraph graph = qwen35::build_target_chunk_graph(
@@ -1562,9 +1314,7 @@ struct Qwen35Runtime::Impl {
             output_mode,
             retain_hidden,
             false,
-            attention_implementation,
-            mtp_prefill_cache_view,
-            mtp_verification_cache_view);
+            attention_implementation);
 
         //计算图建立完毕，开始进行实际执行
         // 让 GGML scheduler 为 graph 做节点放置和临时 tensor 分配。
@@ -1581,36 +1331,6 @@ struct Qwen35Runtime::Impl {
         require_allocated_input(graph.positions, "target_chunk.positions");
         require_allocated_input(graph.write_slots, "target_chunk.write_slots");
         require_allocated_input(graph.read_slots, "target_chunk.read_slots");
-        if (graph.context_len != nullptr) {
-            require_allocated_input(graph.context_len, "target_chunk.context_len");
-        }
-        if (fuse_mtp_verification_kv) {
-            require_allocated_input(
-                graph.mtp_verification_tokens,
-                "target_chunk.mtp_verification_tokens");
-            require_allocated_input(
-                graph.mtp_verification_positions,
-                "target_chunk.mtp_verification_positions");
-            require_allocated_input(
-                graph.mtp_verification_write_slots,
-                "target_chunk.mtp_verification_write_slots");
-            ggml_backend_tensor_set(
-                graph.mtp_verification_tokens,
-                mtp_verification_tokens.data(),
-                0,
-                mtp_verification_tokens.size() * sizeof(mtp_verification_tokens.front()));
-            ggml_backend_tensor_set(
-                graph.mtp_verification_positions,
-                mtp_verification_positions.data(),
-                0,
-                mtp_verification_positions.size() * sizeof(mtp_verification_positions.front()));
-            ggml_backend_tensor_set(
-                graph.mtp_verification_write_slots,
-                mtp_verification_write_slots.data(),
-                0,
-                mtp_verification_write_slots.size() * sizeof(mtp_verification_write_slots.front()));
-        }
-        const std::int32_t context_len_i32 = static_cast<std::int32_t>(read_slots.size());
         ggml_backend_tensor_set(
             graph.tokens, tokens.data(), 0, tokens.size() * sizeof(tokens.front()));
         ggml_backend_tensor_set(
@@ -1628,10 +1348,6 @@ struct Qwen35Runtime::Impl {
             read_slots.data(),
             0,
             read_slots.size() * sizeof(read_slots.front()));
-        if (graph.context_len != nullptr) {
-            ggml_backend_tensor_set(
-                graph.context_len, &context_len_i32, 0, sizeof(context_len_i32));
-        }
         if (graph.causal_mask != nullptr) {
             // 多 token chunk 需要 causal mask，因为 read_slots 包含的是直到
             // chunk 最后一个 token 为止的完整上下文。
@@ -1692,17 +1408,6 @@ struct Qwen35Runtime::Impl {
                 0,
                 result.hidden.size() * sizeof(result.hidden.front()));
         }
-        if (fuse_mtp_prefill) {
-            if (graph.mtp_last_hidden == nullptr) {
-                fail("target chunk omitted fused MTP last hidden output");
-            }
-            result.mtp_last_hidden.resize(model->config().embedding_length);
-            ggml_backend_tensor_get(
-                graph.mtp_last_hidden,
-                result.mtp_last_hidden.data(),
-                0,
-                result.mtp_last_hidden.size() * sizeof(result.mtp_last_hidden.front()));
-        }
         return result;
     }
 
@@ -1737,14 +1442,12 @@ struct Qwen35Runtime::Impl {
                 padded_read_slots(read_slots, n_kv_bucket);
             upload_common_inputs(
                 token_graph, token, position, write_slot, padded_slots, read_slots.size());
-            if (attention_implementation != qwen35::AttentionImplementation::Paged) {
-                if (token_graph.causal_mask == nullptr) {
-                    fail("persistent MTP draft graph omitted its causal mask");
-                }
-                const std::vector<float> mask =
-                    make_single_token_mask(read_slots.size(), n_kv_bucket);
-                upload_causal_mask(token_graph.causal_mask, mask);
+            if (token_graph.causal_mask == nullptr) {
+                fail("persistent MTP draft graph omitted its causal mask");
             }
+            const std::vector<float> mask =
+                make_single_token_mask(read_slots.size(), n_kv_bucket);
+            upload_causal_mask(token_graph.causal_mask, mask);
             ggml_backend_tensor_set(
                 token_graph.hidden_input,
                 hidden_input.data(),
@@ -1918,20 +1621,10 @@ struct Qwen35Runtime::Impl {
 // 每个元素都是一个 PagedKV 的 physical_slot，表示对应 token 的 K/V 要写到哪里。
             const std::vector<std::int32_t> write_slots = slice(
                 plan.slot_mapping, item.token_offset, item.token_count);//取出这些token实际要写入那些物理slot
-// 决定当前 sequence 的 prefill/decode 是否需要切 chunk。
-// 如果是 Mali Vulkan，则每个 target chunk 最多跑 kVulkanTargetPrefillChunk 个 token，当前代码里是 64。
-// 如果不是 Mali Vulkan，则整个 item.token_count 一次性跑完。                 
-            const bool use_mali_mtp_prefill_chunking =
-                plan.is_prefill && mali_mtp_prefill_chunking_enabled();
-            const bool use_mali_mtp_prefill_staging =
-                plan.is_prefill && mali_mtp_prefill_staging_enabled();
-            const std::size_t chunk_limit = execution_profile.is_mali_vulkan &&
-                    (!(options.enable_mtp && plan.is_prefill) ||
-                     use_mali_mtp_prefill_chunking)
-                ? kVulkanTargetPrefillChunk
-                : item.token_count;
-            const bool fuse_mtp_prefill =
-                plan.is_prefill && mtp_prefill_fusion_available();
+            // Vulkan prefill is submitted as one prompt graph.  The Mali MMQ
+            // pipeline owns its tile/dispatch choice, so do not split the
+            // request again in the runtime based on a device policy.
+            const std::size_t chunk_limit = item.token_count;
 
 // 保存当前 sequence 最后一个 chunk 产生的 greedy prediction。
 // 初始化为 -1，后面只有 final chunk 会真正写入预测 token。
@@ -1982,13 +1675,6 @@ struct Qwen35Runtime::Impl {
     // 后续 execute_target_chunk 会从这个 plane 读取 conv_state / delta_state。
                 const std::size_t input_plane =
                     recurrent->active_snapshot_plane(item.sequence_slot);
-                // ChunkedStaged keeps MTP rollback planes [0, K] untouched.
-                // Its recurrent source/destination views therefore alternate
-                // between two dedicated scratch planes after the first chunk.
-                const std::size_t first_output_plane =
-                    use_mali_mtp_prefill_staging
-                        ? staged_prefill_output_plane(input_plane)
-                        : 0;
                 TargetChunkResult target = execute_target_chunk(            //普通prefill或者decode进入graph的如来
                     item.sequence_slot,
                     chunk_tokens,   //输入token
@@ -1996,20 +1682,14 @@ struct Qwen35Runtime::Impl {
                     chunk_write_slots,  //输入token对应的slot
                     context,    //attention要读取的slots
                     input_plane,    //输入token对应的snapshot plane
-                    first_output_plane,
+                    0,
                     1,
                     is_final ? qwen35::TargetChunkOutputMode::Last
                              : qwen35::TargetChunkOutputMode::None,
-                    options.enable_mtp && !fuse_mtp_prefill,
+                    options.enable_mtp,
                     !plan.is_prefill,
-                    false,
-                    fuse_mtp_prefill ? &sequence.pending_hidden : nullptr);
-                if (use_mali_mtp_prefill_staging) {
-                    recurrent->select_snapshot_plane(
-                        item.sequence_slot, first_output_plane);
-                } else {
-                    recurrent->select_latest(item.sequence_slot);
-                }
+                    false);
+                recurrent->select_latest(item.sequence_slot);
                 if (is_final) {
                     if (target.predictions.size() != 1 ||
                         target.predictions.front() < 0) {
@@ -2022,14 +1702,6 @@ struct Qwen35Runtime::Impl {
 
                 if (options.enable_mtp) {
                     const std::size_t embedding = model->config().embedding_length;
-                    if (fuse_mtp_prefill) {
-                        if (target.mtp_last_hidden.size() != embedding) {
-                            fail("target chunk returned the wrong fused MTP hidden shape");
-                        }
-                        sequence.pending_hidden = std::move(target.mtp_last_hidden);
-                        offset += chunk_count;
-                        continue;
-                    }
                     const std::size_t hidden_elements = checked_product(
                         chunk_count, embedding, "MTP prefill hidden input");
                     if (target.hidden.size() != hidden_elements) {
@@ -2141,8 +1813,6 @@ struct Qwen35Runtime::Impl {
                     item.block_table, position + verification_count);
             const std::size_t input_plane =
                 recurrent->active_snapshot_plane(item.sequence_slot);
-            const bool fuse_mtp_verification_kv =
-                mtp_verification_kv_fusion_available();
             const auto verification_started = std::chrono::steady_clock::now();
             TargetChunkResult target = execute_target_chunk(
                 item.sequence_slot,
@@ -2156,9 +1826,7 @@ struct Qwen35Runtime::Impl {
                 qwen35::TargetChunkOutputMode::All,
                 true,
                 true,
-                true,
-                nullptr,
-                fuse_mtp_verification_kv);
+                true);
             ++mtp_profile.verification_calls;
             mtp_profile.verification_tokens += verification_count;
             mtp_profile.verification_elapsed_ns += elapsed_nanoseconds(verification_started);
@@ -2192,7 +1860,7 @@ struct Qwen35Runtime::Impl {
             // overwritten before a later MTP draft can read them.  Without
             // that fusion, retain the legacy accepted-prefix-only maintenance
             // graph so the two modes remain directly comparable.
-            if (accepted > 0 && !fuse_mtp_verification_kv) {
+            if (accepted > 0) {
                 std::vector<std::int32_t> catchup_tokens(
                     verification_inputs.begin() + 1,
                     verification_inputs.begin() + accepted + 1);
@@ -2292,17 +1960,6 @@ struct Qwen35Runtime::Impl {
     Qwen35ExecutionProfileStats execution_profile_stats() const {
         Qwen35ExecutionProfileStats result;
         result.backend = options.backend;
-        result.mali_mtp_prefill_strategy =
-            mali_mtp_prefill_strategy_name(options.mali_mtp_prefill_strategy);
-        result.normal_prefill_chunk_tokens = execution_profile.is_mali_vulkan
-            ? static_cast<std::uint64_t>(kVulkanTargetPrefillChunk)
-            : 0;
-        result.mtp_prefill_chunk_tokens = mali_mtp_prefill_chunking_enabled()
-            ? static_cast<std::uint64_t>(kVulkanTargetPrefillChunk)
-            : 0;
-        result.staged_recurrent_planes = static_cast<std::uint64_t>(
-            recurrent == nullptr ? 0 : recurrent->extra_snapshot_planes());
-
         if (primary_backend == nullptr) {
             result.profile_name = "unavailable";
             return result;
