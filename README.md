@@ -50,24 +50,30 @@ features.
 
 ## Measured performance
 
-All numbers below are real end-to-end runs on `Qwen3.5-2B-Q4_0.gguf`, batch
-size 1, greedy decoding, `repeat=3`, `warmup=1`. `pp` is prompt length and
-`tg` is generated-token length. Compare configurations on the same device, not
-absolute rates across devices.
+All numbers below are real runs on `Qwen3.5-2B-Q4_0.gguf`, batch size 1 and
+greedy decoding. `PP` is prompt length and `TG` is generated-token length.
+`llama.cpp upstream` is the native upstream Vulkan/CPU baseline; the
+nanovllm-ggml rows use the native runtime on the same platform.
 
-| Platform | Workload | Best measured configuration | Prefill tok/s | Decode tok/s | Result |
-| --- | --- | --- | ---: | ---: | --- |
-| NVIDIA A100-SXM4-80GB, Vulkan | pp128 / tg128 | MTP K=3 + graph reuse | 4327.7 | **288.4** | **1.85×** baseline decode |
-| NVIDIA A100-SXM4-80GB, Vulkan | pp2048 / tg512 | MTP K=3 + graph reuse | 11469.7 | **279.6** | **1.84×** baseline decode |
-| Arm Cortex-A720/A520, CPU | pp186 / tg541 | MTP K=1 | 87.60 | **35.58** | **+27.5%** decode, 100% acceptance |
-| Mali-G720-Immortalis, Vulkan | pp186 / tg541 | Stable default: MTP off | **70.04** | **23.12** | Best end-to-end interactive path |
+| Platform | Framework | Configuration | PP + TG | Prefill tok/s | Decode tok/s |
+| --- | --- | --- | ---: | ---: | ---: |
+| NVIDIA A100 Vulkan | llama.cpp upstream | Native Vulkan, MTP off | 2048 + 512 | 11908.7 | 260.7 |
+| NVIDIA A100 Vulkan | nanovllm-ggml | Native Vulkan, MTP off | 2048 + 512 | **12208.9** | 210.0 |
+| NVIDIA A100 Vulkan | nanovllm-ggml | Native Vulkan, MTP K=3 + graph reuse | 2048 + 512 | 11469.7 | **279.6** |
+| Arm Cortex-A720 CPU | llama.cpp | Native CPU, MTP off | 512 + 128 | **140.9** | 25.4 |
+| Arm Cortex-A720 CPU | llama.cpp | Native CPU, MTP K=1 | 512 + 128 | 133.5 | 22.6 |
+| Arm Cortex-A720 CPU | nanovllm-ggml | Native CPU, MTP off | 512 + 128 | 88.46 | 27.90 |
+| Arm Cortex-A720 CPU | nanovllm-ggml | Native CPU, MTP K=1 | 512 + 128 | 87.60 | **35.58** |
+| Mali-G720 Vulkan | llama.cpp | Native Vulkan, MTP off | 512 + 128 | 18.0 | 19.7 |
+| Mali-G720 Vulkan | llama.cpp | Native Vulkan, MTP K=3 | 512 + 128 | 17.7 | 11.8 |
+| Mali-G720 Vulkan | nanovllm-ggml v4.0 | Native Vulkan, MTP off | 512 + 128 | **167.65** | 21.55 |
+| Mali-G720 Vulkan | nanovllm-ggml v4.0 | Native Vulkan, MTP K=3 | 512 + 128 | 166.13 | **24.55** |
 
-Mali MTP K=3 reaches `25.03 tok/s` pure decode in this workload, but its
-prefill path is currently slower; it is therefore not the recommended
-interactive default.
-
-> These are development validation results. Release tags should rerun the same
-> matrix on the stated hardware before making a tagged performance claim.
+The A100 result uses an NVIDIA A100-SXM4-80GB, full Vulkan offload and eight
+CPU threads. The upstream llama.cpp A100 baseline has no MTP result. For
+Arm/Mali llama.cpp rows, retain the workload and build settings supplied with
+the original benchmark when making strict claims; cross-platform rates are not
+directly comparable.
 
 ## Build and run
 
